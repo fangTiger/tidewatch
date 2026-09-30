@@ -10,6 +10,7 @@ from sqlalchemy import insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from tidewatch.models import max_level
+from tidewatch.store.repo import OPEN_STATUSES
 from tidewatch.store.tables import event_clusters, events, push_log
 
 # 按事件来源返回新鲜度上限（None 表示不限）
@@ -78,7 +79,7 @@ class PushDecider:
         elif top == "S" and cluster.committed_level == "A":
             result = await conn.execute(
                 update(push_log)
-                .where(push_log.c.cluster_id == cluster_id, push_log.c.status.in_(("pending", "failed")))
+                .where(push_log.c.cluster_id == cluster_id, push_log.c.status.in_(OPEN_STATUSES))
                 .values(status="superseded")
                 .returning(push_log.c.id)
             )

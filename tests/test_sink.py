@@ -1,7 +1,9 @@
+import asyncio
 from datetime import timedelta
 
 import pytest
 from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 
 from tidewatch.models import Event, FetchResult
 from tidewatch.pipeline.rules.engine import build_rule_engine
@@ -113,12 +115,13 @@ async def test_db_error_in_rule_rolls_back_to_savepoint(engine, settings, clock)
         rows = {r.dedupe_key: r for r in (await conn.execute(select(events))).all()}
         assert await load_cursor(conn, "jin10") == {"last_id": "7"}
     assert rows["bad"].final_level == "C" and rows["good"].final_level == "S"
+    assert rows["bad"].rule_hits == ["error"] and rows["bad"].cluster_id is not None
 
 
-async def test_commit_failure_keeps_cursor(sink, engine, clock):
+async def test_insert_failure_rolls_back_batch_and_keeps_cursor(sink, engine, clock):
     broken = _flash(clock, "jin10:x", "标题")
     broken.title = None  # 违反 NOT NULL，整批事务失败
-    with pytest.raises(Exception):
+    with pytest.raises(DBAPIError):
         await sink.ingest(FetchResult([_flash(clock, "jin10:ok", "港股低开高走"), broken], {"last_id": "x"}), collector="jin10")
     async with engine.connect() as conn:
         assert (await conn.execute(select(events))).first() is None
@@ -159,3 +162,145 @@ async def test_not_started_raises(engine, settings, clock):
     await event_sink.stop()
     with pytest.raises(RuntimeError):  # 停止后再提交也立即报错，不会挂起
         await event_sink.ingest(FetchResult([], None), collector="jin10")
+
+
+async def test_duplicate_ingest_does_not_notify(sink, clock):
+    received = []
+    sink.on_ingest(received.append)
+    await sink.ingest(FetchResult([_flash(clock, "jin10:1", NFP)], {"last_id": "1"}), collector="jin10")
+    assert len(received) == 1
+    assert await sink.ingest(FetchResult([_flash(clock, "jin10:1", NFP)], {"last_id": "2"}), collector="jin10") == []
+    assert len(received) == 1  # 没有新事件，不通知
+
+
+async def test_listener_exception_is_isolated(sink, clock):
+    """一个监听器抛异常，既不影响其他监听器，也不影响 ingest 的返回"""
+    received = []
+
+    def broken(_outcome):
+        raise RuntimeError("监听器缺陷")
+
+    sink.on_ingest(broken)
+    sink.on_ingest(received.append)
+    ids = await sink.ingest(FetchResult([_flash(clock, "jin10:1", NFP)], None), collector="jin10")
+    assert len(ids) == 1 and len(received) == 1 and received[0].event_ids == ids
+
+
+class _TrackedEngine:
+    """包装引擎：记录 begin() 的事务是否已经提交（__aexit__ 正常完成）"""
+
+    def __init__(self, engine) -> None:
+        self._engine = engine
+        self.committed = False
+
+    def begin(self):
+        tracked = self
+
+        class _Begin:
+            def __init__(self) -> None:
+                self._inner = tracked._engine.begin()
+
+            async def __aenter__(self):
+                tracked.committed = False
+                return await self._inner.__aenter__()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                result = await self._inner.__aexit__(exc_type, exc, tb)
+                if exc_type is None:
+                    tracked.committed = True
+                return result
+
+        return _Begin()
+
+
+async def test_listeners_notified_only_after_commit(engine, settings, clock):
+    tracked = _TrackedEngine(engine)
+    event_sink = create_event_sink(tracked, settings, clock=clock)
+    await event_sink.start()
+    observed: dict[str, bool] = {}
+    # 监听器中的断言异常会被吞掉，因此只记录当时的提交状态，事后再断言
+    event_sink.on_ingest(lambda outcome: observed.setdefault("ingest", tracked.committed))
+    event_sink.on_push_result(lambda outcome: observed.setdefault("push", tracked.committed))
+    try:
+        await event_sink.ingest(FetchResult([_flash(clock, "jin10:1", NFP)], None), collector="jin10")
+        async with engine.connect() as conn:
+            push_id = (await conn.execute(select(push_log.c.id))).scalar_one()
+        await event_sink.push_result(push_id, "ok")
+    finally:
+        await event_sink.stop()
+    assert observed == {"ingest": True, "push": True}
+
+
+class _BlockingRules:
+    """第一次 evaluate 时卡住，直到 release 被置位；之后委托给真实规则"""
+
+    def __init__(self, real) -> None:
+        self._real = real
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def evaluate(self, event, ctx):
+        self.entered.set()
+        await self.release.wait()
+        return await self._real.evaluate(event, ctx)
+
+
+async def _wait_queued(event_sink, count: int) -> None:
+    while event_sink._queue.qsize() < count:
+        await asyncio.sleep(0)
+
+
+async def test_worker_cancel_fails_running_and_queued_commands(engine, settings, clock):
+    """工作协程被取消时，正在执行与排队中的命令都应立即失败，而不是让调用方永久等待"""
+    blocking = _BlockingRules(build_rule_engine(settings))
+    event_sink = create_event_sink(engine, settings, clock=clock, rules=blocking)
+    await event_sink.start()
+    first = asyncio.create_task(event_sink.ingest(FetchResult([_flash(clock, "k1", NFP)], None), collector="jin10"))
+    await asyncio.wait_for(blocking.entered.wait(), 5)  # 第一条命令已在执行并卡住
+    second = asyncio.create_task(event_sink.ingest(FetchResult([_flash(clock, "k2", NFP)], None), collector="jin10"))
+    await asyncio.wait_for(_wait_queued(event_sink, 1), 5)
+    event_sink._worker.cancel()
+    for task in (first, second):
+        with pytest.raises(RuntimeError, match="已停止"):
+            await asyncio.wait_for(task, 3)
+    await event_sink.stop()  # 工作协程已被取消，stop 仍应正常返回
+
+
+async def test_submit_fails_fast_after_worker_exit(engine, settings, clock):
+    """工作协程已退出（被取消）后再提交命令：立即报错而不是入队后永久挂起；stop 之后可重新启动"""
+    event_sink = create_event_sink(engine, settings, clock=clock)
+    await event_sink.start()
+    worker = event_sink._worker
+    worker.cancel()
+    await asyncio.wait({worker})
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(event_sink.ingest(FetchResult([], None), collector="jin10"), 3)
+    with pytest.raises(RuntimeError):
+        await asyncio.wait_for(event_sink.push_result(1, "ok"), 3)
+    await event_sink.stop()
+    assert event_sink._worker is None
+    await event_sink.start()
+    try:
+        assert len(await event_sink.ingest(FetchResult([_flash(clock, "jin10:1", NFP)], None), collector="jin10")) == 1
+    finally:
+        await event_sink.stop()
+
+
+async def test_cancelling_stop_does_not_cancel_worker(engine, settings, clock):
+    """stop() 被外层取消时不能连带取消工作协程：已在执行的命令仍应正常完成"""
+    blocking = _BlockingRules(build_rule_engine(settings))
+    event_sink = create_event_sink(engine, settings, clock=clock, rules=blocking)
+    await event_sink.start()
+    worker = event_sink._worker
+    ingest = asyncio.create_task(event_sink.ingest(FetchResult([_flash(clock, "k1", NFP)], None), collector="jin10"))
+    await asyncio.wait_for(blocking.entered.wait(), 5)
+    stopping = asyncio.create_task(event_sink.stop())
+    await asyncio.sleep(0.05)  # 让 stop() 进入等待
+    stopping.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+    assert not worker.done()
+    blocking.release.set()
+    assert len(await asyncio.wait_for(ingest, 5)) == 1
+    await event_sink.stop()  # 再次 stop 等待工作协程自然结束
+    assert event_sink._worker is None

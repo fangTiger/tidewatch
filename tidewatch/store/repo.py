@@ -1,4 +1,8 @@
-"""通用 SQL：事件插入与分级回写、采集器游标"""
+"""通用 SQL：事件插入与分级回写、采集器游标、推送结果回写
+
+所有函数都在调用方传入的连接（事务）内执行，本模块不提交、不回滚；写入的串行化由 EventSink 负责。
+同时定义推送状态常量，供推送决策、EventSink 与调度器共用。
+"""
 
 from __future__ import annotations
 
@@ -14,6 +18,13 @@ from tidewatch.models import Event, max_level
 from tidewatch.store.tables import collector_state, event_clusters, events, push_log
 
 BODY_LIMIT = 2000
+# 推送记录的状态：
+#   pending / failed 为「未完成」，仍可被后续结果覆盖，也可被更高等级的推送取代（superseded）
+#   ok / dry_run / expired / superseded 为终态，不会再被覆盖
+# 其中 ok / dry_run 表示消息已经送达（dry_run 为演练模式下的模拟送达）
+OPEN_STATUSES = ("pending", "failed")
+DELIVERED_STATUSES = ("ok", "dry_run")
+# 调度器允许回写的结果状态（superseded 只由推送决策产生，不能回写）
 PUSH_RESULT_STATUSES = ("ok", "failed", "dry_run", "expired")
 
 
@@ -103,7 +114,20 @@ async def record_push_result(
     response: str | None = None,
     batch_id: str | None = None,
 ) -> tuple[str, int] | None:
-    """回写一次推送结果，返回 (最终状态, 簇 id)；记录不存在时返回 None"""
+    """回写一次推送结果，返回 (记录的最终状态, 簇 id)；记录不存在时返回 None
+
+    状态语义：
+    - 记录处于 OPEN_STATUSES（pending / failed）时，状态被覆盖为 status：
+      ok / dry_run 记录送达时间 sent_at；ok / dry_run / failed 使 attempts 加 1；expired 不计发送次数。
+      failed 仍是未完成状态，之后重试的结果还会继续覆盖它
+    - 记录已是终态（ok / dry_run / expired / superseded）时不再修改，
+      status、attempts、sent_at、response、batch_id 都保持原样，返回值是记录现有的状态
+    - 例外：本次结果为 ok / dry_run（消息确实发出去了）时，无论记录是否已是终态（例如迟到的
+      成功结果落在已被取代的记录上），都要把簇的 delivered_level 提升到 max(原值, 本条等级)，
+      它只升不降
+    - response 最多保留 500 个字符
+    用 SELECT ... FOR UPDATE 锁住记录，避免并发回写互相覆盖。
+    """
     if status not in PUSH_RESULT_STATUSES:
         raise ValueError(f"非法的推送结果状态：{status}")
     row = (
@@ -115,9 +139,9 @@ async def record_push_result(
     ).one_or_none()
     if row is None:
         return None
-    delivered = status in ("ok", "dry_run")
+    delivered = status in DELIVERED_STATUSES
     final_status = row.status
-    if row.status in ("pending", "failed"):
+    if row.status in OPEN_STATUSES:
         final_status = status
         values: dict[str, Any] = {"status": status}
         if status != "expired":
