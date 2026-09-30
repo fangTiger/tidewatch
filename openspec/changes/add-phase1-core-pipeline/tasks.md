@@ -14,7 +14,7 @@
 ## 3. 领域模型与规范化
 
 - [x] 3.1 实现 `models.py`：`Event`、`FetchResult`、`RuleResult`、等级枚举与比较
-- [ ] 3.2 实现 `pipeline/normalize.py`：标题规范化、关注资产别名识别、字符二元组 Jaccard 标题相似度（含测试）
+- [x] 3.2 实现 `pipeline/normalize.py`：标题规范化、关注资产别名识别、字符二元组 Jaccard 标题相似度（含测试）
 
 ## 4. 规则引擎
 
