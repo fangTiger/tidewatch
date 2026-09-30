@@ -15,3 +15,8 @@ LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 def utcnow() -> datetime:
     """返回带时区的 UTC 当前时间"""
     return datetime.now(timezone.utc)
+
+
+def format_local(when: datetime, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """把带时区的时间格式化为上海时间字符串"""
+    return when.astimezone(LOCAL_TZ).strftime(fmt)
