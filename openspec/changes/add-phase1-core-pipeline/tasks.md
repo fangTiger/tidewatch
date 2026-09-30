@@ -38,7 +38,7 @@
 
 ## 7. 采集器
 
-- [ ] 7.1 实现 `collectors/base.py`：`PollCollector`、`StreamCollector`、令牌桶限流、指数退避、提交后推进游标、健康上报与异常判定（含测试）
+- [x] 7.1 实现 `collectors/base.py`：`PollCollector`、`StreamCollector`、令牌桶限流、指数退避、提交后推进游标、健康上报与异常判定（含测试）
 - [x] 7.2 实现健康监控：状态变化广播、`send_health` 异常告警每源每小时 1 条、恢复通知（含测试）
 - [ ] 7.3 实现 `jin10` 采集器：参照开源实现确定接口，录制真实响应到 `tests/fixtures/jin10/`，解析与去重键测试
 - [ ] 7.4 实现 `okx_ann` 采集器：接口解析、公告分类、录制夹具与测试
