@@ -45,11 +45,21 @@ async def test_exchange_levels(exchange, kind, assets, level):
     assert f"exchange.{exchange}.{kind}" in result.hits
 
 
-async def test_exchange_name_falls_back_to_source():
+@pytest.mark.parametrize("raw", [{}, {"exchange": "  "}])
+async def test_exchange_name_falls_back_to_source(raw):
     event = _ann("binance", "spot_listing", ["XYZ"])
-    event.raw = {}  # 采集器漏写 raw.exchange 时按来源名推断
+    event.raw = raw  # 采集器漏写（或写成空白）raw.exchange 时按来源名推断
     result = await ExchangeRules(watch_symbols=set()).evaluate(event, CTX)
     assert result.level == "S"
+
+
+@pytest.mark.parametrize("raw_exchange", ["OKX", " OKX ", " okx"])
+async def test_exchange_name_is_normalized(raw_exchange):
+    event = _ann("okx", "spot_listing", ["XYZ"])
+    event.raw = {"exchange": raw_exchange}
+    result = await ExchangeRules(watch_symbols=set()).evaluate(event, CTX)
+    assert result.level == "A"
+    assert "exchange.okx.spot_listing" in result.hits
 
 
 async def test_build_rule_engine(settings):

@@ -12,7 +12,7 @@ from __future__ import annotations
 from tidewatch.config import NewsRulesCfg
 from tidewatch.models import Event, RuleResult
 from tidewatch.pipeline.rules.engine import RuleContext
-from tidewatch.pipeline.rules.keywords import matched_ids
+from tidewatch.pipeline.rules.keywords import matched_ids, text_contains
 
 
 class NewsRules:
@@ -25,8 +25,8 @@ class NewsRules:
         s_hits = matched_ids(text, self._cfg.s_keywords)
         a_hits = matched_ids(text, self._cfg.a_keywords)
         has_asset = bool(event.assets)
-        lowered = text.lower()
-        has_person = any(person.lower() in lowered for person in self._cfg.people)
+        # 人物匹配与关键词规则语义一致：NFKC 规范化，英文名按独立单词匹配
+        has_person = any(text_contains(text, person) for person in self._cfg.people)
 
         if important and s_hits:
             return RuleResult("S", ["news.important", *s_hits])

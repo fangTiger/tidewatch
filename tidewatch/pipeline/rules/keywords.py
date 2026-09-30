@@ -18,7 +18,10 @@ def _normalize(text: str | None) -> str:
 
 def _contains(content: str, word: str) -> bool:
     """content 须已规范化"""
-    needle = _normalize(word)
+    needle = _normalize(word).strip()
+    if not needle:
+        # 空关键词不匹配任何文本（配置层已拦截，这里防御）
+        return False
     if needle.isascii():
         return re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", content) is not None
     return needle in content

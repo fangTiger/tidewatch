@@ -2,7 +2,9 @@ from pathlib import Path
 
 import pytest
 
-from tidewatch.config import ConfigError, deep_merge, load_settings
+from pydantic import ValidationError
+
+from tidewatch.config import AssetCfg, ConfigError, KeywordRule, NewsRulesCfg, deep_merge, load_settings
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV = {"TIDEWATCH_DATABASE_URL": "postgresql+asyncpg://u:p@localhost:5432/tidewatch"}
@@ -191,6 +193,41 @@ def test_asset_symbol_must_not_be_blank(tmp_path):
     message = str(exc.value)
     assert "watchlist.assets" in message and "symbol" in message
     assert "关注资产代码不能为空" in message
+
+
+@pytest.mark.parametrize("field", ["all", "any", "none"])
+def test_keyword_rule_items_must_not_be_blank(field):
+    kwargs = {"id": "r", "any": ["关税"], field: ["关税", "  "]}
+    with pytest.raises(ValidationError) as exc:
+        KeywordRule(**kwargs)
+    assert "关键词不能为空" in str(exc.value)
+
+
+def test_keyword_rule_blank_reported_in_chinese(tmp_path):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(
+        'rules:\n  news:\n    s_keywords:\n      - {id: s.blank, any: [""]}\n', encoding="utf-8"
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+    message = str(exc.value)
+    assert "rules.news.s_keywords" in message and "关键词不能为空" in message
+
+
+def test_news_people_must_not_be_blank(tmp_path):
+    with pytest.raises(ValidationError) as exc:
+        NewsRulesCfg(s_keywords=[], a_keywords=[], people=["特朗普", " "])
+    assert "人物名不能为空" in str(exc.value)
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text('rules:\n  news:\n    people: ["马斯克", ""]\n', encoding="utf-8")
+    with pytest.raises(ConfigError) as config_exc:
+        load_settings(base, environ=ENV)
+    message = str(config_exc.value)
+    assert "rules.news.people" in message and "人物名不能为空" in message
+
+
+def test_asset_symbol_is_stripped():
+    assert AssetCfg(symbol=" BTC ").symbol == "BTC"
 
 
 @pytest.mark.parametrize("filename", ["config.yaml", "config.local.yaml"])

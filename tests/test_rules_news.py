@@ -1,9 +1,9 @@
 from datetime import datetime, timezone
 
-from tidewatch.config import KeywordRule
+from tidewatch.config import KeywordRule, NewsRulesCfg
 from tidewatch.models import Event, RuleResult
 from tidewatch.pipeline.rules.engine import RuleContext, RuleEngine
-from tidewatch.pipeline.rules.keywords import match_rule, text_contains
+from tidewatch.pipeline.rules.keywords import _contains, match_rule, text_contains
 from tidewatch.pipeline.rules.news import NewsRules
 
 NOW = datetime(2026, 9, 30, 2, 0, tzinfo=timezone.utc)
@@ -37,6 +37,14 @@ def test_keyword_rule_combinations():
     assert not match_rule("任意文本", KeywordRule.model_construct(id="empty"))
 
 
+def test_blank_keyword_never_matches():
+    # 规范化后为空的关键词不应匹配任何文本（配置层已拦截，这里验证防御行为）
+    assert not _contains("任意文本", "")
+    assert not _contains("任意文本", "   ")
+    assert not text_contains("任意文本", "")
+    assert not match_rule("任意文本", KeywordRule.model_construct(id="b", all=[], any=[""], none=[]))
+
+
 async def _level(rules: NewsRules, event: Event) -> RuleResult:
     return await rules.evaluate(event, CTX)
 
@@ -68,3 +76,14 @@ async def test_engine_dispatch_by_category(settings):
     other.category = "unknown"
     result = await engine.evaluate(other, CTX)
     assert result.level == "C" and result.hits == ["no_rules"]
+
+
+async def test_person_matching_reuses_keyword_semantics():
+    cfg = NewsRulesCfg(s_keywords=[], a_keywords=[], people=["Trump"])
+    rules = NewsRules(cfg)
+    # 英文人物名按独立单词匹配，且不区分大小写
+    assert (await _level(rules, _flash("Trump says bitcoin", assets=["BTC"]))).level == "A"
+    assert (await _level(rules, _flash("TRUMP：比特币", assets=["BTC"]))).level == "A"
+    assert (await _level(rules, _flash("trumpet 演奏", assets=["BTC"]))).level == "B"
+    # 全角字符经 NFKC 规范化后也能匹配
+    assert (await _level(rules, _flash("Ｔｒｕｍｐ 发言", assets=["BTC"]))).level == "A"

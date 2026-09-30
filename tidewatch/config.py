@@ -35,7 +35,8 @@ class AssetCfg(_Strict):
         # 空代码会让资产识别失去意义，在配置层提前拦截
         if not value.strip():
             raise ValueError("关注资产代码不能为空")
-        return value
+        # 去除首尾空白，避免 " BTC " 与 "BTC" 被当成不同资产
+        return value.strip()
 
     @field_validator("aliases")
     @classmethod
@@ -55,6 +56,14 @@ class KeywordRule(_Strict):
     all: list[str] = []
     any: list[str] = []
     none: list[str] = []
+
+    @field_validator("all", "any", "none")
+    @classmethod
+    def _keywords_not_blank(cls, value: list[str]) -> list[str]:
+        # 空关键词会匹配任意文本，导致规则失去意义
+        if any(not word.strip() for word in value):
+            raise ValueError("关键词不能为空")
+        return value
 
     @model_validator(mode="after")
     def _need_all_or_any(self) -> KeywordRule:
@@ -79,6 +88,14 @@ class NewsRulesCfg(_Strict):
     s_keywords: list[KeywordRule]
     a_keywords: list[KeywordRule]
     people: list[str]
+
+    @field_validator("people")
+    @classmethod
+    def _people_not_blank(cls, value: list[str]) -> list[str]:
+        # 空人物名会匹配任意文本，导致关注资产的快讯都被升级为 A
+        if any(not person.strip() for person in value):
+            raise ValueError("人物名不能为空")
+        return value
 
 
 class ExchangeRulesCfg(_Strict):
