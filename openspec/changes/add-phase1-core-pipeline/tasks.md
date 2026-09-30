@@ -24,7 +24,7 @@
 
 ## 5. 事件流水线
 
-- [ ] 5.1 实现 `pipeline/cluster.py`：`news` 标题相似度聚簇、`news`↔`exchange` 跨类显式匹配、窗口判断，候选从数据库查询（含测试）
+- [x] 5.1 实现 `pipeline/cluster.py`：`news` 标题相似度聚簇、`news`↔`exchange` 跨类显式匹配、窗口判断，候选从数据库查询（含测试）
 - [ ] 5.2 实现 `pipeline/decision.py` 推送决策：新鲜事件判定、首次推送、A→S 升级与取代、同级不重复（含测试）
 - [ ] 5.3 实现 `pipeline/sink.py`：串行命令队列，`ingest` 事务（插入去重、分级、聚簇、推送决策、AI 标记、游标）与逐条保存点降级（含测试）
 - [ ] 5.4 实现 `EventSink.push_result`：回写推送状态、更新 `delivered_level`、处理已取代记录（含测试）
