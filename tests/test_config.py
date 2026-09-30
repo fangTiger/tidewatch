@@ -4,7 +4,16 @@ import pytest
 
 from pydantic import ValidationError
 
-from tidewatch.config import AssetCfg, ConfigError, KeywordRule, NewsRulesCfg, deep_merge, load_settings
+from tidewatch.config import (
+    AssetCfg,
+    ConfigError,
+    ExchangeRulesCfg,
+    KeywordRule,
+    NewsRulesCfg,
+    deep_merge,
+    load_settings,
+)
+from tidewatch.pipeline.normalize import AssetMatcher
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV = {"TIDEWATCH_DATABASE_URL": "postgresql+asyncpg://u:p@localhost:5432/tidewatch"}
@@ -228,6 +237,38 @@ def test_news_people_must_not_be_blank(tmp_path):
 
 def test_asset_symbol_is_stripped():
     assert AssetCfg(symbol=" BTC ").symbol == "BTC"
+
+
+def test_asset_aliases_are_stripped():
+    # 别名首尾空白必须去掉，否则 " Bitcoin " 永远匹配不到 "Bitcoin rises"
+    cfg = AssetCfg(symbol="BTC", aliases=[" Bitcoin ", "\t比特币\n"])
+    assert cfg.aliases == ["Bitcoin", "比特币"]
+    assert AssetMatcher([cfg]).find("Bitcoin rises") == ["BTC"]
+
+
+_EXCHANGE_BLANK_CASES = [
+    ("exchange_names", "交易所名称不能为空"),
+    ("listing_keywords", "上币/下架关键词不能为空"),
+]
+
+
+@pytest.mark.parametrize("field, expected", _EXCHANGE_BLANK_CASES)
+def test_exchange_rule_items_must_not_be_blank(field, expected):
+    kwargs = {"exchange_names": ["币安"], "listing_keywords": ["上线"]}
+    kwargs[field] = ["币安", "  "]
+    with pytest.raises(ValidationError) as exc:
+        ExchangeRulesCfg(**kwargs)
+    assert expected in str(exc.value)
+
+
+@pytest.mark.parametrize("field, expected", _EXCHANGE_BLANK_CASES)
+def test_exchange_rule_blank_reported_in_chinese(tmp_path, field, expected):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(f'rules:\n  exchange:\n    {field}: ["", 币安]\n', encoding="utf-8")
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+    message = str(exc.value)
+    assert f"rules.exchange.{field}" in message and expected in message
 
 
 @pytest.mark.parametrize("filename", ["config.yaml", "config.local.yaml"])

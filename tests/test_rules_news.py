@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from tidewatch.config import KeywordRule, NewsRulesCfg
 from tidewatch.models import Event, RuleResult
 from tidewatch.pipeline.rules.engine import RuleContext, RuleEngine
-from tidewatch.pipeline.rules.keywords import _contains, match_rule, text_contains
+from tidewatch.pipeline.rules.keywords import match_rule, text_contains
 from tidewatch.pipeline.rules.news import NewsRules
 
 NOW = datetime(2026, 9, 30, 2, 0, tzinfo=timezone.utc)
@@ -39,9 +39,8 @@ def test_keyword_rule_combinations():
 
 def test_blank_keyword_never_matches():
     # 规范化后为空的关键词不应匹配任何文本（配置层已拦截，这里验证防御行为）
-    assert not _contains("任意文本", "")
-    assert not _contains("任意文本", "   ")
     assert not text_contains("任意文本", "")
+    assert not text_contains("任意文本", "   ")
     assert not match_rule("任意文本", KeywordRule.model_construct(id="b", all=[], any=[""], none=[]))
 
 

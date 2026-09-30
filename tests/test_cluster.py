@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from sqlalchemy import select
 
 from tidewatch.models import Event
@@ -85,3 +86,81 @@ async def test_listing_news_without_symbol_not_merged(engine, settings):
         ann = await _add(conn, clusterer, "Binance Will List XYZ (XYZ)", category="exchange", source="binance_ann", assets=["XYZ"])
         news = await _add(conn, clusterer, "币安将上线新币")
     assert news.id != ann.id
+
+
+async def test_window_counts_from_first_seen_not_last_seen(engine, settings):
+    """窗口自簇的 first_seen_at 起算：+8 分钟并入后 last_seen 推到 +8，+12 分钟仍应新建簇"""
+    clusterer = _clusterer(settings)
+    async with engine.begin() as conn:
+        first = await _add(conn, clusterer, NFP)
+        joined = await _add(conn, clusterer, NFP, now=NOW + timedelta(minutes=8))
+        late = await _add(conn, clusterer, NFP, now=NOW + timedelta(minutes=12))
+        last_seen = (
+            await conn.execute(select(event_clusters.c.last_seen_at).where(event_clusters.c.id == first.id))
+        ).scalar_one()
+    assert joined.id == first.id
+    assert last_seen == NOW + timedelta(minutes=8)  # 若按 last_seen 起算，+12 分钟的事件会被并入
+    assert late.id != first.id
+
+
+async def test_source_count_deduplicates_sources(engine, settings):
+    """同一来源的多条事件只算一个来源，member_count 仍按事件数计"""
+    clusterer = _clusterer(settings)
+    async with engine.begin() as conn:
+        await _add(conn, clusterer, NFP, source="jin10")
+        await _add(conn, clusterer, f"{NFP}！", now=NOW + timedelta(minutes=1), source="jin10")
+        third = await _add(conn, clusterer, f"【{NFP}】", now=NOW + timedelta(minutes=2), source="other")
+    assert third.member_count == 3 and third.source_count == 2
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "XYZ 大涨",  # 只有币种
+        "币安 XYZ 大涨",  # 有交易所名，缺上币/下架关键词
+        "XYZ 将上线",  # 有上币关键词，缺交易所名
+    ],
+)
+async def test_cross_category_needs_exchange_name_and_listing_keyword(engine, settings, title):
+    """快讯并入公告簇必须同时含交易所名与上币/下架关键词"""
+    clusterer = _clusterer(settings)
+    async with engine.begin() as conn:
+        ann = await _add(
+            conn, clusterer, "Binance Will List XYZ (XYZ)", category="exchange", source="binance_ann", assets=["XYZ"]
+        )
+        news = await _add(conn, clusterer, title, now=NOW + timedelta(minutes=1))
+    assert news.id != ann.id
+
+
+async def test_tie_on_first_seen_prefers_newest_cluster(engine, settings):
+    """first_seen_at 相同时按簇 id 倒序，结果确定：并入较新的簇"""
+    clusterer = _clusterer(settings)
+    async with engine.begin() as conn:
+        older = await _add(
+            conn, clusterer, "Binance Will List XYZ (XYZ)", category="exchange", source="binance_ann", assets=["XYZ"]
+        )
+        newer = await _add(
+            conn, clusterer, "OKX to list XYZ (XYZ) for spot trading", category="exchange", source="okx_ann", assets=["XYZ"]
+        )
+        news = await _add(conn, clusterer, "币安将上线XYZ", now=NOW + timedelta(minutes=1))
+    assert older.id != newer.id and newer.id > older.id
+    assert news.id == newer.id
+
+
+async def test_unsaved_event_rejected(engine, settings):
+    """事件尚未入库（id 为 None）时，新建簇与并入簇都应报错，而不是静默写入"""
+    clusterer = _clusterer(settings)
+
+    def unsaved(title: str) -> Event:
+        event = Event(source="jin10", category="news", event_type="flash", occurred_at=NOW, title=title,
+                      dedupe_key=f"jin10:{title}", assets=[])
+        event.final_level = "B"
+        return event
+
+    async with engine.begin() as conn:
+        with pytest.raises(ValueError, match="事件尚未入库"):
+            await clusterer.create_single(conn, unsaved("新建簇"), NOW)
+    async with engine.begin() as conn:
+        await _add(conn, clusterer, NFP)
+        with pytest.raises(ValueError, match="事件尚未入库"):
+            await clusterer.assign(conn, unsaved(NFP), NOW)

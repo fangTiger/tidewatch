@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select, update
@@ -20,7 +21,11 @@ async def insert_event(conn: AsyncConnection, event: Event, now: datetime) -> in
     """插入事件；dedupe_key 已存在时不做修改并返回 None
 
     插入成功时回填 event.id 与 event.collected_at。
+    amount_usd 为 float 时先按十进制字面值归一化（0.1 存为 0.1，而不是 0.1000000000000000055…）。
     """
+    amount_usd = event.amount_usd
+    if isinstance(amount_usd, float):
+        amount_usd = Decimal(str(amount_usd))
     stmt = (
         pg_insert(events)
         .values(
@@ -34,7 +39,7 @@ async def insert_event(conn: AsyncConnection, event: Event, now: datetime) -> in
             body=(event.body or "")[:BODY_LIMIT],
             url=event.url,
             assets=list(event.assets),
-            amount_usd=event.amount_usd,
+            amount_usd=amount_usd,
             dedupe_key=event.dedupe_key,
             raw=event.raw,
         )
@@ -49,7 +54,9 @@ async def insert_event(conn: AsyncConnection, event: Event, now: datetime) -> in
 
 
 async def save_grading(conn: AsyncConnection, event: Event) -> None:
-    """回写分级结果与 AI 状态"""
+    """回写分级结果与 AI 状态；事件必须已入库（id 不为 None）"""
+    if event.id is None:
+        raise ValueError("事件尚未入库")
     await conn.execute(
         update(events)
         .where(events.c.id == event.id)

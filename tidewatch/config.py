@@ -44,7 +44,8 @@ class AssetCfg(_Strict):
         # 空别名会匹配任意文本，导致所有快讯都被识别为该资产
         if any(not alias.strip() for alias in value):
             raise ValueError("关注资产别名不能为空")
-        return value
+        # 去除首尾空白，否则 " Bitcoin " 永远匹配不到 "Bitcoin rises"
+        return [alias.strip() for alias in value]
 
 
 class WatchlistCfg(_Strict):
@@ -101,6 +102,22 @@ class NewsRulesCfg(_Strict):
 class ExchangeRulesCfg(_Strict):
     exchange_names: list[str]
     listing_keywords: list[str]
+
+    @field_validator("exchange_names")
+    @classmethod
+    def _names_not_blank(cls, value: list[str]) -> list[str]:
+        # 空交易所名会让「含交易所名」的判断恒为真，导致快讯被误并入公告簇
+        if any(not name.strip() for name in value):
+            raise ValueError("交易所名称不能为空")
+        return value
+
+    @field_validator("listing_keywords")
+    @classmethod
+    def _listing_keywords_not_blank(cls, value: list[str]) -> list[str]:
+        # 空关键词会让「含上币/下架关键词」的判断恒为真
+        if any(not word.strip() for word in value):
+            raise ValueError("上币/下架关键词不能为空")
+        return value
 
 
 class RulesCfg(_Strict):

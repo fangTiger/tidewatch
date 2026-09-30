@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
+import pytest
 from sqlalchemy import select
 
 from tidewatch.models import Event
@@ -54,3 +56,31 @@ async def test_cursor_roundtrip(engine):
         row = (await conn.execute(select(collector_state))).mappings().one()
     assert row["last_event_at"] == NOW
     assert row["updated_at"] == NOW + timedelta(minutes=1)
+
+
+async def test_save_cursor_conflict_updates_cursor_and_last_event_at(engine):
+    """冲突分支：第二次传入新 cursor 且 had_events=True，应写入新 cursor 与新的 last_event_at"""
+    later = NOW + timedelta(minutes=5)
+    async with engine.begin() as conn:
+        await save_cursor(conn, "jin10", {"last_id": "1"}, NOW, had_events=True)
+        await save_cursor(conn, "jin10", {"last_id": "2"}, later, had_events=True)
+        assert await load_cursor(conn, "jin10") == {"last_id": "2"}
+        row = (await conn.execute(select(collector_state))).mappings().one()
+    assert row["last_event_at"] == later and row["updated_at"] == later
+
+
+async def test_insert_event_normalizes_float_amount(engine):
+    """float 金额按其十进制字面值入库，不引入二进制浮点误差"""
+    event = _event("jin10:amount")
+    event.amount_usd = 0.1
+    async with engine.begin() as conn:
+        await insert_event(conn, event, NOW)
+        amount = (await conn.execute(select(events.c.amount_usd).where(events.c.id == event.id))).scalar_one()
+    assert amount == Decimal("0.1")
+    assert str(amount) == "0.1"
+
+
+async def test_save_grading_requires_saved_event(engine):
+    async with engine.begin() as conn:
+        with pytest.raises(ValueError, match="事件尚未入库"):
+            await save_grading(conn, _event("jin10:unsaved"))

@@ -24,6 +24,11 @@ from tidewatch.store.tables import event_clusters, events
 _MATCHABLE = ("news", "exchange")
 
 
+def _require_saved(event: Event) -> None:
+    if event.id is None:
+        raise ValueError("事件尚未入库")
+
+
 @dataclass
 class ClusterState:
     """聚簇后簇的最新状态"""
@@ -54,7 +59,8 @@ class Clusterer:
         return await self._join(conn, cluster_id, event, now)
 
     async def create_single(self, conn: AsyncConnection, event: Event, now: datetime) -> ClusterState:
-        """为事件新建一个只含它自己的簇"""
+        """为事件新建一个只含它自己的簇；事件必须已入库"""
+        _require_saved(event)  # 先校验，避免报错前已写入孤立的簇记录
         cluster_id = (
             await conn.execute(
                 insert(event_clusters)
@@ -76,7 +82,8 @@ class Clusterer:
             select(event_clusters.c.id, event_clusters.c.category, events.c.title, events.c.assets)
             .select_from(event_clusters.join(events, events.c.id == event_clusters.c.first_event_id))
             .where(event_clusters.c.category.in_(_MATCHABLE), event_clusters.c.first_seen_at >= since)
-            .order_by(event_clusters.c.first_seen_at.desc())
+            # first_seen_at 相同时按 id 倒序，保证并入哪个簇的结果是确定的
+            .order_by(event_clusters.c.first_seen_at.desc(), event_clusters.c.id.desc())
         )
         for row in (await conn.execute(stmt)).all():
             if self._matches(event, row.category, row.title, row.assets):
@@ -126,6 +133,7 @@ class Clusterer:
 
     @staticmethod
     async def _attach(conn: AsyncConnection, event: Event, cluster_id: int) -> None:
+        _require_saved(event)
         await conn.execute(update(events).where(events.c.id == event.id).values(cluster_id=cluster_id))
         event.cluster_id = cluster_id
 
