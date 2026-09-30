@@ -21,7 +21,7 @@ from tidewatch.pipeline.cluster import Clusterer
 from tidewatch.pipeline.decision import PushDecider, PushPlan, freshness_from_settings
 from tidewatch.pipeline.normalize import AssetMatcher
 from tidewatch.pipeline.rules.engine import CategoryRules, RuleContext, build_rule_engine
-from tidewatch.store.repo import insert_event, save_cursor, save_grading
+from tidewatch.store.repo import insert_event, record_push_result, save_cursor, save_grading
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,18 @@ class IngestOutcome:
 
 
 IngestListener = Callable[[IngestOutcome], None]
+
+
+@dataclass
+class PushOutcome:
+    """一次推送结果回写后的摘要"""
+
+    push_id: int
+    cluster_id: int
+    status: str  # 回写后的实际状态
+
+
+PushListener = Callable[[PushOutcome], None]
 
 
 class EventSink:
@@ -66,11 +78,15 @@ class EventSink:
         self._worker: asyncio.Task | None = None
         self._closing = False
         self._ingest_listeners: list[IngestListener] = []
+        self._push_listeners: list[PushListener] = []
 
     # ---------- 生命周期与监听 ----------
 
     def on_ingest(self, listener: IngestListener) -> None:
         self._ingest_listeners.append(listener)
+
+    def on_push_result(self, listener: PushListener) -> None:
+        self._push_listeners.append(listener)
 
     async def start(self) -> None:
         if self._worker is None:
@@ -91,6 +107,12 @@ class EventSink:
     async def ingest(self, result: FetchResult, *, collector: str) -> list[int]:
         """提交一批采集结果；事务提交后返回新插入的事件 id（重复事件不计入）"""
         return await self._submit(self._do_ingest, result, collector)
+
+    async def push_result(
+        self, push_id: int, status: str, *, response: str | None = None, batch_id: str | None = None
+    ) -> str | None:
+        """回写推送结果（ok / failed / dry_run / expired），返回记录的最终状态；记录不存在时返回 None"""
+        return await self._submit(self._do_push_result, push_id, status, response, batch_id)
 
     async def _submit(self, func, *args):
         if self._worker is None or self._closing:
@@ -173,6 +195,20 @@ class EventSink:
             await save_grading(conn, event)
             await self._clusterer.create_single(conn, event, now)
             return None
+
+    async def _do_push_result(
+        self, push_id: int, status: str, response: str | None, batch_id: str | None
+    ) -> str | None:
+        async with self._engine.begin() as conn:
+            recorded = await record_push_result(
+                conn, push_id, status, self._clock(), response=response, batch_id=batch_id
+            )
+        if recorded is None:
+            logger.warning("推送记录不存在：%s", push_id)
+            return None
+        final_status, cluster_id = recorded
+        self._emit(self._push_listeners, PushOutcome(push_id, cluster_id, final_status))
+        return final_status
 
     @staticmethod
     def _emit(listeners: list[Callable[[Any], None]], payload: Any) -> None:

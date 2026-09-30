@@ -9,10 +9,11 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
-from tidewatch.models import Event
-from tidewatch.store.tables import collector_state, events
+from tidewatch.models import Event, max_level
+from tidewatch.store.tables import collector_state, event_clusters, events, push_log
 
 BODY_LIMIT = 2000
+PUSH_RESULT_STATUSES = ("ok", "failed", "dry_run", "expired")
 
 
 async def insert_event(conn: AsyncConnection, event: Event, now: datetime) -> int | None:
@@ -84,3 +85,50 @@ async def save_cursor(
     stmt = pg_insert(collector_state).values(**values)
     set_ = {key: stmt.excluded[key] for key in values if key != "name"}
     await conn.execute(stmt.on_conflict_do_update(index_elements=["name"], set_=set_))
+
+
+async def record_push_result(
+    conn: AsyncConnection,
+    push_id: int,
+    status: str,
+    now: datetime,
+    *,
+    response: str | None = None,
+    batch_id: str | None = None,
+) -> tuple[str, int] | None:
+    """回写一次推送结果，返回 (最终状态, 簇 id)；记录不存在时返回 None"""
+    if status not in PUSH_RESULT_STATUSES:
+        raise ValueError(f"非法的推送结果状态：{status}")
+    row = (
+        await conn.execute(
+            select(push_log.c.status, push_log.c.cluster_id, push_log.c.level)
+            .where(push_log.c.id == push_id)
+            .with_for_update()
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    delivered = status in ("ok", "dry_run")
+    final_status = row.status
+    if row.status in ("pending", "failed"):
+        final_status = status
+        values: dict[str, Any] = {"status": status}
+        if status != "expired":
+            values["attempts"] = push_log.c.attempts + 1
+        if response is not None:
+            values["response"] = response[:500]
+        if batch_id is not None:
+            values["batch_id"] = batch_id
+        if delivered:
+            values["sent_at"] = now
+        await conn.execute(update(push_log).where(push_log.c.id == push_id).values(**values))
+    if delivered:
+        current = (
+            await conn.execute(select(event_clusters.c.delivered_level).where(event_clusters.c.id == row.cluster_id))
+        ).scalar_one()
+        await conn.execute(
+            update(event_clusters)
+            .where(event_clusters.c.id == row.cluster_id)
+            .values(delivered_level=max_level(current, row.level))
+        )
+    return final_status, row.cluster_id
