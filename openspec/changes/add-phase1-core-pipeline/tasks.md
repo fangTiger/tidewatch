@@ -52,7 +52,7 @@
 
 ## 9. 装配与运维
 
-- [ ] 9.1 实现 `app.py` 与 `__main__.py`：按组启动组件、`--only`、`--dry-run`、uvicorn 嵌入同一事件循环、启动恢复、SIGTERM/SIGINT 优雅退出
+- [x] 9.1 实现 `app.py` 与 `__main__.py`：按组启动组件、`--only`、`--dry-run`、uvicorn 嵌入同一事件循环、启动恢复、SIGTERM/SIGINT 优雅退出
 - [ ] 9.2 编写 `deploy/com.captain.tidewatch.plist` 与安装/卸载脚本（`caffeinate -i`、`RunAtLoad`、`KeepAlive`）
 - [ ] 9.3 编写 `README.md`（中文）：安装、配置、运行、launchd、注意事项（不要合盖）
 
