@@ -18,8 +18,8 @@
 
 ## 4. 规则引擎
 
-- [ ] 4.1 实现 `RuleEngine`（异步）、`RuleContext` 与关键词组合匹配（all / any / none）（含测试）
-- [ ] 4.2 实现 `news` 规则：金十 S/A/B/C 分级（含边界测试）
+- [x] 4.1 实现 `RuleEngine`（异步）、`RuleContext` 与关键词组合匹配（all / any / none）（含测试）
+- [x] 4.2 实现 `news` 规则：金十 S/A/B/C 分级（含边界测试）
 - [ ] 4.3 实现 `exchange` 规则：公告类型 × 交易所 × 是否关注资产的分级表（含测试）
 
 ## 5. 事件流水线
