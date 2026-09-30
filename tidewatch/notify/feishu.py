@@ -1,9 +1,10 @@
 """飞书群自定义机器人通知器
 
-安全约定：新闻标题、正文、公告标题、健康告警 detail 都是外部不可信文本，
+安全约定：新闻标题、正文、公告标题、资产代码、健康告警 detail 都可能来自外部文本，
 一律使用 plain_text 展示，绝不放进 lark_md（否则会被解析为 @所有人、钓鱼链接等）。
-lark_md 中只允许出现固定字段（时间、来源中文名、来源数量、资产代码），
-其中资产代码来自配置或公告标题提取，写入前经 _md_safe 去除 Markdown 特殊字符。
+lark_md 中只允许出现代码生成的固定内容（@所有人、时间、来源中文名、来源数量），
+其中来源名写入前仍经 _md_safe 去除 Markdown 特殊字符，作为兜底。
+资产行（「资产：BTC、ETH」）单独放在 plain_text 块中，最多显示 _ASSET_LIMIT 个。
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import hmac
 import time
 import unicodedata
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -29,6 +31,8 @@ _TITLE_LIMIT = 80
 _BODY_LIMIT = 300
 _DIGEST_TITLE_LIMIT = 60
 _DETAIL_LIMIT = 500
+# 资产行最多显示的资产数量，超出部分折叠为「等 N 个」
+_ASSET_LIMIT = 10
 
 # lark_md 的特殊字符 → 全角替换字符（换行压成空格），避免被解析为标签、链接或强调
 _MD_SAFE_TABLE = str.maketrans(
@@ -59,8 +63,8 @@ def sign(timestamp: str, secret: str) -> str:
 def _md_safe(text: str) -> str:
     """把文本中的 Markdown 特殊字符替换为全角字符，使其可安全放入 lark_md
 
-    仅用于配置或公告标题提取出的短文本（如资产代码）；新闻标题、正文等
-    自由文本不走这里，而是直接使用 plain_text。
+    仅用于代码生成的短文本（如来源名）作为兜底；新闻标题、正文、资产代码等
+    外部文本不走这里，而是直接使用 plain_text。
     """
     return text.translate(_MD_SAFE_TABLE)
 
@@ -76,23 +80,52 @@ def _plain_div(content: str) -> dict[str, Any]:
 
 
 def _button_url(url: str | None) -> str | None:
-    """返回可用作按钮链接的地址；仅 http:// 或 https:// 开头才有效（拒绝 javascript: 等协议）"""
+    """返回可用作按钮链接的地址；无效时返回 None
+
+    有效条件：去掉首尾空白后，scheme 为 http/https（拒绝 javascript: 等协议）、主机非空，
+    且整串不含空白与控制字符（含换行、制表符），无法解析的地址（如 IPv6 括号不配对）也视为无效。
+    """
     cleaned = (url or "").strip()
-    return cleaned if cleaned.lower().startswith(("http://", "https://")) else None
+    if not cleaned or any(ch.isspace() or unicodedata.category(ch) == "Cc" for ch in cleaned):
+        return None
+    try:
+        parts = urlsplit(cleaned)
+    except ValueError:
+        return None
+    # netloc 非空；再要求 hostname 非空，排除「https://@/x」这类只有用户信息、没有主机的地址
+    if parts.scheme not in ("http", "https") or not parts.netloc or not parts.hostname:
+        return None
+    return cleaned
 
 
 def _body_text(title: str, body: str) -> str:
-    """生成正文展示文本：去除与标题重复的开头并截断，无有效内容时返回空串"""
+    """生成正文展示文本：去除与标题重复的开头并截断，无有效内容时返回空串
+
+    只有标题后面恰好是结尾、空白或标点时才去掉标题前缀（如「标题：详情」→「详情」）；
+    标题只是正文开头的一部分（如标题「美联储降息」、正文「美联储降息25个基点」）时保留完整正文，
+    避免切出残缺的「25个基点」。
+    """
     title = title.strip()
     body = body.strip()
     if title and body.startswith(title):
         rest = body[len(title):]
-        start = 0
-        # 去掉标题后紧跟的空白与标点（如「：」「，」「。」）
-        while start < len(rest) and (rest[start].isspace() or unicodedata.category(rest[start]).startswith("P")):
-            start += 1
-        body = rest[start:]
+        if not rest or rest[0].isspace() or unicodedata.category(rest[0]).startswith("P"):
+            start = 0
+            # 去掉标题后紧跟的空白与标点（如「：」「，」「。」）
+            while start < len(rest) and (rest[start].isspace() or unicodedata.category(rest[start]).startswith("P")):
+                start += 1
+            body = rest[start:]
     return _truncate(body, _BODY_LIMIT) if body else ""
+
+
+def _assets_text(assets: list[str]) -> str:
+    """生成资产行文本「资产：BTC、ETH」；最多显示 _ASSET_LIMIT 个，超出加「 等 N 个」（N 为资产总数）；无资产返回空串"""
+    if not assets:
+        return ""
+    text = "资产：" + "、".join(assets[:_ASSET_LIMIT])
+    if len(assets) > _ASSET_LIMIT:
+        text += f" 等 {len(assets)} 个"
+    return text
 
 
 class FeishuNotifier(Notifier):
@@ -150,16 +183,17 @@ class FeishuNotifier(Notifier):
     def _event_card(card: EventCard, mention_all: bool) -> dict[str, Any]:
         """构造事件卡片
 
-        结构：header（plain_text 标题）→ lark_md 固定字段块（@所有人、时间、来源、资产）
-        → plain_text 正文块（可选）→ 「查看原文」按钮（仅 http/https 链接）。
+        结构：header（plain_text 标题）→ lark_md 固定字段块（@所有人、时间、来源）
+        → plain_text 资产行（可选）→ plain_text 正文块（可选）→ 「查看原文」按钮（仅有效的 http/https 链接）。
         """
         lines = ["<at id=all></at>"] if mention_all else []
         lines.append(f"**时间**：{format_local(card.occurred_at)}")
         extra = f"（另有 {card.source_count - 1} 个来源）" if card.source_count > 1 else ""
         lines.append(f"**来源**：{_md_safe(source_name(card.source))}{extra}")
-        if card.assets:
-            lines.append(f"**资产**：{'、'.join(_md_safe(asset) for asset in card.assets)}")
         elements: list[dict[str, Any]] = [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}}]
+        assets = _assets_text(card.assets)
+        if assets:
+            elements.append(_plain_div(assets))  # 资产代码可能来自公告标题提取，不放进 lark_md
         body = _body_text(card.title, card.body)
         if body:
             elements.append(_plain_div(body))

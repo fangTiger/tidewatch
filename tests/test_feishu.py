@@ -63,9 +63,16 @@ def _ok_route() -> respx.Route:
     return respx.post(HOOK).mock(return_value=httpx.Response(200, json={"code": 0, "msg": "success", "data": {}}))
 
 
+def _asset_lines(payload: dict[str, Any]) -> list[str]:
+    """事件卡片中的资产行（plain_text div，内容以「资产：」开头）"""
+    return [e["text"]["content"] for e in payload["card"]["elements"][1:]
+            if e["tag"] == "div" and e["text"]["tag"] == "plain_text" and e["text"]["content"].startswith("资产：")]
+
+
 def _body_div(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    """事件卡片中除首个 lark_md 固定字段块之外的 div 元素"""
-    return [e for e in payload["card"]["elements"][1:] if e["tag"] == "div"]
+    """事件卡片中除首个 lark_md 固定字段块与资产行之外的 div 元素"""
+    return [e for e in payload["card"]["elements"][1:]
+            if e["tag"] == "div" and not e["text"]["content"].startswith("资产：")]
 
 
 def _has_button(payload: dict[str, Any]) -> bool:
@@ -93,11 +100,12 @@ async def test_s_card_signed_with_mention(make_notifier):
     assert body["card"]["header"]["title"]["content"].startswith("【S】美国9月非农")
     assert elements[0]["text"]["tag"] == "lark_md"
     assert "<at id=all></at>" in content and "2026-09-30 10:00:00" in content
-    assert "金十快讯（另有 2 个来源）" in content and "BTC" in content
-    # 正文单独放在 plain_text 中，不进入 lark_md
-    assert "正文内容" not in content
-    assert elements[1] == {"tag": "div", "text": {"tag": "plain_text", "content": "正文内容"}}
-    assert elements[2]["actions"][0]["url"] == "https://flash.jin10.com/detail/1"
+    assert "金十快讯（另有 2 个来源）" in content
+    # 资产行与正文都放在 plain_text 中，不进入 lark_md
+    assert "BTC" not in content and "正文内容" not in content
+    assert elements[1] == {"tag": "div", "text": {"tag": "plain_text", "content": "资产：BTC"}}
+    assert elements[2] == {"tag": "div", "text": {"tag": "plain_text", "content": "正文内容"}}
+    assert elements[3]["actions"][0]["url"] == "https://flash.jin10.com/detail/1"
 
 
 @respx.mock
@@ -110,7 +118,7 @@ async def test_upgraded_a_card_without_secret(make_notifier):
     assert body["card"]["header"]["title"]["content"].startswith("【升级】【A】")
     assert "<at id=all></at>" not in body["card"]["elements"][0]["text"]["content"]
     assert not _has_button(body)  # 没有原文链接时不加按钮
-    assert len(body["card"]["elements"]) == 2  # 固定字段 + 正文
+    assert len(body["card"]["elements"]) == 3  # 固定字段 + 资产行 + 正文
 
 
 @respx.mock
@@ -153,16 +161,17 @@ async def test_digest_and_health_cards(make_notifier):
 
 @respx.mock
 async def test_event_card_untrusted_text_never_in_lark_md(make_notifier):
-    """正文含 @所有人 与钓鱼链接：lark_md 中不得出现，正文只出现在 plain_text 中"""
+    """正文、资产含 @所有人 与钓鱼链接：lark_md 中不得出现，只出现在 plain_text 中"""
     route = _ok_route()
     card = _card(body=EVIL_BODY, assets=["BTC<at id=all></at>", "[领取](https://evil.example)"])
     await make_notifier().send_event(card, mention_all=False)
     payload = json.loads(route.calls.last.request.content)
     for content in _lark_md(payload):
-        assert "<at" not in content and "](" not in content
+        assert "<at" not in content and "](" not in content and "BTC" not in content
     assert EVIL_BODY in _plain_text(payload)
-    # 固定字段仍保留在 lark_md 中
-    assert "**时间**" in _lark_md(payload)[0] and "BTC" in _lark_md(payload)[0]
+    assert "资产：BTC<at id=all></at>、[领取](https://evil.example)" in _plain_text(payload)
+    # lark_md 里只有代码生成的固定字段
+    assert _lark_md(payload) == ["**时间**：2026-09-30 10:00:00\n**来源**：金十快讯"]
 
 
 @respx.mock
@@ -172,6 +181,7 @@ async def test_event_card_mention_all_is_only_at_in_lark_md(make_notifier):
     await make_notifier().send_event(_card(body=EVIL_BODY), mention_all=True)
     payload = json.loads(route.calls.last.request.content)
     assert "".join(_lark_md(payload)).count("<at") == 1
+    assert _lark_md(payload) == ["<at id=all></at>\n**时间**：2026-09-30 10:00:00\n**来源**：金十快讯"]
     assert EVIL_BODY in _plain_text(payload)
 
 
@@ -275,11 +285,61 @@ async def test_network_error_detail_contains_exception_type(make_notifier, exc):
     assert result.detail == f"网络错误：{type(exc).__name__} {exc}"
 
 
+# ---------- 资产行 ----------
+
+
+@respx.mock
+async def test_assets_line_is_plain_text_between_fixed_fields_and_body(make_notifier):
+    route = _ok_route()
+    await make_notifier().send_event(_card(assets=["BTC", "ETH"], body="正文内容"), mention_all=False)
+    payload = json.loads(route.calls.last.request.content)
+    elements = payload["card"]["elements"]
+    assert [e["tag"] for e in elements] == ["div", "div", "div", "action"]
+    assert elements[1]["text"] == {"tag": "plain_text", "content": "资产：BTC、ETH"}
+    assert elements[2]["text"] == {"tag": "plain_text", "content": "正文内容"}
+    assert "资产" not in "".join(_lark_md(payload)) and "BTC" not in "".join(_lark_md(payload))
+
+
+@respx.mock
+async def test_assets_line_omitted_when_no_assets(make_notifier):
+    route = _ok_route()
+    await make_notifier().send_event(_card(assets=[], body="正文内容"), mention_all=False)
+    payload = json.loads(route.calls.last.request.content)
+    assert _asset_lines(payload) == [] and "资产" not in "".join(_plain_text(payload))
+    await make_notifier().send_event(_card(assets=[], body=""), mention_all=False)
+    payload = json.loads(route.calls.last.request.content)
+    assert [e["tag"] for e in payload["card"]["elements"]] == ["div", "action"]  # 只有固定字段与按钮
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("count", "expected_suffix"),
+    [(1, ""), (10, ""), (11, " 等 11 个"), (25, " 等 25 个")],
+)
+async def test_assets_line_limited_to_ten(make_notifier, count, expected_suffix):
+    route = _ok_route()
+    assets = [f"A{i}" for i in range(count)]
+    await make_notifier().send_event(_card(assets=assets), mention_all=False)
+    payload = json.loads(route.calls.last.request.content)
+    assert _asset_lines(payload) == ["资产：" + "、".join(assets[:10]) + expected_suffix]
+
+
 # ---------- 原文按钮 url 校验 ----------
 
 
 @respx.mock
-@pytest.mark.parametrize("url", ["javascript:alert(1)", "ftp://example.com/a", "flash.jin10.com/1", "", "   "])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "javascript:alert(1)", "ftp://example.com/a", "flash.jin10.com/1", "", "   ",
+        "https://", "http://", "https:///path", "https://@/x",  # 缺少主机
+        "https://a b/c", "https://example.com/a b",  # 含空白
+        "https://example.com/a\nb", "https://example.com/a\r\nb", "https://example.com/a\tb",  # 含换行、制表符
+        "https://example.com/\x00", "https://exa\x1bmple.com/",  # 含控制字符
+        "https://example.com/\u3000a",  # 含全角空白
+        "https://[::1/a",  # urlsplit 会抛 ValueError
+    ],
+)
 async def test_button_omitted_for_non_http_url(make_notifier, url):
     route = _ok_route()
     await make_notifier().send_event(_card(url=url), mention_all=False)
@@ -287,7 +347,11 @@ async def test_button_omitted_for_non_http_url(make_notifier, url):
 
 
 @respx.mock
-@pytest.mark.parametrize("url", ["http://example.com/a", "https://example.com/a"])
+@pytest.mark.parametrize(
+    "url",
+    ["http://example.com/a", "https://example.com/a", "HTTPS://Example.com/A", "https://example.com:8443/a?b=c&d=e#f",
+     "https://example.com/新闻/1"],
+)
 async def test_button_present_for_http_url(make_notifier, url):
     route = _ok_route()
     await make_notifier().send_event(_card(url=url), mention_all=False)
@@ -304,6 +368,7 @@ async def test_button_present_for_http_url(make_notifier, url):
     [
         ("美国9月非农就业人口增加8.2万人：详细内容", "详细内容"),
         ("美国9月非农就业人口增加8.2万人 ， 详细内容", "详细内容"),
+        ("美国9月非农就业人口增加8.2万人\n详细内容", "详细内容"),
         ("与标题无关的正文", "与标题无关的正文"),
     ],
 )
@@ -315,11 +380,31 @@ async def test_body_dedup_strips_leading_title(make_notifier, body, expected):
 
 
 @respx.mock
+@pytest.mark.parametrize(
+    ("title", "body", "expected"),
+    [
+        # 标题只是正文开头的一部分（后面紧跟数字、文字）：保留完整正文，不能切成残缺的「25个基点」
+        ("美联储降息", "美联储降息25个基点", "美联储降息25个基点"),
+        ("美联储降息", "美联储降息了", "美联储降息了"),
+        ("美联储降息", "美联储降息Fed", "美联储降息Fed"),
+        # 标题后是标点或空白：去掉重复的标题前缀
+        ("美联储降息", "美联储降息：幅度 25 个基点", "幅度 25 个基点"),
+        ("美联储降息", "美联储降息 幅度 25 个基点", "幅度 25 个基点"),
+    ],
+)
+async def test_body_dedup_respects_title_boundary(make_notifier, title, body, expected):
+    route = _ok_route()
+    await make_notifier().send_event(_card(title=title, body=body), mention_all=False)
+    payload = json.loads(route.calls.last.request.content)
+    assert [e["text"]["content"] for e in _body_div(payload)] == [expected]
+
+
+@respx.mock
 @pytest.mark.parametrize("suffix", ["", " ", "。", " ，。 "])
 async def test_body_omitted_when_only_repeats_title(make_notifier, suffix):
     route = _ok_route()
     title = "美国9月非农就业人口增加8.2万人"
-    await make_notifier().send_event(_card(title=title, body=title + suffix), mention_all=False)
+    await make_notifier().send_event(_card(title=title, body=title + suffix, assets=[]), mention_all=False)
     payload = json.loads(route.calls.last.request.content)
     assert _body_div(payload) == []
     # 标题只应出现在 header 中，不得在任何正文元素里重复
