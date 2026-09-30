@@ -45,17 +45,22 @@ class DailyFileHandler(logging.Handler):
             today = self._today()
             if today != self._current:
                 self._rollover(today)
-            assert self._stream is not None
-            self._stream.write(self.format(record) + "\n")
-            self._stream.flush()
+            stream = self._stream
+            if stream is None:
+                raise RuntimeError("日志文件尚未打开")
+            stream.write(self.format(record) + "\n")
+            stream.flush()
         except Exception:
             self.handleError(record)
 
     def _rollover(self, today: date) -> None:
-        if self._stream is not None:
-            self._stream.close()
+        # 先打开新文件：打开失败时异常直接抛出，旧流与 _current 保持不变，下次 emit 会重试换日
+        new_stream = open(self._dir / f"{self._prefix}_{today.isoformat()}.log", "a", encoding="utf-8")
+        old_stream = self._stream
+        self._stream = new_stream
         self._current = today
-        self._stream = open(self._dir / f"{self._prefix}_{today.isoformat()}.log", "a", encoding="utf-8")
+        if old_stream is not None:
+            old_stream.close()
         self._cleanup(today)
 
     def _cleanup(self, today: date) -> None:
@@ -67,7 +72,11 @@ class DailyFileHandler(logging.Handler):
             except ValueError:
                 continue
             if day < cutoff:
-                path.unlink(missing_ok=True)
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    # 清理旧日志失败不应影响当前日志写入，下次换日再试
+                    continue
 
     def close(self) -> None:
         if self._stream is not None:

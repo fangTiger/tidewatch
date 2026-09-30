@@ -95,4 +95,88 @@ def test_unknown_key_rejected(tmp_path):
     (base / "config.local.yaml").write_text("collectors:\n  jin10:\n    interval: 5\n", encoding="utf-8")
     with pytest.raises(ConfigError) as exc:
         load_settings(base, environ=ENV)
-    assert "collectors.jin10.interval" in str(exc.value) and "未知配置项" in str(exc.value)
+    assert "collectors.jin10.interval 无效：未知配置项" in str(exc.value)
+
+
+def test_env_var_overrides_dotenv_file(tmp_path):
+    base = _copy_default(tmp_path)
+    (base / ".env").write_text(
+        "TIDEWATCH_DATABASE_URL=postgresql+asyncpg://file:file@localhost:5432/from_file\n"
+        "FEISHU_WEBHOOK=https://example.com/from_file\n",
+        encoding="utf-8",
+    )
+    environ = {**ENV, "FEISHU_WEBHOOK": "https://example.com/from_env"}
+    settings = load_settings(base, environ=environ)
+    # 环境变量优先于 .env；环境变量未设置的项仍取自 .env
+    assert settings.secrets.database_url == ENV["TIDEWATCH_DATABASE_URL"]
+    assert settings.secrets.feishu_webhook == "https://example.com/from_env"
+
+
+def test_database_url_must_use_asyncpg(tmp_path):
+    environ = {"TIDEWATCH_DATABASE_URL": "postgresql://u:leakme@localhost:5432/tidewatch"}
+    with pytest.raises(ConfigError) as exc:
+        load_settings(_copy_default(tmp_path), environ=environ)
+    message = str(exc.value)
+    assert "数据库连接必须以 postgresql+asyncpg:// 开头" in message
+    # 报错信息不能回显密码
+    assert "leakme" not in message
+
+
+def test_repr_and_str_do_not_leak_secrets(tmp_path):
+    environ = {
+        "TIDEWATCH_DATABASE_URL": "postgresql+asyncpg://u:s3cretpw@localhost:5432/tidewatch",
+        "FEISHU_WEBHOOK": "https://example.com/hook/tokentokentoken",
+        "FEISHU_SECRET": "signsecretvalue",
+    }
+    settings = load_settings(_copy_default(tmp_path), environ=environ)
+    for text in (repr(settings), str(settings), repr(settings.secrets), str(settings.secrets)):
+        assert "s3cretpw" not in text
+        assert "tokentokentoken" not in text
+        assert "signsecretvalue" not in text
+    # 仍然能正常取到明文供程序使用
+    assert settings.secrets.database_url == environ["TIDEWATCH_DATABASE_URL"]
+
+
+def test_empty_section_reports_chinese(tmp_path):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text("watchlist:\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+    message = str(exc.value)
+    assert "watchlist" in message and "必须是键值映射" in message
+    assert "Input should be" not in message
+
+
+def test_literal_error_uses_chinese_or(tmp_path):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text("collectors:\n  jin10:\n    proxy: foo\n", encoding="utf-8")
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+    message = str(exc.value)
+    assert "collectors.jin10.proxy" in message
+    assert "'global' 或 'direct'" in message and " or " not in message
+
+
+def test_keyword_rule_requires_all_or_any(tmp_path):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(
+        "rules:\n  news:\n    s_keywords:\n      - {id: s.empty, none: [前瞻]}\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+    message = str(exc.value)
+    assert "rules.news.s_keywords" in message
+    assert "关键词规则至少需要 all 或 any 之一" in message
+
+
+@pytest.mark.parametrize("filename", ["config.yaml", "config.local.yaml"])
+def test_secrets_key_in_config_file_rejected(tmp_path, filename):
+    base = _copy_default(tmp_path)
+    path = base / filename
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    path.write_text(
+        existing + "\nsecrets:\n  database_url: postgresql+asyncpg://u:p@localhost/db\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+    assert str(exc.value) == "密钥不能写在配置文件中，请写到 .env"

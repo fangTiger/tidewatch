@@ -12,7 +12,7 @@ from typing import Any, Literal, Mapping
 
 import yaml
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 class ConfigError(Exception):
@@ -39,6 +39,13 @@ class KeywordRule(_Strict):
     all: list[str] = []
     any: list[str] = []
     none: list[str] = []
+
+    @model_validator(mode="after")
+    def _need_all_or_any(self) -> KeywordRule:
+        # 只有 none 的规则无法匹配任何内容，在配置层提前拦截
+        if not self.all and not self.any:
+            raise ValueError("关键词规则至少需要 all 或 any 之一")
+        return self
 
 
 class CollectorCfg(_Strict):
@@ -100,11 +107,13 @@ class LogCfg(_Strict):
 
 
 class Secrets(_Strict):
-    database_url: str
-    feishu_webhook: str | None = None
-    feishu_secret: str | None = None
-    binance_api_key: str | None = None
-    binance_api_secret: str | None = None
+    """密钥集合：所有字段都不出现在 repr 中，避免日志或异常回溯泄露"""
+
+    database_url: str = Field(repr=False)
+    feishu_webhook: str | None = Field(default=None, repr=False)
+    feishu_secret: str | None = Field(default=None, repr=False)
+    binance_api_key: str | None = Field(default=None, repr=False)
+    binance_api_secret: str | None = Field(default=None, repr=False)
 
     @field_validator("database_url")
     @classmethod
@@ -124,7 +133,7 @@ class Settings(_Strict):
     web: WebCfg = WebCfg()
     ai: AICfg = AICfg()
     log: LogCfg = LogCfg()
-    secrets: Secrets
+    secrets: Secrets = Field(repr=False)
 
     def collector(self, name: str) -> CollectorCfg:
         """按名称取采集器配置，不存在时抛出 ConfigError"""
@@ -218,6 +227,9 @@ def _read_yaml(path: Path) -> dict[str, Any]:
         return {}
     if not isinstance(content, dict):
         raise ConfigError(f"配置文件 {path.name} 的顶层必须是键值映射")
+    if "secrets" in content:
+        # 密钥只能来自 .env / 环境变量，避免误提交到公开仓库
+        raise ConfigError("密钥不能写在配置文件中，请写到 .env")
     return content
 
 
@@ -241,6 +253,7 @@ _SIMPLE_MESSAGES = {
     "string_type": "必须是字符串",
     "list_type": "必须是列表",
     "dict_type": "必须是键值映射",
+    "model_type": "必须是键值映射",
 }
 
 
@@ -262,7 +275,7 @@ def _translate(err: Mapping[str, Any]) -> str:
     if kind == "less_than_equal":
         return f"必须小于或等于 {_num(ctx.get('le'))}"
     if kind == "literal_error":
-        return f"取值必须为 {ctx.get('expected')}"
+        return f"取值必须为 {str(ctx.get('expected')).replace(' or ', ' 或 ')}"
     if kind == "value_error":
         return str(ctx.get("error", err["msg"]))
     return f"{err['msg']}（输入：{err.get('input')!r}）"
