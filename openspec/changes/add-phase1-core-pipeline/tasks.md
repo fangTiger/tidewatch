@@ -1,8 +1,8 @@
 ## 1. 项目骨架与配置
 
 - [x] 1.1 创建 `.venv` 与 `pyproject.toml`（hatchling，依赖与 `dev` 可选依赖），建立 `tidewatch/` 包与 `tests/` 目录结构
-- [ ] 1.2 编写 `config.yaml`（默认值）、`config.local.example.yaml`、`.env.example`
-- [ ] 1.3 实现 `tidewatch/config.py`：三层加载、深度合并、pydantic 校验与中文错误信息（含测试）
+- [x] 1.2 编写 `config.yaml`（默认值）、`config.local.example.yaml`、`.env.example`
+- [x] 1.3 实现 `tidewatch/config.py`：三层加载、深度合并、pydantic 校验与中文错误信息（含测试）
 - [ ] 1.4 实现日志初始化：`log/tidewatch_YYYY-MM-DD.log` 按天轮转保留 14 天，同时输出到标准输出
 
 ## 2. 存储

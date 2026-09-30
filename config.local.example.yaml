@@ -1,0 +1,8 @@
+# 复制为 config.local.yaml 后修改（该文件被 .gitignore 排除，不会提交）
+proxy_url: http://127.0.0.1:10808
+watchlist:
+  assets:
+    # 以 symbol 合并：写已有 symbol 会覆盖其别名，写新 symbol 即新增关注资产
+    - {symbol: DOGE, aliases: [狗狗币, Dogecoin]}
+    # 删除某个默认关注资产
+    - {symbol: TSLA, remove: true}

@@ -1,0 +1,93 @@
+# 观潮默认配置（公开提交）。个人配置写在 config.local.yaml，密钥写在 .env
+proxy_url: null  # 在 config.local.yaml 中设置，例如 http://127.0.0.1:10808
+
+watchlist:
+  assets:
+    - {symbol: BTC, aliases: [比特币, Bitcoin]}
+    - {symbol: ETH, aliases: [以太坊, Ethereum]}
+    - {symbol: SOL, aliases: [Solana]}
+    - {symbol: XRP, aliases: [瑞波, Ripple]}
+    - {symbol: HYPE, aliases: [Hyperliquid]}
+    - {symbol: MSTR, aliases: [微策略, MicroStrategy]}
+    - {symbol: COIN, aliases: [Coinbase]}
+    - {symbol: NVDA, aliases: [英伟达, NVIDIA, Nvidia]}
+    - {symbol: TSLA, aliases: [特斯拉, Tesla]}
+    - {symbol: NDX, aliases: [纳指, 纳斯达克, Nasdaq]}
+    - {symbol: SPX, aliases: [标普, S&P 500]}
+
+collectors:
+  jin10:
+    interval_s: 20
+    proxy: direct
+    stale_after_s: 300
+    backfill_max_s: 21600
+    max_push_age_s: 1800
+    rate_per_s: 2
+  binance_ann:
+    interval_s: 30          # 无 API Key 时的降级轮询间隔
+    proxy: global
+    stale_after_s: 180
+    backfill_max_s: 21600
+    max_push_age_s: 1800
+    gap_fill_interval_s: 600
+    rate_per_s: 1
+  okx_ann:
+    interval_s: 30
+    proxy: global
+    stale_after_s: 300
+    backfill_max_s: 21600
+    max_push_age_s: 1800
+    rate_per_s: 1
+
+rules:
+  news:
+    s_keywords:
+      - {id: s.rate_decision, any: [利率决议, 议息会议, FOMC], none: [前瞻, 展望]}
+      - {id: s.powell, all: [鲍威尔], any: [讲话, 表示, 称]}
+      - {id: s.cpi, any: [CPI], none: [前瞻, 展望]}
+      - {id: s.pce, any: [PCE], none: [前瞻, 展望]}
+      - {id: s.nfp, any: [非农], none: [前瞻, 展望]}
+      - {id: s.emergency_rate, any: [紧急降息, 紧急加息]}
+      - {id: s.tariff, all: [关税], any: [中国, 全面, 对等]}
+      - {id: s.etf_approval, all: [ETF], any: [批准, 获批]}
+      - {id: s.exchange_hack, any: [交易所被盗, 遭黑客攻击, 被黑客攻击]}
+      - {id: s.depeg, any: [脱锚]}
+      - {id: s.withdraw_halt, any: [暂停提现, 暂停提币]}
+      - {id: s.bankruptcy, any: [破产]}
+    a_keywords:
+      - {id: a.macro, any: [美联储, 央行, 降息, 加息, 关税, 制裁]}
+      - {id: a.regulator, any: [SEC, 证监会]}
+      - {id: a.etf, any: [ETF]}
+      - {id: a.geo, any: [战争, 停火]}
+      - {id: a.security, any: [黑客, 被盗]}
+      - {id: a.bankruptcy, any: [破产]}
+    people: [特朗普, 马斯克]
+  exchange:
+    exchange_names: [币安, Binance, OKX, 欧易]
+    listing_keywords: [上线, 上币, list, 下架, delist]
+
+pipeline:
+  cluster_window_s: 600
+  title_similarity: 0.5
+
+dispatch:
+  a_window_s: 300
+  a_window_max: 10
+  digest_interval_s: 60
+  retry_immediate: 3
+  retry_interval_s: 60
+  retry_max_s: 86400
+  health_alert_interval_s: 3600
+
+web:
+  host: 127.0.0.1
+  port: 8000
+  timeline_limit: 200
+
+ai:
+  enabled: false
+
+log:
+  dir: log
+  retention_days: 14
+  level: INFO
