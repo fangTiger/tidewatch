@@ -119,10 +119,10 @@ tidewatch/                        # 仓库根目录
 │   │   └── profile.py            # 钱包画像计算
 │   ├── pipeline/
 │   │   ├── sink.py               # EventSink：串行入口，编排 ①–⑧（见 6.3）
-│   │   ├── normalize.py          # 资产识别、美元金额、SimHash
+│   │   ├── normalize.py          # 资产识别、美元金额、标题相似度
 │   │   ├── cluster.py            # 聚簇
 │   │   ├── rules/                # RuleEngine 与各类别规则（news / exchange / chain / institution / hyperliquid）
-│   │   └── dispatch.py           # 推送决策、防刷屏、推送重试
+│   │   └── decision.py           # 以簇为单位的推送决策
 │   ├── ai/
 │   │   ├── runner.py             # LLMRunner 接口；ClaudeCLI、CodexCLI；降级与冷却
 │   │   ├── scorer.py             # 任务① 批量解读
@@ -132,6 +132,7 @@ tidewatch/                        # 仓库根目录
 │   ├── notify/
 │   │   ├── base.py               # Notifier 接口（见 9.1）
 │   │   ├── feishu.py             # 飞书自定义机器人
+│   │   ├── dispatcher.py         # 发送队列、防刷屏、汇总、重试与期限
 │   │   └── dryrun.py             # 演练模式：只写日志
 │   ├── web/
 │   │   ├── server.py             # FastAPI 路由、SSE
@@ -294,7 +295,6 @@ Hyperliquid 子系统结构复杂（多连接、按钱包调度），**不继承
 | `title` / `body` / `url` | text | 标题、正文（截断到 2,000 字）、原文链接 |
 | `assets` | text[] | 涉及资产，如 `{BTC,MSTR}`；识别不到为空数组 |
 | `amount_usd` | numeric | 统一美元金额（可空） |
-| `simhash` | bigint | 规范化标题的 SimHash（新闻、公告类） |
 | `rule_level` / `rule_hits` | char(1) / text[] | 规则等级与命中的规则 ID |
 | `ai_status` | text | `pending` / `done` / `failed` / `skipped` |
 | `ai_level` / `ai_direction` / `ai_summary` / `ai_runner` / `ai_at` | | AI 结果；方向取 `bull` / `bear` / `neutral` |
@@ -310,7 +310,7 @@ Hyperliquid 子系统结构复杂（多连接、按钱包调度），**不继承
 | 字段 | 说明 |
 |---|---|
 | `id` | 主键 |
-| `category` / `cluster_key` | 类别与聚簇键（按 6.4 的规则生成；新闻类为空，靠 SimHash 匹配） |
+| `category` / `cluster_key` | 类别与聚簇键（按 6.4 的规则生成；新闻类为空，靠标题相似度匹配） |
 | `first_event_id` | 簇内首条事件 |
 | `first_seen_at` / `last_seen_at` | 首条与最近一条事件的入库时间 |
 | `max_level` | 簇内事件 `final_level` 的最高值（网站展示用） |
@@ -327,7 +327,7 @@ Hyperliquid 子系统结构复杂（多连接、按钱包调度），**不继承
 **处理一批采集结果（`ingest`）——② 至 ⑦ 在同一个数据库事务内完成：**
 
 ```
-① 规范化（事务外，纯计算）：识别资产、统一美元金额、计算 SimHash
+① 规范化（事务外，纯计算）：识别资产、统一美元金额
 ── 开始事务 ──
 ② INSERT … ON CONFLICT (dedupe_key) DO NOTHING RETURNING id；只有新插入的事件继续
 ③ 分级：await RuleEngine.evaluate(event, ctx) → rule_level / rule_hits；final_level = rule_level
@@ -350,8 +350,8 @@ Hyperliquid 子系统结构复杂（多连接、按钱包调度），**不继承
 
 | 类别 | 聚簇方式 | 窗口（自簇的 `first_seen_at` 起） |
 |---|---|---|
-| `news` | 从数据库查询窗口内 `news` 类的簇，比较簇内首条事件与新事件的 SimHash（规范化标题的字符 3-gram 特征，无需分词），汉明距离 ≤ 3 即匹配；若双方 `assets` 均非空，还要求有交集；任一方为空时只看 SimHash | 10 分钟 |
-| `exchange`（含与 `news` 的跨类匹配） | 同一公告来自 WS 与列表接口的重复已由 `dedupe_key` 去除。跨类匹配用显式规则（中英文标题无法用 SimHash 比对）：窗口内一条 `news` 事件的标题同时命中交易所名（币安、Binance、OKX、欧易）与上币或下架类关键词（上线、上币、list、下架、delist），且与 `exchange` 事件的 `assets` 有交集，即归为同簇，不论谁先到 | 10 分钟 |
+| `news` | 从数据库查询窗口内 `news` 类的簇，比较簇内首条事件与新事件的标题：规范化标题的字符二元组 Jaccard 相似度 ≥ 0.5（阈值可配置）即匹配（实测近乎重复的快讯为 0.85–1.0，无关快讯低于 0.1；SimHash 对短标题过于敏感，已弃用）；若双方 `assets` 均非空，还要求有交集；任一方为空时只看相似度 | 10 分钟 |
+| `exchange`（含与 `news` 的跨类匹配） | 同一公告来自 WS 与列表接口的重复已由 `dedupe_key` 去除。跨类匹配用显式规则（中英文标题无法用相似度比对）：窗口内一条 `news` 事件的标题同时命中交易所名（币安、Binance、OKX、欧易）与上币或下架类关键词（上线、上币、list、下架、delist），且标题中出现该 `exchange` 事件涉及的任一币种代码（新上线的小币不在关注资产中，因此不用资产集合求交集），即归为同簇，不论谁先到 | 10 分钟 |
 | `chain` | `cluster_key` =（发送方实体或地址, 接收方实体或地址, 资产） | 1 小时 |
 | `institution` | 不聚簇（每条 SEC 公告、每个 ETF 日度数据各自成簇） | — |
 | `hyperliquid` | `cluster_key` =（地址, 币种, 事件族）；事件族：同向加码 {开仓, 加仓}、离场 {减仓, 平仓}、强平风险、被清算、新巨鲸；反手拆成「平仓 + 开仓」两个事件 | 30 分钟 |
@@ -388,8 +388,10 @@ class RuleContext(Protocol):   # 只读的历史查询，供依赖历史的规�
 | 等级 | 条件 |
 |---|---|
 | S | `important=1` 且命中 S 关键词组：利率决议、FOMC、鲍威尔讲话、CPI、PCE、非农、紧急降息/加息、关税组合、ETF 获批、交易所被盗、稳定币脱锚、暂停提现、破产 |
-| A | `important=1`；或命中 S 关键词组但非重要；或命中关注资产且同时出现特朗普/马斯克 |
-| B | 命中关注资产关键词 |
+| A | 命中 S 关键词组但非重要；或 `important=1` 且（命中关注资产或命中 A 关键词组：美联储、央行、降息、加息、关税、制裁、SEC、证监会、ETF、战争、停火、黑客、被盗、破产）；或命中关注资产且同时出现特朗普/马斯克 |
+| B | `important=1` 的其他快讯；或命中关注资产 |
+
+实测金十约 30% 的快讯带 `important=1`（2026-09-30 抽样 20 条中 6 条，全天约 1,000 条快讯），若「重要即 A 级」每天将推送数百条，因此 `important=1` 单独只定为 B 级。
 | C | 其他 |
 
 **交易所公告**
@@ -645,7 +647,7 @@ pending ──发送成功──▶ ok
 - 汇总消息：每个被汇总的簇各写一行，用 `batch_id` 关联，发送结果同时更新整批。
 - 标记 `superseded` 时，提交后（6.3 的 ⑧）通知调度器把该记录从发送队列与汇总缓冲中移除；若该记录在被标记前已经发出，回写结果时只更新簇的 `delivered_level`，状态保持 `superseded`（此时 S 卡片不带「升级」标注，可接受）。
 - 代表事件的等级由 AI 上调时，重试期限中的「新鲜度截止时间」取 6.7 两个新鲜度条件中较晚的一个。
-- `pipeline/dispatch.py` 负责推送决策（6.7）、防刷屏（6.8）、发送队列与重试；发送结果通过 `EventSink.push_result(...)` 串行回写。
+- `pipeline/decision.py` 负责推送决策（6.7）；`notify/dispatcher.py` 负责防刷屏（6.8）、发送队列与重试；发送结果通过 `EventSink.push_result(...)` 串行回写。
 
 ## 10. 网站
 
@@ -671,7 +673,7 @@ pending ──发送成功──▶ ok
 | `events` | 统一事件 | 6.1 | 一期 |
 | `event_clusters` | 事件簇与推送状态 | 6.2 | 一期 |
 | `collector_state` | 采集器游标与健康：采集器名（主键）、`cursor` jsonb、`last_success_at`、`last_event_at`、`last_error_at`、`last_error`、`consecutive_failures`、`status` | 5.1 | 一期 |
-| `push_log` | 推送记录：簇 id、代表事件 id、等级、类型（event/upgrade/note/health/draft）、`batch_id`（汇总时）、状态（pending/ok/failed/expired/superseded/dry_run）、重试期限、时间、响应摘要 | 9.2 | 一期 |
+| `push_log` | 推送记录：簇 id、代表事件 id、等级、类型（一期为 event/upgrade，后续期次增加 note/draft；健康告警不写入 push_log）、`batch_id`（汇总时）、状态（pending/ok/failed/expired/superseded/dry_run）、重试期限、时间、响应摘要 | 9.2 | 一期 |
 | `hl_wallets`、`hl_positions`、`hl_fills`、`hl_state` | Hyperliquid | 7.6 | 二期 |
 | `etf_flows` | ETF 日度资金流：主键（交易日, 资产或代码），净流入、累计净流入、净资产 | 5.4 | 三期 |
 | `calendar_items` | 经济日历：时间、国家、名称、重要性、预期、前值 | 5.4 | 三期 |
@@ -699,7 +701,7 @@ pending ──发送成功──▶ ok
 - **解析测试**：每个采集器用录制的真实返回数据（`tests/fixtures/`）测试解析、`occurred_at` 与 `dedupe_key` 生成，测试不联网；币安公告需覆盖「同一公告分别来自 WS 与列表接口时键一致」。
 - **流水线**：
   - 规则：每条规则的边界值、关键词组合（all/any/none）；
-  - 聚簇：窗口边界、SimHash 阈值、资产为空的情况、金十上币快讯与交易所公告的跨类匹配；
+  - 聚簇：窗口边界、相似度阈值、资产为空的情况、金十上币快讯与交易所公告的跨类匹配；
   - 推送决策：首次推送、B→A、A→S（A 已送达时标注升级，A 未送达时旧推送转为 superseded）、等级不变不推、过期事件不作代表、AI 上调事件的 `ai_push_age`；
   - 推送状态机：失败重试、重试期限到期、演练模式视为已送达、汇总批次；
   - 防刷屏：S 不合并、A 超限进入汇总、60 秒汇总节奏；
