@@ -33,6 +33,14 @@ class EventCard:
 
 @dataclass
 class SendResult:
+    """一次推送的结果
+
+    Attributes:
+        ok: 是否发送成功
+        retryable: 失败时是否值得重试（网络错误、限流等为 True，参数或签名错误等为 False）
+        detail: 结果说明，写入 push_log 便于排查
+    """
+
     ok: bool
     retryable: bool = False
     detail: str = ""

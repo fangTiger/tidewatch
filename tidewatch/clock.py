@@ -18,5 +18,9 @@ def utcnow() -> datetime:
 
 
 def format_local(when: datetime, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
-    """把带时区的时间格式化为上海时间字符串"""
+    """把带时区的时间格式化为上海时间字符串
+
+    注意：when 必须是带时区的 datetime。不带时区的时间会被 astimezone
+    按运行机器的系统时区解释，得到错误结果，因此调用方应先补齐时区（如 UTC）。
+    """
     return when.astimezone(LOCAL_TZ).strftime(fmt)

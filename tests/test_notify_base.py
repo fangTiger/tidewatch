@@ -1,3 +1,5 @@
+import logging
+from collections import deque
 from datetime import datetime, timezone
 
 from tidewatch.clock import format_local
@@ -24,4 +26,25 @@ async def test_dry_run_notifier_records_and_succeeds():
     assert (await notifier.send_event(_card(), mention_all=True)).ok
     assert (await notifier.send_digest([_card()])).ok
     assert (await notifier.send_health("jin10", False, "连续失败")).ok
-    assert [kind for kind, _ in notifier.sent] == ["event", "digest", "health"]
+    assert [kind for kind, _ in list(notifier.sent)] == ["event", "digest", "health"]
+
+
+async def test_dry_run_sent_is_bounded_deque():
+    notifier = DryRunNotifier()
+    assert isinstance(notifier.sent, deque) and notifier.sent.maxlen == 1000
+    for _ in range(1005):
+        await notifier.send_digest([_card()])
+    assert len(notifier.sent) == 1000  # 超出上限时丢弃最旧记录，避免长期运行内存增长
+
+
+async def test_dry_run_logs_mention_all_and_health_status(caplog):
+    notifier = DryRunNotifier()
+    with caplog.at_level(logging.INFO, logger="tidewatch.notify.dryrun"):
+        await notifier.send_event(_card(), mention_all=True)
+        await notifier.send_event(_card(), mention_all=False)
+        await notifier.send_health("jin10", False, "连续失败")
+        await notifier.send_health("jin10", True, "恢复")
+    messages = [record.getMessage() for record in caplog.records]
+    assert "mention_all=True" in messages[0] and "mention_all=False" in messages[1]
+    assert "异常" in messages[2] and "连续失败" in messages[2]
+    assert "正常" in messages[3] and "异常" not in messages[3]
