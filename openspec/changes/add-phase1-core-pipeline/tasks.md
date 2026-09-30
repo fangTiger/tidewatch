@@ -8,7 +8,7 @@
 ## 2. 存储
 
 - [x] 2.1 在 `store/tables.py` 定义 `events`、`event_clusters`、`collector_state`、`push_log` 表与索引
-- [ ] 2.2 配置 Alembic 并生成一期初始迁移，验证 `upgrade head` 与 `downgrade base`
+- [x] 2.2 配置 Alembic 并生成一期初始迁移，验证 `upgrade head` 与 `downgrade base`
 - [x] 2.3 实现 `store/db.py` 异步引擎与连接池，测试夹具连接 `tidewatch_test` 并在每个测试后清理数据
 
 ## 3. 领域模型与规范化
