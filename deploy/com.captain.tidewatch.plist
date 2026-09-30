@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 观潮 launchd 配置模板：由 deploy/install.sh 替换仓库路径与启动参数占位符后安装 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.captain.tidewatch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-i</string>
+    <string>__REPO__/.venv/bin/python</string>
+    <string>-m</string>
+    <string>tidewatch</string>
+    __ARGS__
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>__REPO__/log/launchd.err.log</string>
+</dict>
+</plist>
