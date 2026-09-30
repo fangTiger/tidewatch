@@ -42,3 +42,17 @@ class RuleEngine:
         if rules is None:
             return RuleResult("C", ["no_rules"])
         return await rules.evaluate(event, ctx)
+
+
+def build_rule_engine(settings: "Settings") -> RuleEngine:
+    """按配置装配一期规则集（news、exchange）"""
+    # 函数内导入是为了避免 engine.py 与 news.py、exchange.py 之间的循环导入
+    from tidewatch.pipeline.rules.exchange import ExchangeRules
+    from tidewatch.pipeline.rules.news import NewsRules
+
+    return RuleEngine(
+        {
+            "news": NewsRules(settings.rules.news),
+            "exchange": ExchangeRules(settings.watch_symbols),
+        }
+    )
