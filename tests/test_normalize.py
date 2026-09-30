@@ -9,6 +9,12 @@ def test_clean_text_strips_html():
     assert clean_text("") == ""
 
 
+def test_clean_text_keeps_comparison_operators():
+    # 只清理真正的 HTML 标签，数值比较符号必须保留
+    assert clean_text("美元指数<100，日元>150") == "美元指数<100，日元>150"
+    assert clean_text("<p>美元指数<100</p>") == "美元指数<100"
+
+
 def test_normalize_title():
     assert normalize_title("Binance Will List ＸＹＺ (XYZ)!") == "binancewilllistxyzxyz"
     assert normalize_title("【港股】 恒指、翻红！") == "港股恒指翻红"
@@ -44,3 +50,11 @@ def test_contains_symbol():
     assert contains_symbol("Binance Will List XYZ (XYZ)", "XYZ")
     assert not contains_symbol("XYZW 上线", "XYZ")
     assert not contains_symbol("任意", "")
+
+
+def test_asset_matcher_skips_blank_symbol_and_alias():
+    # 用 model_construct 绕过配置校验，验证匹配器自身的防御：空白代码/别名不能匹配任意文本
+    matcher = AssetMatcher([AssetCfg.model_construct(symbol="BTC", aliases=[""])])
+    assert matcher.find("任意文字") == []
+    assert matcher.find("比特币 BTC 突破") == ["BTC"]
+    assert AssetMatcher([AssetCfg.model_construct(symbol=" ", aliases=["  "])]).find("任意文字") == []

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -23,10 +23,14 @@ def _test_db_url() -> str | None:
     url = os.environ.get("TIDEWATCH_TEST_DATABASE_URL")
     if url:
         return url
-    base = dotenv_values(REPO_ROOT / ".env").get("TIDEWATCH_DATABASE_URL")
+    # 环境变量优先，其次 .env
+    base = os.environ.get("TIDEWATCH_DATABASE_URL") or dotenv_values(REPO_ROOT / ".env").get(
+        "TIDEWATCH_DATABASE_URL"
+    )
     if not base:
         return None
-    return base.rsplit("/", 1)[0] + "/tidewatch_test"
+    # 只替换库名，保留用户名、密码、主机与查询参数
+    return make_url(base).set(database="tidewatch_test").render_as_string(hide_password=False)
 
 
 TEST_DB_URL = _test_db_url()
@@ -46,10 +50,11 @@ async def engine():
         if not _schema_ready:
             await conn.run_sync(metadata.drop_all)
             await conn.run_sync(metadata.create_all)
-            _schema_ready = True
-        await conn.execute(
-            text("TRUNCATE push_log, events, event_clusters, collector_state RESTART IDENTITY CASCADE")
-        )
+        # 表名由元数据动态生成，新增表后无需再改夹具
+        tables = ", ".join(t.name for t in reversed(metadata.sorted_tables))
+        await conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
+    # 事务成功提交后才标记表结构已就绪，避免失败后后续测试跳过建表
+    _schema_ready = True
     yield eng
     await eng.dispose()
 
@@ -71,8 +76,6 @@ class FakeClock:
         return self.now
 
     def advance(self, **kwargs) -> None:
-        from datetime import timedelta
-
         self.now = self.now + timedelta(**kwargs)
 
 

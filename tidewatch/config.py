@@ -29,6 +29,22 @@ class AssetCfg(_Strict):
     symbol: str
     aliases: list[str] = []
 
+    @field_validator("symbol")
+    @classmethod
+    def _symbol_not_blank(cls, value: str) -> str:
+        # 空代码会让资产识别失去意义，在配置层提前拦截
+        if not value.strip():
+            raise ValueError("关注资产代码不能为空")
+        return value
+
+    @field_validator("aliases")
+    @classmethod
+    def _aliases_not_blank(cls, value: list[str]) -> list[str]:
+        # 空别名会匹配任意文本，导致所有快讯都被识别为该资产
+        if any(not alias.strip() for alias in value):
+            raise ValueError("关注资产别名不能为空")
+        return value
+
 
 class WatchlistCfg(_Strict):
     assets: list[AssetCfg]

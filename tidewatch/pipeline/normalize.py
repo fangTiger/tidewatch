@@ -8,7 +8,8 @@ import unicodedata
 
 from tidewatch.config import AssetCfg
 
-_TAG = re.compile(r"<[^>]+>")
+# 只匹配真正的 HTML 标签（<b>、</p>、<br/>、<!-- -->），不误伤 "美元指数<100" 这类比较符号
+_TAG = re.compile(r"</?[A-Za-z!][^>]*>")
 _NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
 
 
@@ -54,10 +55,13 @@ class AssetMatcher:
     """
 
     def __init__(self, assets: list[AssetCfg]) -> None:
-        self._patterns: list[tuple[str, list[re.Pattern[str]]]] = [
-            (asset.symbol, [self._compile(alias) for alias in (asset.symbol, *asset.aliases)])
-            for asset in assets
-        ]
+        self._patterns: list[tuple[str, list[re.Pattern[str]]]] = []
+        for asset in assets:
+            # 防御性处理：空白代码整体跳过，空白别名会匹配任意文本，必须忽略
+            if not asset.symbol.strip():
+                continue
+            words = [word for word in (asset.symbol, *asset.aliases) if word.strip()]
+            self._patterns.append((asset.symbol, [self._compile(word) for word in words]))
 
     @staticmethod
     def _compile(alias: str) -> re.Pattern[str]:

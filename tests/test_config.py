@@ -169,6 +169,30 @@ def test_keyword_rule_requires_all_or_any(tmp_path):
     assert "关键词规则至少需要 all 或 any 之一" in message
 
 
+def test_asset_alias_must_not_be_blank(tmp_path):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(
+        'watchlist:\n  assets:\n    - {symbol: BTC, aliases: [""]}\n', encoding="utf-8"
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+    message = str(exc.value)
+    assert "watchlist.assets" in message and "aliases" in message
+    assert "关注资产别名不能为空" in message
+
+
+def test_asset_symbol_must_not_be_blank(tmp_path):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(
+        'watchlist:\n  assets:\n    - {symbol: "  ", aliases: [狗狗币]}\n', encoding="utf-8"
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+    message = str(exc.value)
+    assert "watchlist.assets" in message and "symbol" in message
+    assert "关注资产代码不能为空" in message
+
+
 @pytest.mark.parametrize("filename", ["config.yaml", "config.local.yaml"])
 def test_secrets_key_in_config_file_rejected(tmp_path, filename):
     base = _copy_default(tmp_path)
