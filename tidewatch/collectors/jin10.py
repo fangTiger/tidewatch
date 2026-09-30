@@ -1,0 +1,87 @@
+"""金十快讯采集器
+
+金十没有公开 API，这里调用其网页使用的快讯接口（请求头与参数参照 RSSHub / newsnow 的实现），
+个人低频自用。接口变化会导致解析失败，由健康监控发出告警。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from typing import Any
+
+from tidewatch.clock import LOCAL_TZ
+from tidewatch.collectors.base import PollCollector
+from tidewatch.models import Event, FetchResult
+from tidewatch.pipeline.normalize import clean_text
+
+JIN10_URL = "https://flash-api.jin10.com/get_flash_list"
+JIN10_HEADERS = {"x-app-id": "bVBF4FyRTn5NJF5n", "x-version": "1.0.0"}
+MAX_PAGES = 30
+
+
+def _parse_time(text: str) -> datetime:
+    return datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=LOCAL_TZ)
+
+
+def parse_item(item: dict[str, Any]) -> Event | None:
+    """把一条快讯转成事件；没有标题的条目返回 None"""
+    data = item.get("data") or {}
+    locked = bool(data.get("lock"))
+    if locked:  # VIP 锁定条目只有标题
+        title, body = clean_text(data.get("vip_title")), ""
+    else:
+        body = clean_text(data.get("content"))
+        title = clean_text(data.get("title")) or body
+    if not title:
+        return None
+    return Event(
+        source="jin10",
+        category="news",
+        event_type="article" if item.get("type") == 2 else "flash",
+        occurred_at=_parse_time(item["time"]),
+        title=title[:300],
+        body=body,
+        url=data.get("link") or f"https://flash.jin10.com/detail/{item['id']}",
+        dedupe_key=f"jin10:{item['id']}",
+        raw={"id": item["id"], "important": int(item.get("important") or 0), "type": item.get("type"), "locked": locked},
+    )
+
+
+class Jin10Collector(PollCollector):
+    name = "jin10"
+    group = "news"
+
+    async def fetch(self, cursor: dict[str, Any] | None) -> FetchResult:
+        last_id = (cursor or {}).get("last_id")
+        floor = self.clock() - timedelta(seconds=self.cfg.backfill_max_s)
+        collected: list[dict[str, Any]] = []
+        max_time: str | None = None
+        for _ in range(MAX_PAGES):
+            page = await self._page(max_time)
+            if not page:
+                break
+            fresh = [item for item in page if last_id is None or item["id"] > last_id]
+            collected.extend(fresh)
+            # 首次运行只取第一页；本页出现已采集过的条目说明已追上游标
+            if last_id is None or len(fresh) < len(page):
+                break
+            oldest = page[-1]
+            if _parse_time(oldest["time"]) < floor:  # 超出补抓窗口
+                break
+            # 多取 1 秒：避免与上一页最后一条同一秒的快讯被跳过（重复由去重键处理）
+            max_time = (_parse_time(oldest["time"]) + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
+        events = [e for e in (parse_item(item) for item in collected) if e is not None and e.occurred_at >= floor]
+        newest = max((item["id"] for item in collected), default=last_id)
+        return FetchResult(events, {"last_id": newest} if newest else None)
+
+    async def _page(self, max_time: str | None) -> list[dict[str, Any]]:
+        await self.limiter.acquire()
+        params = {"channel": "-8200", "vip": "1"}
+        if max_time:
+            params["max_time"] = max_time
+        response = await self.client.get(JIN10_URL, params=params, headers=JIN10_HEADERS)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("status") != 200:
+            raise RuntimeError(f"金十接口返回异常状态：{payload.get('status')} {payload.get('message')}")
+        return payload.get("data") or []
