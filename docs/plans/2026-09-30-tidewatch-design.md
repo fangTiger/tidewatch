@@ -618,10 +618,10 @@ codex exec --ephemeral --skip-git-repo-check -s read-only \
 
 ```python
 class Notifier(ABC):
-    async def send_event(self, card: EventCard, *, mention_all: bool, upgraded: bool) -> SendResult: ...
+    async def send_event(self, card: EventCard, *, mention_all: bool) -> SendResult: ...  # 是否升级在 card.upgraded
     async def send_digest(self, cards: list[EventCard]) -> SendResult: ...       # 防刷屏汇总
     async def send_note(self, ref: EventCard, text: str) -> SendResult: ...      # AI 补充消息
-    async def send_health(self, source: str, status: str, detail: str) -> SendResult: ...
+    async def send_health(self, source: str, healthy: bool, detail: str) -> SendResult: ...
     async def send_draft(self, title: str, body: str, tags: list[str]) -> SendResult: ...  # 四期
 ```
 
@@ -688,7 +688,7 @@ pending ──发送成功──▶ ok
 - **自启与守护**：launchd（`~/Library/LaunchAgents/com.captain.tidewatch.plist`），`RunAtLoad` + `KeepAlive`；进程通过 `caffeinate -i` 启动以阻止空闲睡眠。**合盖仍会睡眠**，需要不合盖或外接显示器使用。
 - **断点补抓**：采集器启动时从 `collector_state.cursor` 继续，最多回溯 `backfill_max`（默认 6 小时；Arkham 中转为 72 小时）。补抓到的事件照常入库、分级、聚簇；是否推送由新鲜度决定（6.7），因此长时间离线后不会出现旧消息洪峰。
 - **崩溃恢复**：见 6.3 与 9.2（事务保证不留半处理事件；重启后继续发送未完成的推送）。
-- **健康监控**：异常判定见 5.1；异常时状态页标红，并通过 `send_health` 告警（每源每小时最多 1 条）；恢复正常时发一条恢复通知。
+- **健康监控**：异常判定见 5.1；异常时状态页标红，并通过 `send_health` 告警（每源每小时最多 1 条，重启后从数据库恢复上次告警时间，限流仍有效）；若该次异常发过告警，恢复正常时发一条恢复通知。
 - **限流与退避**：每源令牌桶；429/5xx/网络错误指数退避（1 秒起，×2，上限 5 分钟），成功后重置。
 - **网络**：代理地址在 `config.local.yaml`；每个源可设 `proxy: global | direct`（金十直连，其余走代理）。
 - **日志**：`log/tidewatch_YYYY-MM-DD.log`，按天轮转，保留 14 天；日志消息使用中文。
