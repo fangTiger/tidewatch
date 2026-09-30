@@ -1,0 +1,36 @@
+# 密钥与个人配置（公开仓库，严禁提交）
+.env
+.env.*
+!.env.example
+config.local.yaml
+
+# 头脑风暴可视化临时文件
+.superpowers/
+
+# 日志与运行时数据
+log/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+
+# Vercel 中转函数
+relay/node_modules/
+relay/.vercel/
+
+# 系统与编辑器
+.DS_Store
+.idea/
+.vscode/
