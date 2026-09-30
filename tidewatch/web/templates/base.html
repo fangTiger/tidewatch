@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}观潮{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <a class="brand" href="/">🌊 观潮</a>
+    <nav>
+      <a href="/" class="{{ 'on' if active == 'home' else '' }}">时间线</a>
+      <a href="/status" class="{{ 'on' if active == 'status' else '' }}">状态</a>
+    </nav>
+    <span id="live" class="live off" title="实时连接状态">● 实时</span>
+  </header>
+  <main>{% block content %}{% endblock %}</main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

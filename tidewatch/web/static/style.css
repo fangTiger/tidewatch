@@ -1,0 +1,40 @@
+/* 观潮页面样式：跟随系统深浅色 */
+:root { --bg: #f6f7f9; --card: #fff; --text: #1d1f23; --muted: #8a8f98; --line: #e3e5e8;
+        --s: #e5484d; --a: #f59e0b; --b: #3b82f6; --c: #9ca3af; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111317; --card: #1a1d22; --text: #e6e8eb; --muted: #7d828b; --line: #2a2e35; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 14px/1.6 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; }
+.top { display: flex; align-items: center; gap: 20px; padding: 10px 20px; background: var(--card);
+       border-bottom: 1px solid var(--line); position: sticky; top: 0; }
+.brand { font-weight: 700; font-size: 16px; color: var(--text); text-decoration: none; }
+nav a { color: var(--muted); text-decoration: none; margin-right: 14px; }
+nav a.on { color: var(--text); font-weight: 600; }
+.live { margin-left: auto; color: #22c55e; font-size: 12px; }
+.live.off { color: var(--muted); }
+main { padding: 16px 20px; max-width: 1200px; margin: 0 auto; }
+.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.filters select, .filters button { padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px;
+                                   background: var(--card); color: var(--text); }
+.grid { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 8px; overflow: hidden; }
+.grid th, .grid td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.grid th { color: var(--muted); font-weight: 500; font-size: 12px; }
+.time { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
+.title a { color: var(--text); text-decoration: none; }
+.title a:hover { text-decoration: underline; }
+.badge { display: inline-block; min-width: 22px; text-align: center; border-radius: 4px; color: #fff;
+         font-weight: 700; font-size: 12px; padding: 0 5px; }
+.badge.lv-S { background: var(--s); } .badge.lv-A { background: var(--a); }
+.badge.lv-B { background: var(--b); } .badge.lv-C { background: var(--c); }
+tr.lv-S td { background: color-mix(in srgb, var(--s) 8%, transparent); }
+.tag { display: inline-block; font-size: 11px; padding: 0 6px; margin-left: 4px; border-radius: 10px;
+       border: 1px solid var(--line); color: var(--muted); }
+.tag.muted { border-style: dashed; }
+tr.flash td { animation: flash 2s ease-out; }
+@keyframes flash { from { background: color-mix(in srgb, var(--a) 30%, transparent); } to { background: transparent; } }
+tr.empty td { text-align: center; color: var(--muted); }
+tr.st-abnormal td { color: var(--s); }
+.stats { list-style: none; padding: 0; display: flex; gap: 20px; }
+.stats b { font-size: 18px; }

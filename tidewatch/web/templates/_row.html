@@ -1,0 +1,11 @@
+<tr id="c{{ row.cluster_id }}" class="lv-{{ row.level }}" data-ts="{{ row.occurred_at }}">
+  <td class="time">{{ row.time_local }}</td>
+  <td>
+    <span class="badge lv-{{ row.level }}">{{ row.level }}</span>
+    {% if row.pushed %}<span class="tag">已推送</span>{% endif %}
+    {% if row.backfill %}<span class="tag muted">补抓</span>{% endif %}
+  </td>
+  <td class="title">{% if row.url %}<a href="{{ row.url }}" target="_blank" rel="noopener">{{ row.title }}</a>{% else %}{{ row.title }}{% endif %}</td>
+  <td>{{ row.source_name }}{% if row.source_count > 1 %} <span class="tag">来源 +{{ row.source_count - 1 }}</span>{% endif %}</td>
+  <td>{{ row.assets | join('、') }}</td>
+</tr>

@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}状态 · 观潮{% endblock %}
+{% block content %}
+<h2>采集器</h2>
+<table id="collectors" class="grid">
+  <thead><tr><th>名称</th><th>状态</th><th>模式</th><th>最后成功</th><th>最后事件</th><th>连续失败</th><th>最近错误</th></tr></thead>
+  <tbody>
+    {% for c in collectors %}
+    <tr id="s-{{ c.name }}" class="st-{{ c.status }}">
+      <td>{{ c.source_name }}</td>
+      <td class="status">{{ c.status_text }}</td>
+      <td class="mode">{{ c.mode_text }}</td>
+      <td>{{ c.last_success }}</td>
+      <td>{{ c.last_event }}</td>
+      <td class="failures">{{ c.consecutive_failures }}</td>
+      <td class="error">{{ c.last_error }}</td>
+    </tr>
+    {% else %}
+    <tr class="empty"><td colspan="7">尚无采集器运行记录</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+<h2>今日推送</h2>
+<ul class="stats">
+  <li>已送达 <b>{{ stats.ok }}</b></li>
+  <li>演练 <b>{{ stats.dry_run }}</b></li>
+  <li>待发送 <b>{{ stats.pending }}</b></li>
+  <li>失败 <b>{{ stats.failed }}</b></li>
+  <li>过期 <b>{{ stats.expired }}</b></li>
+  <li>已取代 <b>{{ stats.superseded }}</b></li>
+</ul>
+{% endblock %}
