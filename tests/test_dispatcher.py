@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import uuid
 from datetime import timedelta
 
@@ -5,7 +7,7 @@ import pytest
 from sqlalchemy import insert, select
 
 from fakes import FakeNotifier
-from tidewatch.notify.base import SendResult
+from tidewatch.notify.base import EventCard, SendResult
 from tidewatch.notify.dispatcher import Dispatcher
 from tidewatch.notify.dryrun import DryRunNotifier
 from tidewatch.pipeline.decision import PushPlan
@@ -29,7 +31,8 @@ async def sink(engine, settings, clock):
     await event_sink.stop()
 
 
-async def _seed(engine, clock, level: str, n: int = 1, *, status: str = "pending", retry_minutes: int = 30) -> list[int]:
+async def _seed(engine, clock, level: str, n: int = 1, *, status: str = "pending", retry_minutes: int = 30,
+                kind: str = "event") -> list[int]:
     """直接写入 n 个簇、事件与推送记录，返回 push_id 列表"""
     ids = []
     async with engine.begin() as conn:
@@ -42,20 +45,35 @@ async def _seed(engine, clock, level: str, n: int = 1, *, status: str = "pending
                 title=f"{level} 级测试 {i}", dedupe_key=f"t:{uuid.uuid4().hex}", final_level=level,
                 cluster_id=cid).returning(events.c.id))).scalar_one()
             pid = (await conn.execute(insert(push_log).values(
-                cluster_id=cid, event_id=eid, level=level, kind="event", status=status,
+                cluster_id=cid, event_id=eid, level=level, kind=kind, status=status,
                 retry_until=clock.now + timedelta(minutes=retry_minutes), created_at=clock.now,
             ).returning(push_log.c.id))).scalar_one()
             ids.append(pid)
     return ids
 
 
-def _dispatcher(engine, sink, settings, clock, notifier, *, monotonic=None, sleeps=None) -> Dispatcher:
+def _dispatcher(engine, sink, settings, clock, notifier, *, monotonic=None, sleeps=None, sleep=None) -> Dispatcher:
     async def fake_sleep(seconds: float) -> None:
         if sleeps is not None:
             sleeps.append(seconds)
 
-    return Dispatcher(engine, sink, notifier, settings.dispatch, clock=clock, sleep=fake_sleep,
+    return Dispatcher(engine, sink, notifier, settings.dispatch, clock=clock, sleep=sleep or fake_sleep,
                       monotonic=monotonic or FakeMonotonic())
+
+
+async def _idle_sleep(seconds: float) -> None:
+    """真正让出事件循环的睡眠：后台定时任务在测试期间不会被触发，也不会空转占满事件循环"""
+    await asyncio.sleep(3600)
+
+
+async def _wait_status(engine, ids: list[int], expected: str, timeout: float = 5.0) -> None:
+    """等待所有记录进入指定状态；超时抛 TimeoutError，避免后台任务出问题时测试挂起"""
+
+    async def poll() -> None:
+        while any(v[0] != expected for k, v in (await _statuses(engine)).items() if k in ids):
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), timeout)
 
 
 async def _statuses(engine) -> dict[int, tuple[str, str | None]]:
@@ -165,8 +183,11 @@ async def test_enqueue_dedupes(engine, sink, settings, clock):
     dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
     [pid] = await _seed(engine, clock, "S")
     dispatcher.enqueue([pid, pid])
+    assert dispatcher._queue.qsize() == 1  # 同一批重复 id 只入队一次
+    dispatcher.enqueue([pid])
+    assert dispatcher._queue.qsize() == 1  # 已在跟踪中的记录不再入队
     await dispatcher.process_pending()
-    assert len(notifier.events) == 1
+    assert len(notifier.events) == 1 and pid not in dispatcher._tracked  # 处理完成后解除跟踪
 
 
 async def test_startup_loads_pending(engine, sink, settings, clock):
@@ -212,3 +233,228 @@ async def test_attach_receives_plans_from_sink(engine, sink, settings, clock):
     await sink.ingest(FetchResult([event], None), collector="jin10")
     await dispatcher.process_pending()
     assert len(notifier.events) == 1 and notifier.events[0][0].level == "S"
+
+
+# ---------- 补强：重试、汇总、取代、告警等级 ----------
+
+
+async def test_persistent_retryable_failure_backs_off_then_fails(engine, sink, settings, clock):
+    sleeps: list[float] = []
+    notifier = FakeNotifier([SendResult(False, retryable=True, detail="code=11232")] * 4)
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier, sleeps=sleeps)
+    [pid] = await _seed(engine, clock, "S")
+    dispatcher.enqueue([pid])
+    await dispatcher.process_pending()
+    assert len(notifier.events) == 4  # 首次 + retry_immediate(3) 次重试
+    assert sleeps == [1.0, 2.0, 4.0]
+    assert (await _statuses(engine))[pid][0] == "failed"
+
+
+async def test_digest_split_into_batches_of_30(engine, sink, settings, clock):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    ids = await _seed(engine, clock, "A", 41)  # 10 条单独发送，31 条进入汇总
+    dispatcher.enqueue(ids)
+    await dispatcher.process_pending()
+    assert len(notifier.events) == 10 and dispatcher.digest_size == 31
+    await dispatcher.flush_digest()
+    assert [len(d) for d in notifier.digests] == [30] and dispatcher.digest_size == 1
+    await dispatcher.flush_digest()
+    assert [len(d) for d in notifier.digests] == [30, 1] and dispatcher.digest_size == 0
+    statuses = await _statuses(engine)
+    assert all(statuses[i][0] == "ok" for i in ids)
+    assert len({statuses[i][1] for i in ids[10:]}) == 2 and None not in {statuses[i][1] for i in ids[10:]}
+    assert dispatcher._tracked == set()  # 汇总发完后不再跟踪
+
+
+async def test_failed_digest_has_no_batch_id(engine, sink, settings, clock):
+    notifier = FakeNotifier([SendResult(True)] * 10 + [SendResult(False, retryable=False, detail="code=19021")])
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    ids = await _seed(engine, clock, "A", 11)
+    dispatcher.enqueue(ids)
+    await dispatcher.process_pending()
+    await dispatcher.flush_digest()
+    assert (await _statuses(engine))[ids[10]] == ("failed", None)  # 没有发出去，不写 batch_id
+    await dispatcher.retry_failed()  # 回到汇总缓冲
+    await dispatcher.flush_digest()
+    status, batch_id = (await _statuses(engine))[ids[10]]
+    assert status == "ok" and batch_id is not None
+
+
+async def test_dry_run_digest_status(engine, sink, settings, clock):
+    dispatcher = _dispatcher(engine, sink, settings, clock, DryRunNotifier())
+    ids = await _seed(engine, clock, "A", 11)
+    dispatcher.enqueue(ids)
+    await dispatcher.process_pending()
+    assert dispatcher.digest_size == 1
+    await dispatcher.flush_digest()
+    statuses = await _statuses(engine)
+    assert all(statuses[i][0] == "dry_run" for i in ids) and statuses[ids[10]][1] is not None
+
+
+async def test_superseded_in_queue_not_sent(engine, sink, settings, clock):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    [pid] = await _seed(engine, clock, "S")
+    dispatcher.enqueue([pid])
+    dispatcher.cancel([pid])  # 仍在发送队列中（未进入汇总缓冲）时被取代
+    await dispatcher.process_pending()
+    assert notifier.events == []
+    assert pid not in dispatcher._tracked and pid not in dispatcher._cancelled
+
+
+async def test_superseded_while_loading_not_sent(engine, sink, settings, clock):
+    """_load 期间被取代：加载完成后必须再检查一次，不能继续发送"""
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    [pid] = await _seed(engine, clock, "S")
+    original_load = dispatcher._load
+
+    async def load_then_cancel(push_id: int):
+        pending = await original_load(push_id)
+        dispatcher.cancel([push_id])  # 模拟 _load 的 await 期间新事件取代了它
+        return pending
+
+    dispatcher._load = load_then_cancel
+    dispatcher.enqueue([pid])
+    await dispatcher.process_pending()
+    assert notifier.events == []
+    assert pid not in dispatcher._tracked and pid not in dispatcher._cancelled
+
+
+async def test_a_sent_individually_without_mention(engine, sink, settings, clock):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    [pid] = await _seed(engine, clock, "A")
+    dispatcher.enqueue([pid])
+    await dispatcher.process_pending()
+    assert len(notifier.events) == 1 and notifier.events[0][1] is False
+
+
+@pytest.mark.parametrize(("kind", "upgraded"), [("upgrade", True), ("event", False)])
+async def test_upgrade_kind_marks_card_upgraded(engine, sink, settings, clock, kind, upgraded):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    [pid] = await _seed(engine, clock, "S", kind=kind)
+    dispatcher.enqueue([pid])
+    await dispatcher.process_pending()
+    card: EventCard = notifier.events[0][0]
+    assert card.upgraded is upgraded
+
+
+async def test_digest_buffered_a_not_resent_by_orphan_recovery(engine, sink, settings, clock):
+    """汇总缓冲中的 A 级记录仍被跟踪：即使窗口已空出、也超过遗漏阈值，retry_failed 也不会单独重复发送"""
+    notifier, mono = FakeNotifier(), FakeMonotonic()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier, monotonic=mono)
+    ids = await _seed(engine, clock, "A", 11)
+    dispatcher.enqueue(ids)
+    await dispatcher.process_pending()
+    assert len(notifier.events) == 10 and dispatcher.digest_size == 1
+    mono.value += settings.dispatch.a_window_s + 1  # 窗口已空出
+    clock.advance(seconds=2 * settings.dispatch.digest_interval_s + 1)  # 超过遗漏阈值，但仍未过期
+    await dispatcher.retry_failed()
+    assert len(notifier.events) == 10 and dispatcher.digest_size == 1
+    await dispatcher.flush_digest()
+    assert len(notifier.events) == 10 and [len(d) for d in notifier.digests] == [1]
+    assert (await _statuses(engine))[ids[10]][0] == "ok"
+
+
+# ---------- 补强：容错与生命周期 ----------
+
+
+class _RaiseOnFirstEvent(FakeNotifier):
+    """第一次 send_event 抛出非预期异常，之后正常"""
+
+    async def send_event(self, card: EventCard, *, mention_all: bool) -> SendResult:
+        result = await super().send_event(card, mention_all=mention_all)
+        if len(self.events) == 1:
+            raise ValueError("通知器内部错误")
+        return result
+
+
+async def test_retry_failed_continues_after_unexpected_error(engine, sink, settings, clock, caplog):
+    notifier = _RaiseOnFirstEvent()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    first, second = await _seed(engine, clock, "S", 2, status="failed")
+    with caplog.at_level(logging.ERROR):
+        await dispatcher.retry_failed()  # 不应向外抛出
+    statuses = await _statuses(engine)
+    assert len(notifier.events) == 2  # 第一条出错后仍处理第二条
+    assert statuses[first][0] == "failed" and statuses[second][0] == "ok"
+    assert dispatcher._tracked == set()
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+
+async def test_start_stop_sends_pending_and_failed(engine, sink, settings, clock):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier, sleep=_idle_sleep)
+    [pending_id] = await _seed(engine, clock, "S")
+    [failed_id] = await _seed(engine, clock, "A", status="failed")
+    calls: list[str] = []
+    load_open, retry_failed = dispatcher.load_open, dispatcher.retry_failed
+
+    async def recorded_load_open() -> None:
+        calls.append("load_open")
+        await load_open()
+
+    async def recorded_retry_failed() -> None:
+        calls.append("retry_failed")
+        await retry_failed()
+
+    dispatcher.load_open, dispatcher.retry_failed = recorded_load_open, recorded_retry_failed
+    await dispatcher.start()
+    try:
+        await _wait_status(engine, [pending_id, failed_id], "ok")
+    finally:
+        await asyncio.wait_for(dispatcher.stop(), 5)
+    assert calls == ["load_open", "retry_failed"]  # 先恢复 pending，再处理 failed
+    assert len(notifier.events) == 2
+    assert dispatcher._tasks == []
+
+
+async def test_start_is_idempotent(engine, sink, settings, clock):
+    dispatcher = _dispatcher(engine, sink, settings, clock, FakeNotifier(), sleep=_idle_sleep)
+    await dispatcher.start()
+    try:
+        tasks = list(dispatcher._tasks)
+        await dispatcher.start()  # 已启动：直接返回，不产生重复任务
+        assert len(tasks) == 3 and dispatcher._tasks == tasks
+    finally:
+        await asyncio.wait_for(dispatcher.stop(), 5)
+    assert dispatcher._tasks == [] and all(t.done() for t in tasks)
+    await dispatcher.start()  # stop 之后可以再次启动
+    try:
+        assert len(dispatcher._tasks) == 3
+    finally:
+        await asyncio.wait_for(dispatcher.stop(), 5)
+
+
+@pytest.mark.parametrize("broken", ["load_open", "retry_failed"])
+async def test_start_creates_tasks_even_if_recovery_fails(engine, sink, settings, clock, caplog, broken):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier, sleep=_idle_sleep)
+    [pending_id] = await _seed(engine, clock, "S")
+    [failed_id] = await _seed(engine, clock, "A", status="failed")
+
+    async def boom() -> None:
+        raise RuntimeError("数据库暂时不可用")
+
+    setattr(dispatcher, broken, boom)
+    with caplog.at_level(logging.ERROR):
+        await dispatcher.start()  # 启动恢复出错不能阻止后台任务创建
+    try:
+        assert len(dispatcher._tasks) == 3 and not any(t.done() for t in dispatcher._tasks)
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+        # 出错的一步之外，另一步照常完成
+        if broken == "load_open":
+            await _wait_status(engine, [failed_id], "ok")
+            assert (await _statuses(engine))[pending_id][0] == "pending"
+        else:
+            await _wait_status(engine, [pending_id], "ok")
+            assert (await _statuses(engine))[failed_id][0] == "failed"
+        # 后台发送任务仍在工作
+        [new_id] = await _seed(engine, clock, "S")
+        dispatcher.enqueue([new_id])
+        await _wait_status(engine, [new_id], "ok")
+    finally:
+        await asyncio.wait_for(dispatcher.stop(), 5)
