@@ -4807,6 +4807,20 @@ async def test_poll_keeps_old_cursor_when_ingest_fails():
     assert len(health.failures) == 1 and "数据库暂时不可用" in health.failures[0][1]
 
 
+class BrokenHealth(FakeHealth):
+    async def failure(self, name: str, error: str) -> None:
+        raise RuntimeError("数据库断开，健康状态写不进去")
+
+
+async def test_poll_survives_health_report_failure():
+    sink, health, sleep = FakeSink(fail_on={1}), BrokenHealth(), FakeSleep(stop_after=2)
+    collector = DemoPoll(sink=sink, health=health, client=None, engine=None, sleep=sleep)
+    with pytest.raises(asyncio.CancelledError):
+        await collector.run()
+    assert collector.seen == [None, None]  # 第一轮失败后保持旧游标并继续
+    assert sleep.delays == [1, 20]
+
+
 class DemoStream(StreamCollector):
     name = "demo_ws"
 
@@ -4840,7 +4854,7 @@ async def test_stream_gap_fill_then_stream_then_reconnect():
     ingested = [result for _, result in sink.calls]
     assert [len(r.events) for r in ingested] == [0, 1]  # 补缺结果 + WS 事件；心跳不入库
     assert collector.cursor == {"last_ms": 9}
-    assert len(health.successes) == 3  # 补缺成功 + 两次消息
+    assert len(health.successes) == 2  # 只在收到长连接消息时上报成功
     assert health.failures and "长连接" in health.failures[0][1]  # 连接结束后按失败处理并退避
     assert sleep.delays == [1]
 
@@ -4989,6 +5003,30 @@ class Collector(ABC):
         async with self.engine.connect() as conn:
             return await load_cursor(conn, self.name)
 
+    async def _load_cursor_with_retry(self) -> dict[str, Any] | None:
+        """读取游标；失败（如数据库暂时不可用）时退避重试，不让采集器退出"""
+        while True:
+            try:
+                return await self.load_cursor()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("采集器 %s 读取游标失败：%s", self.name, describe(exc))
+                await self._sleep(self.backoff.next())
+
+    async def _report_success(self) -> None:
+        """上报健康状态；上报本身失败（如数据库断开）只记日志，不影响采集循环"""
+        try:
+            await self.health.success(self.name)
+        except Exception:
+            logger.exception("采集器 %s 健康状态上报失败", self.name)
+
+    async def _report_failure(self, exc: BaseException) -> None:
+        try:
+            await self.health.failure(self.name, describe(exc))
+        except Exception:
+            logger.exception("采集器 %s 健康状态上报失败", self.name)
+
     @abstractmethod
     async def run(self) -> None:
         """运行直到被取消"""
@@ -5001,11 +5039,11 @@ class PollCollector(Collector):
     async def fetch(self, cursor: dict[str, Any] | None) -> FetchResult: ...
 
     async def run(self) -> None:
-        cursor = await self.load_cursor()
+        cursor = await self._load_cursor_with_retry()
         while True:
             try:
                 result = await self.fetch(cursor)
-                await self.health.success(self.name)
+                await self._report_success()
                 await self.sink.ingest(result, collector=self.name)
                 if result.cursor is not None:  # 提交成功后才采用新游标
                     cursor = result.cursor
@@ -5015,7 +5053,7 @@ class PollCollector(Collector):
                 raise
             except Exception as exc:
                 logger.warning("采集器 %s 本轮失败：%s", self.name, describe(exc))
-                await self.health.failure(self.name, describe(exc))
+                await self._report_failure(exc)
                 delay = self.backoff.next()
             await self._sleep(delay)
 
@@ -5042,8 +5080,10 @@ class StreamCollector(Collector):
         return new if new is not None else old
 
     async def _commit(self, result: FetchResult) -> None:
-        await self.sink.ingest(result, collector=self.name)
-        self.cursor = self.merge_cursor(self.cursor, result.cursor)
+        """先合并游标再入库，避免较旧的游标覆盖库中较新的游标"""
+        merged = self.merge_cursor(self.cursor, result.cursor)
+        await self.sink.ingest(FetchResult(result.events, merged, result.records), collector=self.name)
+        self.cursor = merged
 
     async def _gap_fill_loop(self) -> None:
         interval = self.cfg.gap_fill_interval_s or 600
@@ -5057,24 +5097,26 @@ class StreamCollector(Collector):
                 logger.warning("采集器 %s 定时补缺失败：%s", self.name, describe(exc))
 
     async def run(self) -> None:
-        self.cursor = await self.load_cursor()
+        self.cursor = await self._load_cursor_with_retry()
         while True:
             filler: asyncio.Task | None = None
             try:
                 await self._commit(await self.gap_fill(self.cursor))
-                await self.health.success(self.name)
                 filler = asyncio.create_task(self._gap_fill_loop(), name=f"{self.name}-gap-fill")
-                async for result in self.stream(self.cursor):
-                    await self.health.success(self.name)
-                    if result.events or result.cursor is not None:
-                        await self._commit(result)
-                    self.backoff.reset()
+                # aclosing：入库失败退出循环时立即关闭长连接
+                async with contextlib.aclosing(self.stream(self.cursor)) as messages:
+                    async for result in messages:
+                        # 只在收到长连接消息时上报成功（补缺成功不代表长连接可用）
+                        await self._report_success()
+                        if result.events or result.cursor is not None:
+                            await self._commit(result)
+                        self.backoff.reset()
                 raise ConnectionError("长连接已关闭")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning("采集器 %s 连接中断：%s", self.name, describe(exc))
-                await self.health.failure(self.name, describe(exc))
+                await self._report_failure(exc)
                 await self._sleep(self.backoff.next())
             finally:
                 if filler is not None:
@@ -5260,7 +5302,7 @@ git commit -m "feat: 交易所公告分类与币种提取" -m "Co-Authored-By: C
 - Create: `tidewatch/collectors/jin10.py`
 - Test: `tests/test_jin10.py`
 
-接口（2026-09-30 实测，直连）：`GET https://flash-api.jin10.com/get_flash_list?channel=-8200&vip=1[&max_time=YYYY-MM-DD HH:MM:SS]`，请求头 `x-app-id: bVBF4FyRTn5NJF5n`、`x-version: 1.0.0`；返回 `{"status": 200, "data": [...]}`，每页 20 条、按时间倒序；`id` 为 20 位数字字符串（可按字符串比较大小）；`time` 为上海时间；`type=0` 为快讯、`type=2` 为文章（带 `data.link`、`data.title`）；VIP 锁定条目 `data.lock=true`、`content` 为空，标题在 `data.vip_title`；`important` 为 0/1。夹具中第 1 条为锁定条目，第 5 条 id 为 `20260930105137078800`，最后一条时间为 `2026-09-30 10:36:49`，最大 id 为 `20260930110028586800`。
+接口（2026-09-30 实测，直连）：`GET https://flash-api.jin10.com/get_flash_list?channel=-8200&vip=1[&max_time=YYYY-MM-DD HH:MM:SS]`，请求头 `x-app-id: bVBF4FyRTn5NJF5n`、`x-version: 1.0.0`；返回 `{"status": 200, "data": [...]}`，每页 20 条、按时间倒序；`id` 为 20 位数字字符串（可按字符串比较大小）；`time` 为上海时间；翻页时 `max_time` 取本页最后一条时间加 1 秒（与上一页重叠，重复由去重键处理）；`type=0` 为快讯、`type=2` 为文章（带 `data.link`、`data.title`）；VIP 锁定条目 `data.lock=true`、`content` 为空，标题在 `data.vip_title`；`important` 为 0/1。夹具中第 1 条为锁定条目，第 5 条 id 为 `20260930105137078800`，最后一条时间为 `2026-09-30 10:36:49`，最大 id 为 `20260930110028586800`。
 
 - [ ] **Step 1: 写失败的测试 `tests/test_jin10.py`**
 
@@ -5328,7 +5370,7 @@ async def test_paginates_until_cursor(settings):
     route = respx.get(JIN10_URL).mock(side_effect=[httpx.Response(200, json=PAGE1), httpx.Response(200, json=older)])
     result = await _collector(settings).fetch({"last_id": "20260930100000000000"})
     assert len(result.events) == 21 and route.call_count == 2
-    assert route.calls[1].request.url.params["max_time"] == "2026-09-30 10:36:49"
+    assert route.calls[1].request.url.params["max_time"] == "2026-09-30 10:36:50"
     assert result.cursor == {"last_id": "20260930110028586800"}
 
 
@@ -5417,7 +5459,8 @@ class Jin10Collector(PollCollector):
             oldest = page[-1]
             if _parse_time(oldest["time"]) < floor:  # 超出补抓窗口
                 break
-            max_time = oldest["time"]
+            # 多取 1 秒：避免与上一页最后一条同一秒的快讯被跳过（重复由去重键处理）
+            max_time = (_parse_time(oldest["time"]) + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")
         events = [e for e in (parse_item(item) for item in collected) if e is not None and e.occurred_at >= floor]
         newest = max((item["id"] for item in collected), default=last_id)
         return FetchResult(events, {"last_id": newest} if newest else None)
@@ -5569,10 +5612,16 @@ class OkxAnnCollector(PollCollector):
         collected: list[dict[str, Any]] = []
         for page in range(1, MAX_PAGES + 1):
             items = await self._page(page)
-            fresh = [item for item in items if int(item["pTime"]) > last]
-            collected.extend(fresh)
-            if not items or cursor is None or len(fresh) < len(items) or int(items[-1]["pTime"]) < floor_ms:
+            collected.extend(items)
+            # 本页全部比游标新、且仍在补抓窗口内时才继续翻页；首次运行只取第一页
+            if (
+                not items
+                or cursor is None
+                or any(int(item["pTime"]) <= last for item in items)
+                or int(items[-1]["pTime"]) < floor_ms
+            ):
                 break
+        # 只按补抓窗口过滤、不按游标过滤：延迟出现的旧公告也能采到，重复由去重键处理
         events = [parse_detail(item) for item in collected if int(item["pTime"]) >= floor_ms]
         newest = max((int(item["pTime"]) for item in collected), default=last)
         return FetchResult(events, {"last_ptime": newest} if newest else None)
@@ -5680,13 +5729,16 @@ async def test_poll_fetch_list_within_window(settings):
     respx.get(BINANCE_LIST_URL).mock(
         side_effect=lambda request: httpx.Response(200, json=LIST48 if request.url.params["catalogId"] == "48" else LIST161)
     )
-    collector = BinanceAnnPoll(settings.collector("binance_ann"), sink=None, health=None,
+    cfg = settings.collector("binance_ann").model_copy(update={"rate_per_s": 100})  # 测试中不等待限流
+    collector = BinanceAnnPoll(cfg, sink=None, health=None,
                                client=httpx.AsyncClient(trust_env=False), engine=None, clock=lambda: NOW)
     result = await collector.fetch(None)
     assert len(result.events) == 3  # 161 两条 + 48 一条落在 6 小时补抓窗口内
     assert result.cursor == {"last_ms": 1790673300000}
     again = await collector.fetch(result.cursor)
-    assert again.events == [] and again.cursor == {"last_ms": 1790673300000}
+    # 只按补抓窗口过滤：再次拉取仍返回窗口内条目，由入库去重保证只入库一次
+    assert [e.dedupe_key for e in again.events] == [e.dedupe_key for e in result.events]
+    assert again.cursor == {"last_ms": 1790673300000}
 
 
 async def test_stream_with_local_server(settings):
@@ -5840,7 +5892,9 @@ class _BinanceList:
             for article in (catalogs[0].get("articles") if catalogs else None) or []:
                 published_ms = int(article["releaseDate"])
                 newest = max(newest, published_ms)
-                if published_ms > last and published_ms >= floor_ms:
+                # 只按补抓窗口过滤、不按游标过滤：两个栏目共用一个游标，若按游标过滤，
+                # 某栏目延迟出现的较早公告会被永久跳过；重复条目由去重键处理
+                if published_ms >= floor_ms:
                     events.append(parse_article(article, catalog_id))
         return FetchResult(events, {"last_ms": newest} if newest else None)
 
@@ -6222,7 +6276,8 @@ async def test_publish_subscribe_and_overflow():
     broadcaster = Broadcaster(max_queue=2)
     agen = broadcaster.subscribe()
     first = asyncio.create_task(_next(agen))
-    await asyncio.sleep(0)  # 让订阅者完成注册
+    while broadcaster.subscriber_count == 0:  # 等订阅者完成注册（3.11 的 wait_for 会再包一层任务）
+        await asyncio.sleep(0)
     broadcaster.publish("cluster.updated", {"cluster_id": 1, "title": "中文标题"})
     message = await first
     assert message["event"] == "cluster.updated"
@@ -6241,7 +6296,8 @@ async def test_live_updates_from_sink_and_health(engine, settings, clock):
     sink.on_ingest(live.on_ingest)
     agen = broadcaster.subscribe()
     pending = asyncio.create_task(_next(agen))
-    await asyncio.sleep(0)
+    while broadcaster.subscriber_count == 0:
+        await asyncio.sleep(0)
     await sink.start()
     try:
         event = Event(source="jin10", category="news", event_type="flash", occurred_at=clock.now - timedelta(minutes=1),
@@ -6977,9 +7033,11 @@ class Application:
             await self.health.load()
             await self.sink.start()
             await self.dispatcher.start()
-            if self.binance_degraded:
-                await self.health.set_mode("binance_ann", "degraded")
-                logger.warning("未配置币安只读 API Key，币安公告以降级模式（轮询列表接口）运行")
+            if any(c.name == "binance_ann" for c in self.collectors):
+                # 每次启动都按实际情况设置，补上 API Key 后状态页会恢复「正常」
+                await self.health.set_mode("binance_ann", "degraded" if self.binance_degraded else "normal")
+                if self.binance_degraded:
+                    logger.warning("未配置币安只读 API Key，币安公告以降级模式（轮询列表接口）运行")
             self._tasks += [
                 asyncio.create_task(self.health.run(), name="health"),
                 asyncio.create_task(self.live.run(), name="live"),
@@ -6987,6 +7045,8 @@ class Application:
             self._collector_tasks = [
                 asyncio.create_task(c.run(), name=f"collector-{c.name}") for c in self.collectors
             ]
+            for task in self._collector_tasks:
+                task.add_done_callback(_log_collector_exit)
         if "web" in self.groups:
             web = self.settings.web
             config = uvicorn.Config(
@@ -6995,6 +7055,7 @@ class Application:
                 port=web.port,
                 log_config=None,
                 access_log=False,
+                timeout_graceful_shutdown=3,  # 浏览器保持 SSE 连接时也能按时退出
             )
             self._server = _EmbeddedServer(config)
             self._tasks.append(asyncio.create_task(self._server.serve(), name="web"))
@@ -7010,7 +7071,8 @@ class Application:
         await self.dispatcher.stop()
         await self.sink.stop()
         if self._server is not None:
-            self._server.should_exit = True
+            # 信号由应用接管，需主动通知 uvicorn 退出（会一并关闭 SSE 连接）
+            self._server.handle_exit(signal.SIGTERM, None)
         for task in self._tasks:
             if task.get_name() != "web":
                 task.cancel()
@@ -7021,6 +7083,17 @@ class Application:
         await self.notifier.aclose()
         await self.engine.dispose()
         logger.info("观潮已停止")
+
+
+def _log_collector_exit(task: asyncio.Task) -> None:
+    """采集器任务意外结束时记录错误（正常情况下只会被取消）"""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("采集器任务 %s 异常退出：%s", task.get_name(), exc, exc_info=exc)
+    else:
+        logger.error("采集器任务 %s 意外结束", task.get_name())
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -7106,7 +7179,7 @@ git commit -m "feat: 程序装配、命令行与优雅退出" -m "Co-Authored-By
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- 观潮 launchd 配置模板：由 deploy/install.sh 替换 __REPO__ 与 __ARGS__ 后安装 -->
+<!-- 观潮 launchd 配置模板：由 deploy/install.sh 替换仓库路径与启动参数占位符后安装 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -7156,12 +7229,16 @@ mkdir -p "$REPO/log" "$HOME/Library/LaunchAgents"
 sed -e "s#__REPO__#$REPO#g" -e "s#__ARGS__#$ARGS#g" "$REPO/deploy/$LABEL.plist" > "$TARGET"
 plutil -lint "$TARGET"
 
-# 已安装则先卸载再加载
+# 已安装则先卸载，等旧进程完全退出（最长约 20 秒）后再加载
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+for _ in $(seq 1 20); do
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+  sleep 1
+done
 launchctl bootstrap "gui/$(id -u)" "$TARGET"
 echo "已安装并启动：$LABEL"
 echo "查看状态：launchctl print gui/$(id -u)/$LABEL | head -20"
-echo "查看日志：tail -f $REPO/log/tidewatch_\$(date +%F).log"
+echo "查看日志：tail -f $REPO/log/tidewatch_\$(TZ=Asia/Shanghai date +%F).log"
 ```
 
 - [ ] **Step 3: 写 `deploy/uninstall.sh`**
@@ -7306,12 +7383,12 @@ Run: `deploy/install.sh --dry-run`，期间手动重启两次：`launchctl kicks
 psql "$(grep ^TIDEWATCH_DATABASE_URL= .env | cut -d= -f2- | sed 's/+asyncpg//')" <<'SQL'
 -- 各等级事件数量（用于评估阈值是否合适）
 SELECT source, final_level, count(*) FROM events GROUP BY 1, 2 ORDER BY 1, 2;
--- 推送状态（演练模式应全部为 dry_run / superseded，不应有长期 pending）
+-- 推送状态（演练模式应为 dry_run / superseded / expired，不应有长期 pending 或 failed）
 SELECT status, count(*) FROM push_log GROUP BY 1;
 -- 同一簇同一等级不应被推送两次（重启不重复推送）
 SELECT cluster_id, level, count(*) FROM push_log WHERE status IN ('dry_run', 'ok') GROUP BY 1, 2 HAVING count(*) > 1;
 SQL
-grep -c "ERROR" log/tidewatch_$(date +%F).log
+grep -c "ERROR" log/tidewatch_$(TZ=Asia/Shanghai date +%F).log
 ```
 Expected: 进程持续运行（`launchctl print` 显示 `state = running`）；最后一个查询无结果；ERROR 行数为 0 或均可解释。把各等级数量与用户一起评估，必要时调整 `config.local.yaml` 中的关键词与阈值。
 
