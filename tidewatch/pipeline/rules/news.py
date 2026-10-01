@@ -1,11 +1,4 @@
-"""金十快讯分级规则（系统设计 6.6）
-
-S：important=1 且命中 S 关键词组
-A：命中 S 关键词组但非重要；或 important=1 且（涉及关注资产或命中 A 关键词组）；
-   或涉及关注资产且出现特朗普/马斯克等人物
-B：important=1 的其他快讯；或涉及关注资产
-C：其他
-"""
+"""金十快讯分级规则（系统设计 6.6）"""
 
 from __future__ import annotations
 
@@ -27,19 +20,28 @@ class NewsRules:
         has_asset = bool(event.assets)
         # 人物匹配与关键词规则语义一致：NFKC 规范化，英文名按独立单词匹配
         has_person = any(text_contains(text, person) for person in self._cfg.people)
+        has_noise = any(text_contains(text, marker) for marker in self._cfg.noise_markers)
 
         if important and s_hits:
-            return RuleResult("S", ["news.important", *s_hits])
-        if s_hits:
-            return RuleResult("A", s_hits)
-        if important and has_asset:
-            return RuleResult("A", ["news.important", "news.asset"])
-        if important and a_hits:
-            return RuleResult("A", ["news.important", *a_hits])
-        if has_asset and has_person:
-            return RuleResult("A", ["news.asset", "news.person"])
-        if important:
-            return RuleResult("B", ["news.important"])
-        if has_asset:
-            return RuleResult("B", ["news.asset"])
-        return RuleResult("C", [])
+            result = RuleResult("S", ["news.important", *s_hits])
+        elif s_hits:
+            critical = any(rule_id in self._cfg.critical_ids for rule_id in s_hits)
+            result = RuleResult("A" if critical else "B", s_hits)
+        elif important and has_asset:
+            result = RuleResult("A", ["news.important", "news.asset"])
+        elif important and a_hits:
+            result = RuleResult("A", ["news.important", *a_hits])
+        elif has_asset and has_person:
+            result = RuleResult("A", ["news.asset", "news.person"])
+        elif important:
+            result = RuleResult("B", ["news.important"])
+        elif has_asset:
+            result = RuleResult("B", ["news.asset"])
+        else:
+            result = RuleResult("C", [])
+
+        if has_noise:
+            if result.level in {"S", "A"}:
+                result.level = "B"
+            result.hits.append("news.noise")
+        return result

@@ -42,18 +42,19 @@ collectors:
 rules:
   news:
     s_keywords:
-      - {id: s.rate_decision, any: [利率决议, 议息会议, FOMC], none: [前瞻, 展望]}
-      - {id: s.powell, all: [鲍威尔], any: [讲话, 表示, 称]}
-      - {id: s.cpi, any: [CPI], none: [前瞻, 展望]}
-      - {id: s.pce, any: [PCE], none: [前瞻, 展望]}
-      - {id: s.nfp, any: [非农], none: [前瞻, 展望]}
+      - {id: s.rate_decision, any: [利率决议, 议息会议, FOMC声明], none: [前瞻, 展望, 票委, 将于]}
+      - {id: s.fed_rate, all: [美联储], any: [降息, 加息, 维持利率不变, 利率目标区间], none: [降息预期, 加息预期, 押注, 概率, 前瞻, 展望, 或将, 可能, 将于, 预计]}
+      - {id: s.fed_chair, all: [美联储主席], any: [讲话, 表示, 证词, 新闻发布会]}
+      - {id: s.cpi, all: [美国], any: [CPI], none: [前瞻, 展望, 预计, 将于]}
+      - {id: s.pce, all: [美国], any: [PCE], none: [前瞻, 展望, 预计, 将于]}
+      - {id: s.nfp, all: [美国], any: [非农], none: [前瞻, 展望, 预计, 将于]}
       - {id: s.emergency_rate, any: [紧急降息, 紧急加息]}
       - {id: s.tariff, all: [关税], any: [中国, 全面, 对等]}
       - {id: s.etf_approval, all: [ETF], any: [批准, 获批]}
       - {id: s.exchange_hack, any: [交易所被盗, 遭黑客攻击, 被黑客攻击]}
       - {id: s.depeg, any: [脱锚]}
       - {id: s.withdraw_halt, any: [暂停提现, 暂停提币]}
-      - {id: s.bankruptcy, any: [破产]}
+      - {id: s.bankruptcy, all: [破产], any: [交易所, 加密, 比特币, 稳定币, 银行破产]}
     a_keywords:
       - {id: a.macro, any: [美联储, 央行, 降息, 加息, 关税, 制裁]}
       - {id: a.regulator, any: [SEC, 证监会]}
@@ -62,6 +63,8 @@ rules:
       - {id: a.security, any: [黑客, 被盗]}
       - {id: a.bankruptcy, any: [破产]}
     people: [特朗普, 马斯克]
+    critical_ids: [s.exchange_hack, s.depeg, s.withdraw_halt, s.bankruptcy, s.emergency_rate, s.etf_approval]
+    noise_markers: [专属文章, 点击阅读, 点击查看, 欢迎前往, 今日重点关注, 盯盘神器, 财经日历]
   exchange:
     exchange_names: [币安, Binance, OKX, 欧易]
     listing_keywords: [上线, 上币, list, 下架, delist]

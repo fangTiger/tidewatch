@@ -225,7 +225,13 @@ def test_keyword_rule_blank_reported_in_chinese(tmp_path):
 
 def test_news_people_must_not_be_blank(tmp_path):
     with pytest.raises(ValidationError) as exc:
-        NewsRulesCfg(s_keywords=[], a_keywords=[], people=["特朗普", " "])
+        NewsRulesCfg(
+            s_keywords=[],
+            a_keywords=[],
+            critical_ids=[],
+            noise_markers=[],
+            people=["特朗普", " "],
+        )
     assert "人物名不能为空" in str(exc.value)
     base = _copy_default(tmp_path)
     (base / "config.local.yaml").write_text('rules:\n  news:\n    people: ["马斯克", ""]\n', encoding="utf-8")
@@ -233,6 +239,47 @@ def test_news_people_must_not_be_blank(tmp_path):
         load_settings(base, environ=ENV)
     message = str(config_exc.value)
     assert "rules.news.people" in message and "人物名不能为空" in message
+
+
+def test_news_noise_markers_must_not_be_blank(tmp_path):
+    with pytest.raises(ValidationError) as exc:
+        NewsRulesCfg(
+            s_keywords=[],
+            a_keywords=[],
+            critical_ids=[],
+            noise_markers=["点击阅读", " "],
+            people=[],
+        )
+    assert "噪音标记不能为空" in str(exc.value)
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(
+        'rules:\n  news:\n    noise_markers: ["", 点击阅读]\n', encoding="utf-8"
+    )
+    with pytest.raises(ConfigError) as config_exc:
+        load_settings(base, environ=ENV)
+    message = str(config_exc.value)
+    assert "rules.news.noise_markers" in message and "噪音标记不能为空" in message
+
+
+def test_news_critical_ids_must_reference_s_keyword_rule(tmp_path):
+    with pytest.raises(ValidationError) as exc:
+        NewsRulesCfg(
+            s_keywords=[KeywordRule(id="s.known", any=["已知"])],
+            a_keywords=[],
+            critical_ids=["s.missing"],
+            noise_markers=[],
+            people=[],
+        )
+    assert "critical_ids 中的规则不存在于 s_keywords：s.missing" in str(exc.value)
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(
+        "rules:\n  news:\n    critical_ids: [s.missing]\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError) as config_exc:
+        load_settings(base, environ=ENV)
+    message = str(config_exc.value)
+    assert "rules.news" in message
+    assert "critical_ids 中的规则不存在于 s_keywords：s.missing" in message
 
 
 def test_asset_symbol_is_stripped():

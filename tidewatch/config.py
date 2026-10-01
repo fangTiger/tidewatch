@@ -88,15 +88,26 @@ class CollectorCfg(_Strict):
 class NewsRulesCfg(_Strict):
     s_keywords: list[KeywordRule]
     a_keywords: list[KeywordRule]
+    critical_ids: list[str]
+    noise_markers: list[str]
     people: list[str]
 
-    @field_validator("people")
+    @field_validator("people", "noise_markers")
     @classmethod
-    def _people_not_blank(cls, value: list[str]) -> list[str]:
-        # 空人物名会匹配任意文本，导致关注资产的快讯都被升级为 A
-        if any(not person.strip() for person in value):
-            raise ValueError("人物名不能为空")
+    def _text_markers_not_blank(cls, value: list[str], info) -> list[str]:
+        # 空字符串会匹配任意文本，导致所有快讯被误升级或封顶
+        if any(not item.strip() for item in value):
+            message = "人物名不能为空" if info.field_name == "people" else "噪音标记不能为空"
+            raise ValueError(message)
         return value
+
+    @model_validator(mode="after")
+    def _critical_ids_exist(self) -> NewsRulesCfg:
+        s_ids = {rule.id for rule in self.s_keywords}
+        missing = [rule_id for rule_id in self.critical_ids if rule_id not in s_ids]
+        if missing:
+            raise ValueError(f"critical_ids 中的规则不存在于 s_keywords：{', '.join(missing)}")
+        return self
 
 
 class ExchangeRulesCfg(_Strict):

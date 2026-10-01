@@ -67,4 +67,4 @@ async def test_build_rule_engine(settings):
     assert (await engine.evaluate(_ann("binance", "spot_listing", ["XYZ"]), CTX)).level == "S"
     news = Event(source="jin10", category="news", event_type="flash", occurred_at=NOW,
                  title="美国9月非农就业人口增加8.2万人", dedupe_key="jin10:x")
-    assert (await engine.evaluate(news, CTX)).level == "A"
+    assert (await engine.evaluate(news, CTX)).level == "B"

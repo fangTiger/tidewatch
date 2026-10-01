@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 from tidewatch.config import KeywordRule, NewsRulesCfg
@@ -45,16 +46,16 @@ def test_blank_keyword_never_matches():
 
 
 async def _level(rules: NewsRules, event: Event) -> RuleResult:
-    return await rules.evaluate(event, CTX)
+    return await asyncio.wait_for(rules.evaluate(event, CTX), timeout=1)
 
 
 async def test_news_levels(settings):
     rules = NewsRules(settings.rules.news)
     r = await _level(rules, _flash("美国9月非农就业人口增加8.2万人，预期12万人", important=1))
     assert r.level == "S" and "s.nfp" in r.hits
-    assert (await _level(rules, _flash("美国9月非农就业人口增加8.2万人"))).level == "A"
+    assert (await _level(rules, _flash("美国9月非农就业人口增加8.2万人"))).level == "B"
     assert (await _level(rules, _flash("比特币跌破11万美元", important=1, assets=["BTC"]))).level == "A"
-    assert (await _level(rules, _flash("美联储理事沃勒：支持12月降息", important=1))).level == "A"
+    assert (await _level(rules, _flash("美联储理事沃勒：支持12月降息", important=1))).level == "S"
     assert (await _level(rules, _flash("特朗普：比特币是未来", assets=["BTC"]))).level == "A"
     assert (await _level(rules, _flash("港股低开高走，恒指翻红", important=1))).level == "B"
     assert (await _level(rules, _flash("以太坊链上活跃度回升", assets=["ETH"]))).level == "B"
@@ -70,7 +71,7 @@ async def test_news_levels(settings):
 
 async def test_engine_dispatch_by_category(settings):
     engine = RuleEngine({"news": NewsRules(settings.rules.news)})
-    assert (await engine.evaluate(_flash("美国9月非农就业人口增加8.2万人"), CTX)).level == "A"
+    assert (await engine.evaluate(_flash("美国9月非农就业人口增加8.2万人"), CTX)).level == "B"
     other = _flash("未知类别")
     other.category = "unknown"
     result = await engine.evaluate(other, CTX)
@@ -78,7 +79,9 @@ async def test_engine_dispatch_by_category(settings):
 
 
 async def test_person_matching_reuses_keyword_semantics():
-    cfg = NewsRulesCfg(s_keywords=[], a_keywords=[], people=["Trump"])
+    cfg = NewsRulesCfg(
+        s_keywords=[], a_keywords=[], critical_ids=[], noise_markers=[], people=["Trump"]
+    )
     rules = NewsRules(cfg)
     # 英文人物名按独立单词匹配，且不区分大小写
     assert (await _level(rules, _flash("Trump says bitcoin", assets=["BTC"]))).level == "A"
@@ -86,3 +89,21 @@ async def test_person_matching_reuses_keyword_semantics():
     assert (await _level(rules, _flash("trumpet 演奏", assets=["BTC"]))).level == "B"
     # 全角字符经 NFKC 规范化后也能匹配
     assert (await _level(rules, _flash("Ｔｒｕｍｐ 发言", assets=["BTC"]))).level == "A"
+
+
+async def test_nonimportant_s_hits_split_by_critical_id(settings):
+    rules = NewsRules(settings.rules.news)
+    critical = await _level(rules, _flash("某加密货币交易所被盗约1亿美元"))
+    macro = await _level(rules, _flash("美国9月CPI年率 3.1%"))
+    assert critical.level == "A" and "s.exchange_hack" in critical.hits
+    assert macro.level == "B" and "s.cpi" in macro.hits
+
+
+async def test_noise_marker_caps_level_and_keeps_rule_hits(settings):
+    rules = NewsRules(settings.rules.news)
+    result = await _level(
+        rules,
+        _flash("美国9月ＣＰＩ年率 3.1%", important=1, body="欢迎前往数据库查看"),
+    )
+    assert result.level == "B"
+    assert result.hits == ["news.important", "s.cpi", "news.noise"]

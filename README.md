@@ -47,6 +47,15 @@ deploy/uninstall.sh          # 卸载
 - 币安公告：`.env` 中配置只读的 `BINANCE_API_KEY` 与 `BINANCE_API_SECRET` 时使用 WebSocket 实时推送，否则每 30 秒轮询（状态页显示「降级」）
 - 日志：`log/tidewatch_YYYY-MM-DD.log`，保留 14 天。`log/launchd.err.log` 只记录启动早期的错误且不会轮转，必要时请手动清理
 
+## 只读重新分级
+
+用当前配置重新计算库中已有事件的 `rule_level`，比较新旧等级但绝不写回数据库。默认检查金十快讯；可限制最新事件数量，并用 `--changes` 显示等级变化明细（时间、旧→新、命中规则及标题前 60 字）。
+
+```bash
+python -m tidewatch.tools.regrade
+python -m tidewatch.tools.regrade --source jin10 --limit 200 --changes
+```
+
 ## 测试
 
 ```bash
