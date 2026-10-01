@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -74,6 +75,18 @@ def _reset_sse_app_status():
     AppStatus.should_exit = False
     yield
     AppStatus.should_exit = False
+
+
+@pytest.fixture
+def occupied_port():
+    """一个已被占用（正在监听）的本机端口；用完关闭"""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen()
+    try:
+        yield sock.getsockname()[1]
+    finally:
+        sock.close()
 
 
 class FakeClock:

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from sqlalchemy import select
 
 import tidewatch.app as app_module
 from fakes import free_port, wait_until
@@ -17,6 +18,8 @@ from tidewatch.collectors.jin10 import Jin10Collector
 from tidewatch.collectors.okx_ann import OkxAnnCollector
 from tidewatch.config import ConfigError
 from tidewatch.notify.dryrun import DryRunNotifier
+from tidewatch.store.tables import collector_state
+from tidewatch.web.embedded import EmbeddedServer
 
 
 def test_parse_args():
@@ -204,3 +207,286 @@ async def test_run_exits_zero_on_sigterm(engine, settings):
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+# ---------- 网站启动失败：端口被占用 ----------
+
+
+async def test_run_returns_1_when_port_in_use(engine, settings, caplog, occupied_port):
+    """端口被占用：run() 记录原因、清理资源并返回 1；SystemExit 不会穿出事件循环"""
+    settings.web.port = occupied_port
+    with caplog.at_level(logging.INFO):
+        code = await asyncio.wait_for(run(settings, groups={"web"}, dry_run=True), timeout=20)
+    assert code == 1
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("端口可能被占用" in m for m in messages)
+    failed = [r for r in caplog.records if "启动失败" in r.getMessage() and r.exc_info is not None]
+    assert failed  # 走的是 run() 的「启动失败」路径
+    assert not any("网站已启动" in m or "观潮已启动" in m for m in messages)
+    assert any("观潮已停止" in m for m in messages)  # 已清理资源
+    gc.collect()
+
+
+async def test_start_raises_when_port_in_use(engine, settings, caplog, occupied_port):
+    """start() 在网站没有真正监听成功时抛 RuntimeError，不输出「已启动」日志"""
+    settings.web.port = occupied_port
+    app = Application(settings, groups={"web"}, dry_run=True)
+    try:
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(RuntimeError, match="端口可能被占用"):
+                await asyncio.wait_for(app.start(), timeout=20)
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)
+    assert not any("已启动" in r.getMessage() for r in caplog.records)
+
+
+async def test_start_returns_only_after_web_listening(engine, settings, caplog):
+    """start() 返回时 uvicorn 已经开始监听；「网站已启动」日志在监听成功之后才输出"""
+    settings.web.port = free_port()
+    app = Application(settings, groups={"web"}, dry_run=True)
+    started_when_logged: list[bool] = []
+
+    class Spy(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if "网站已启动" in record.getMessage():
+                started_when_logged.append(app._server.started)
+
+    spy = Spy()
+    logging.getLogger("tidewatch.app").addHandler(spy)
+    try:
+        with caplog.at_level(logging.INFO):
+            await asyncio.wait_for(app.start(), timeout=20)
+        assert app._server.started
+        assert started_when_logged == [True]
+    finally:
+        logging.getLogger("tidewatch.app").removeHandler(spy)
+        await asyncio.wait_for(app.stop(), timeout=5)
+
+
+async def test_start_times_out_when_web_never_starts(engine, settings, monkeypatch):
+    """网站迟迟没有进入「已启动」：超时后抛 RuntimeError 并取消网站任务，不会挂起"""
+    settings.web.port = free_port()
+
+    async def hang(self, sockets=None):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(EmbeddedServer, "serve", hang)
+    monkeypatch.setattr(app_module, "WEB_START_TIMEOUT_S", 0.3)
+    app = Application(settings, groups={"web"}, dry_run=True)
+    try:
+        with pytest.raises(RuntimeError, match="未完成启动"):
+            await asyncio.wait_for(app.start(), timeout=10)
+        assert app._web_task.done()
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)
+
+
+async def test_start_raises_when_web_task_returns_before_started(engine, settings, monkeypatch, caplog):
+    """网站任务在标记 started 前直接返回，也属于启动失败且不输出「已启动」日志"""
+    settings.web.port = free_port()
+
+    async def quit_before_started(self, sockets=None):
+        return None
+
+    monkeypatch.setattr(EmbeddedServer, "serve", quit_before_started)
+    app = Application(settings, groups={"web"}, dry_run=True)
+    try:
+        with caplog.at_level(logging.INFO):
+            with pytest.raises(RuntimeError, match="启动前结束"):
+                await asyncio.wait_for(app.start(), timeout=5)
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)
+    assert not any("已启动" in r.getMessage() for r in caplog.records)
+
+
+def _fake_serve(behaviour):
+    """构造替代 EmbeddedServer.serve 的协程：先标记已启动，再执行 behaviour"""
+
+    async def serve(self, sockets=None):
+        self.started = True
+        await behaviour(self)
+
+    return serve
+
+
+async def test_unexpected_web_exit_is_logged(engine, settings, monkeypatch, caplog):
+    """网站任务在运行期间意外结束（抛异常）：记录 error 日志"""
+    settings.web.port = free_port()
+
+    async def crash(server):
+        await asyncio.sleep(0.05)
+        raise RuntimeError("嵌入式服务崩溃")
+
+    monkeypatch.setattr(EmbeddedServer, "serve", _fake_serve(crash))
+    app = Application(settings, groups={"web"}, dry_run=True)
+    with caplog.at_level(logging.INFO):
+        await asyncio.wait_for(app.start(), timeout=5)
+        await wait_until(lambda: app._web_task.done())
+        await asyncio.sleep(0.05)  # 让 done-callback 执行
+        await asyncio.wait_for(app.stop(), timeout=5)
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("网站" in m and "嵌入式服务崩溃" in m for m in errors)
+
+
+async def test_unexpected_web_return_is_logged(engine, settings, monkeypatch, caplog):
+    """网站任务没有收到退出请求却正常返回：同样记录 error 日志"""
+    settings.web.port = free_port()
+
+    async def quit_quietly(server):
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(EmbeddedServer, "serve", _fake_serve(quit_quietly))
+    app = Application(settings, groups={"web"}, dry_run=True)
+    with caplog.at_level(logging.INFO):
+        await asyncio.wait_for(app.start(), timeout=5)
+        await wait_until(lambda: app._web_task.done())
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(app.stop(), timeout=5)
+    assert any("网站" in r.getMessage() and r.levelno >= logging.ERROR for r in caplog.records)
+
+
+async def test_cancelled_web_task_is_not_logged_as_error(engine, settings, monkeypatch, caplog):
+    """网站任务被取消不算意外结束：不记 error"""
+    settings.web.port = free_port()
+
+    async def idle(server):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(EmbeddedServer, "serve", _fake_serve(idle))
+    app = Application(settings, groups={"web"}, dry_run=True)
+    with caplog.at_level(logging.INFO):
+        await asyncio.wait_for(app.start(), timeout=5)
+        app._web_task.cancel()
+        await asyncio.gather(app._web_task, return_exceptions=True)
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(app.stop(), timeout=5)
+    assert [r for r in caplog.records if r.name == "tidewatch.app" and r.levelno >= logging.ERROR] == []
+
+
+async def test_normal_stop_does_not_log_web_error(engine, settings, caplog):
+    """正常退出（stop() 通知 uvicorn 退出）不记网站相关的 error"""
+    app, _ = await _start_web(settings)
+    with caplog.at_level(logging.INFO):
+        await asyncio.wait_for(app.stop(), timeout=5)
+        await asyncio.sleep(0.05)
+    assert [r for r in caplog.records if r.name == "tidewatch.app" and r.levelno >= logging.ERROR] == []
+
+
+# ---------- 按组件组装配：实时更新只在新闻与网站同时运行时才有意义 ----------
+
+
+async def _quiet(app: Application) -> None:
+    """测试中不访问外部接口：关闭采集器 HTTP 客户端并清空采集器列表"""
+    for collector in app.collectors:
+        await collector.client.aclose()
+    app.collectors = []
+
+
+async def test_news_only_has_no_live_updates(engine, settings):
+    """只开 news 组：不创建 LiveUpdates，不挂回调，也没有 live 后台任务（否则待推送队列无人消费、无限增长）"""
+    app = Application(settings, groups={"news"}, dry_run=True)
+    await _quiet(app)
+    assert app.live is None
+    await asyncio.wait_for(app.start(), timeout=5)
+    try:
+        assert all(getattr(l, "__self__", None).__class__.__name__ != "LiveUpdates" for l in app.sink._ingest_listeners)
+        assert len(app.sink._ingest_listeners) == 1  # 只有调度器自己的回调
+        assert app.health._listeners == []
+        assert "live" not in [t.get_name() for t in app._tasks]
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)
+
+
+async def test_web_only_has_no_live_updates(engine, settings):
+    """只开 web 组：没有流水线，不创建 LiveUpdates"""
+    settings.web.port = free_port()
+    app = Application(settings, groups={"web"}, dry_run=True)
+    assert app.live is None
+    await asyncio.wait_for(app.start(), timeout=5)
+    try:
+        assert app.sink._ingest_listeners == [] and app.health._listeners == []
+        assert "live" not in [t.get_name() for t in app._tasks]
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)
+
+
+async def test_news_and_web_wire_live_updates(engine, settings):
+    """news 与 web 同时开：LiveUpdates 挂到 sink 与 health 上，并启动 live 后台任务"""
+    settings.web.port = free_port()
+    app = Application(settings, groups={"news", "web"}, dry_run=True)
+    await _quiet(app)
+    assert app.live is not None
+    await asyncio.wait_for(app.start(), timeout=5)
+    try:
+        assert app.live.on_ingest in app.sink._ingest_listeners
+        assert app.live.on_health in app.health._listeners
+        assert "live" in [t.get_name() for t in app._tasks]
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)
+
+
+# ---------- 装配：启动顺序与币安模式 ----------
+
+
+async def test_start_order_health_load_then_sink_then_dispatcher(engine, settings):
+    """启动顺序：health.load → sink.start → dispatcher.start（打桩只记录调用，仍执行真实实现）"""
+    app = Application(settings, groups={"news"}, dry_run=True)
+    await _quiet(app)
+    order: list[str] = []
+
+    def trace(owner, name: str, label: str) -> None:
+        original = getattr(owner, name)
+
+        async def wrapper(*args, **kwargs):
+            order.append(label)
+            return await original(*args, **kwargs)
+
+        setattr(owner, name, wrapper)
+
+    trace(app.health, "load", "health.load")
+    trace(app.sink, "start", "sink.start")
+    trace(app.dispatcher, "start", "dispatcher.start")
+    await asyncio.wait_for(app.start(), timeout=5)
+    try:
+        assert order == ["health.load", "sink.start", "dispatcher.start"]
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)
+
+
+async def _binance_mode(engine) -> str | None:
+    async with engine.connect() as conn:
+        return (await conn.execute(
+            select(collector_state.c.mode).where(collector_state.c.name == "binance_ann")
+        )).scalar_one_or_none()
+
+
+async def _start_only_binance(settings) -> Application:
+    """只保留币安采集器并让它的 run() 空转（不访问外部接口），启动应用"""
+    app = Application(settings, groups={"news"}, dry_run=True)
+    for collector in app.collectors:
+        await collector.client.aclose()
+    app.collectors = [c for c in app.collectors if c.name == "binance_ann"]
+
+    async def idle() -> None:
+        await asyncio.sleep(3600)
+
+    app.collectors[0].run = idle
+    await asyncio.wait_for(app.start(), timeout=5)
+    return app
+
+
+async def test_binance_mode_persisted_degraded_then_normal(engine, settings):
+    """未配置币安 Key：collector_state.mode 落库为 degraded；之后配置 Key 重启，恢复为 normal"""
+    app = await _start_only_binance(settings)
+    try:
+        assert isinstance(app.collectors[0], BinanceAnnPoll)
+        assert await asyncio.wait_for(_binance_mode(engine), timeout=5) == "degraded"
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)
+    settings.secrets.binance_api_key, settings.secrets.binance_api_secret = "k", "s"
+    app = await _start_only_binance(settings)
+    try:
+        assert isinstance(app.collectors[0], BinanceAnnStream)
+        assert await asyncio.wait_for(_binance_mode(engine), timeout=5) == "normal"
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)

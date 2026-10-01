@@ -8,10 +8,10 @@ import pytest
 import uvicorn
 
 from fakes import free_port, wait_until
-from tidewatch.app import _EmbeddedServer
 from tidewatch.models import Event, FetchResult
 from tidewatch.pipeline.sink import create_event_sink
 from tidewatch.web.broadcaster import Broadcaster
+from tidewatch.web.embedded import EmbeddedServer
 from tidewatch.web.server import create_app
 
 
@@ -83,7 +83,7 @@ async def live_server(seeded, settings, clock):
     port = free_port()
     config = uvicorn.Config(create_app(seeded, broadcaster, settings, clock=clock), host="127.0.0.1", port=port,
                             log_config=None, access_log=False, timeout_graceful_shutdown=2)
-    server = _EmbeddedServer(config)
+    server = EmbeddedServer(config)
     task = asyncio.create_task(server.serve())
     try:
         await wait_until(lambda: server.started or task.done())
@@ -126,3 +126,35 @@ async def test_stream_delivers_published_events(live_server):
             broadcaster.publish("health.changed", {"name": "jin10", "status": "abnormal"})
             message = await asyncio.wait_for(_read_sse_message(lines), timeout=3)
             assert message["event"] == "health.changed" and json.loads(message["data"])["status"] == "abnormal"
+
+
+# ---------- 嵌入式 uvicorn：启动失败的表现 ----------
+
+
+async def test_embedded_server_port_in_use_raises_runtime_error(seeded, settings, clock, occupied_port):
+    """端口被占用时 serve() 抛 RuntimeError（含「端口可能被占用」），而不是让 SystemExit 穿出事件循环"""
+    config = uvicorn.Config(create_app(seeded, Broadcaster(), settings, clock=clock), host="127.0.0.1",
+                            port=occupied_port, log_config=None, access_log=False)
+    server = EmbeddedServer(config)
+    with pytest.raises(RuntimeError, match="端口可能被占用") as info:
+        await asyncio.wait_for(server.serve(), timeout=10)
+    assert f"127.0.0.1:{occupied_port}" in str(info.value)
+    assert server.started is False
+
+
+async def test_embedded_server_does_not_touch_signal_handlers(seeded, settings, clock):
+    """嵌入式 uvicorn 不接管信号：serve() 前后进程的 SIGINT / SIGTERM 处理器保持不变"""
+    import signal
+
+    before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+    config = uvicorn.Config(create_app(seeded, Broadcaster(), settings, clock=clock), host="127.0.0.1",
+                            port=free_port(), log_config=None, access_log=False)
+    server = EmbeddedServer(config)
+    task = asyncio.create_task(server.serve())
+    try:
+        await wait_until(lambda: server.started or task.done())
+        assert server.started
+        assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(task, timeout=5)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import logging
 import signal
 import sys
@@ -29,6 +28,7 @@ from tidewatch.notify.feishu import FeishuNotifier
 from tidewatch.pipeline.sink import create_event_sink
 from tidewatch.store.db import create_db_engine
 from tidewatch.web.broadcaster import Broadcaster
+from tidewatch.web.embedded import EmbeddedServer
 from tidewatch.web.live import LiveUpdates
 from tidewatch.web.server import create_app
 
@@ -37,17 +37,7 @@ logger = logging.getLogger(__name__)
 GROUPS = ("news", "web")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STOP_TIMEOUT_S = 8
-
-
-class _EmbeddedServer(uvicorn.Server):
-    """嵌入同一事件循环的 uvicorn：不接管信号，由应用统一处理"""
-
-    @contextlib.contextmanager
-    def capture_signals(self):
-        yield
-
-    def install_signal_handlers(self) -> None:  # 兼容旧版 uvicorn
-        pass
+WEB_START_TIMEOUT_S = 10
 
 
 class Application:
@@ -62,12 +52,18 @@ class Application:
         self.health = HealthMonitor(self.engine, self.notifier, settings.dispatch, clock=clock)
         self.sink = create_event_sink(self.engine, settings, clock=clock)
         self.dispatcher = Dispatcher(self.engine, self.sink, self.notifier, settings.dispatch, clock=clock)
-        self.live = LiveUpdates(self.engine, self.broadcaster, settings)
+        self.live = (
+            LiveUpdates(self.engine, self.broadcaster, settings)
+            if {"news", "web"}.issubset(self.groups)
+            else None
+        )
         self.collectors: list[Collector] = self._make_collectors() if "news" in self.groups else []
         self._tasks: list[asyncio.Task] = []
         self._collector_tasks: list[asyncio.Task] = []
-        self._server: _EmbeddedServer | None = None
+        self._server: EmbeddedServer | None = None
         self._web_task: asyncio.Task | None = None  # uvicorn 的 serve 任务：单独保存，退出时等它自行结束而不是取消
+        self._web_ready = False
+        self._stopping = False
 
     # ---------- 装配 ----------
 
@@ -120,8 +116,9 @@ class Application:
 
     async def start(self) -> None:
         if "news" in self.groups:
-            self.sink.on_ingest(self.live.on_ingest)
-            self.health.on_change(self.live.on_health)
+            if self.live is not None:
+                self.sink.on_ingest(self.live.on_ingest)
+                self.health.on_change(self.live.on_health)
             self.dispatcher.attach()
             await self.health.load()
             await self.sink.start()
@@ -131,10 +128,9 @@ class Application:
                 await self.health.set_mode("binance_ann", "degraded" if self.binance_degraded else "normal")
                 if self.binance_degraded:
                     logger.warning("未配置币安只读 API Key，币安公告以降级模式（轮询列表接口）运行")
-            self._tasks += [
-                asyncio.create_task(self.health.run(), name="health"),
-                asyncio.create_task(self.live.run(), name="live"),
-            ]
+            self._tasks.append(asyncio.create_task(self.health.run(), name="health"))
+            if self.live is not None:
+                self._tasks.append(asyncio.create_task(self.live.run(), name="live"))
             self._collector_tasks = [
                 asyncio.create_task(c.run(), name=f"collector-{c.name}") for c in self.collectors
             ]
@@ -150,11 +146,42 @@ class Application:
                 access_log=False,
                 timeout_graceful_shutdown=3,  # 浏览器保持 SSE 连接时也能按时退出
             )
-            self._server = _EmbeddedServer(config)
+            self._server = EmbeddedServer(config)
             self._web_task = asyncio.create_task(self._server.serve(), name="web")
+            self._web_task.add_done_callback(self._log_web_exit)
+            try:
+                await asyncio.wait_for(self._wait_web_started(), timeout=WEB_START_TIMEOUT_S)
+            except asyncio.TimeoutError as exc:
+                self._web_task.cancel()
+                await asyncio.gather(self._web_task, return_exceptions=True)
+                raise RuntimeError(
+                    f"网站未完成启动：等待监听 {web.host}:{web.port} 超过 {WEB_START_TIMEOUT_S} 秒"
+                ) from exc
+            self._web_ready = True
             logger.info("网站已启动：http://%s:%s", web.host, web.port)
         mode = "，演练模式（不发送飞书）" if self.dry_run else ""
         logger.info("观潮已启动：%s%s", "、".join(sorted(self.groups)), mode)
+
+    async def _wait_web_started(self) -> None:
+        """等待 uvicorn 确认监听；任务提前结束时立即转交其异常"""
+        assert self._server is not None and self._web_task is not None
+        while True:
+            if self._web_task.done():
+                await self._web_task
+                raise RuntimeError("网站启动失败：网站任务在启动前结束")
+            if self._server.started:
+                return
+            await asyncio.sleep(0.01)
+
+    def _log_web_exit(self, task: asyncio.Task) -> None:
+        """网站在完成启动后意外结束时记录错误"""
+        if task.cancelled() or self._stopping or not self._web_ready:
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("网站任务异常退出：%s", exc, exc_info=exc)
+        else:
+            logger.error("网站任务意外结束")
 
     async def stop(self) -> None:
         """优雅退出：先停采集，再处理完已提交的写入与推送，最后关闭网站与各类连接
@@ -162,6 +189,7 @@ class Application:
         对「部分启动」安全（组件未启动时对应步骤什么也不做）；各项资源关闭互不影响，
         任何一步出错只记录日志，数据库连接池一定会释放。
         """
+        self._stopping = True
         try:
             for task in self._collector_tasks:
                 task.cancel()
@@ -196,7 +224,7 @@ class Application:
             logger.exception("%s失败", what)
 
     async def _wait_streams_closed(self, timeout: float = 1.0) -> None:
-        """等待所有 SSE 订阅者结束迭代（最多 timeout 秒），再多让出几轮事件循环，让响应发完结尾"""
+        """保险等待 SSE 响应收尾；Broadcaster.close() 已让流自然结束，这里只负责兜底等待"""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while self.broadcaster.subscriber_count > 0 and loop.time() < deadline:
@@ -217,6 +245,7 @@ def _log_collector_exit(task: asyncio.Task) -> None:
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    """解析命令行参数，返回所选组件组与演练模式设置"""
     parser = argparse.ArgumentParser(prog="tidewatch", description="观潮：个人市场监控系统")
     parser.add_argument("--only", nargs="+", choices=GROUPS, help="只启动指定组件组（默认全部）")
     parser.add_argument("--dry-run", action="store_true", help="演练模式：不发送飞书，只写日志")
@@ -235,8 +264,8 @@ async def run(settings: Settings, *, groups: set[str], dry_run: bool) -> int:
     try:
         try:
             await app.start()
-        except Exception:
-            logger.exception("启动失败")
+        except Exception as exc:
+            logger.exception("启动失败：%s", exc)
             exit_code = 1
         else:
             await stop_event.wait()
@@ -253,6 +282,7 @@ async def run(settings: Settings, *, groups: set[str], dry_run: bool) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """加载配置并运行观潮，返回适合进程退出的状态码"""
     args = parse_args(argv)
     try:
         settings = load_settings(REPO_ROOT)
