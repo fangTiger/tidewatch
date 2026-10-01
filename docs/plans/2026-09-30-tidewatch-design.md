@@ -248,6 +248,9 @@ Hyperliquid 子系统结构复杂（多连接、按钱包调度），**不继承
 **币安公告 / OKX 公告**
 - 公告分类：币安按 `catalogId` + 英文标题关键词，OKX 按 `annType`（如 `announcements-new-listings`、`announcements-delistings`）+ 标题关键词，统一映射为：`spot_listing`、`perp_listing`、`delisting`、`perp_delisting`、`deposit_withdraw_suspend`、`other`。
 - 币安 WS 需要只读 API Key（不开任何交易权限）。
+- **币安 WS 已知限制**（一期实现，首次真实联调时需关注）：
+  - WS 载荷（`com_announcement_en`）不含公告 `code`，无法拼出公告详情页地址。WS 事件的 `url` 因此指向栏目列表页（`https://www.binance.com/en/support/announcement/list/{catalogId}`），列表接口补缺得到的事件才是详情页（`.../announcement/{code}`）。WS 与列表接口共用同一个去重键，同一公告只入库一次，入库采用 `ON CONFLICT DO NOTHING`：谁先入库就保留谁的 `url`，WS 通常先到，所以多数币安公告的推送链接是栏目列表页。后续如需详情页链接，可在补缺时按去重键回填 `url`，一期不做。
+  - REGISTER / SUBSCRIBE 的 COMMAND 消息，一期按「`data` 严格等于 `"SUCCESS"`」判定成功，其余一律视为被拒绝（如 API Key 无效），抛错并按失败退避重连。该取值尚未经真实连接验证，首次真实联调时需观察 COMMAND 原文确认；若实际成功值与 `"SUCCESS"` 不一致，会表现为每次连接都被判失败、反复重连并最终触发健康告警，据此调整判定即可。
 
 **SEC 公告**
 - 使用 `edgartools` 解析；请求必须带 `User-Agent: 名称 邮箱`，全局限速 ≤ 10 次/秒。
