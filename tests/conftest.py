@@ -66,6 +66,16 @@ def settings(tmp_path):
     return load_settings(tmp_path, environ={"TIDEWATCH_DATABASE_URL": TEST_DB_URL or "postgresql+asyncpg://x/y"})
 
 
+@pytest.fixture(autouse=True)
+def _reset_sse_app_status():
+    """sse-starlette 的退出标记是进程全局的：任何一次 uvicorn 退出都会让之后所有 SSE 流立即结束，每个测试前后复位"""
+    from sse_starlette.sse import AppStatus
+
+    AppStatus.should_exit = False
+    yield
+    AppStatus.should_exit = False
+
+
 class FakeClock:
     """可手动推进的时钟"""
 

@@ -2,6 +2,8 @@ import asyncio
 import json
 from datetime import timedelta
 
+import pytest
+
 from tidewatch.models import Event, FetchResult
 from tidewatch.pipeline.sink import create_event_sink
 from tidewatch.web.broadcaster import Broadcaster
@@ -55,3 +57,45 @@ async def test_live_updates_from_sink_and_health(engine, settings, clock):
     health = await _next(agen)
     assert health["event"] == "health.changed" and json.loads(health["data"])["status"] == "abnormal"
     await agen.aclose()
+
+
+async def test_broadcaster_close_ends_subscribers():
+    """close() 后订阅者的迭代正常结束；之后的新订阅也立即结束"""
+    broadcaster = Broadcaster()
+    agen = broadcaster.subscribe()
+    first = asyncio.create_task(_next(agen))
+    while broadcaster.subscriber_count == 0:
+        await asyncio.sleep(0)
+    broadcaster.publish("tick", {"i": 1})
+    assert json.loads((await first)["data"]) == {"i": 1}
+    waiting = asyncio.create_task(agen.__anext__())  # 订阅者空闲，正在等待下一条消息
+    await asyncio.sleep(0)
+    broadcaster.close()
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(waiting, timeout=2)
+    assert broadcaster.subscriber_count == 0
+    late = broadcaster.subscribe()
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(late.__anext__(), timeout=2)
+    assert broadcaster.subscriber_count == 0
+    broadcaster.publish("tick", {"i": 2})  # 关闭后发布不报错
+
+
+async def test_broadcaster_close_with_full_queue():
+    """订阅者队列已满时 close() 也能让它结束（挤掉最旧的消息放入结束标记）"""
+    broadcaster = Broadcaster(max_queue=2)
+    agen = broadcaster.subscribe()
+    first = asyncio.create_task(_next(agen))
+    while broadcaster.subscriber_count == 0:
+        await asyncio.sleep(0)
+    broadcaster.publish("tick", {"i": 0})
+    await first
+    for i in range(1, 4):  # 订阅者不消费，队列被填满
+        broadcaster.publish("tick", {"i": i})
+    broadcaster.close()
+
+    async def drain() -> list[int]:
+        return [json.loads(message["data"])["i"] async for message in agen]
+
+    received = await asyncio.wait_for(drain(), timeout=2)  # 迭代必须结束而不是挂起
+    assert received and received[-1] == 3 and len(received) <= 2  # 容量 2：最多剩两条消息，结束标记不占消息

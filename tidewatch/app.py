@@ -9,6 +9,7 @@ import logging
 import signal
 import sys
 from pathlib import Path
+from typing import Awaitable
 
 import uvicorn
 
@@ -66,6 +67,7 @@ class Application:
         self._tasks: list[asyncio.Task] = []
         self._collector_tasks: list[asyncio.Task] = []
         self._server: _EmbeddedServer | None = None
+        self._web_task: asyncio.Task | None = None  # uvicorn 的 serve 任务：单独保存，退出时等它自行结束而不是取消
 
     # ---------- 装配 ----------
 
@@ -149,31 +151,58 @@ class Application:
                 timeout_graceful_shutdown=3,  # 浏览器保持 SSE 连接时也能按时退出
             )
             self._server = _EmbeddedServer(config)
-            self._tasks.append(asyncio.create_task(self._server.serve(), name="web"))
+            self._web_task = asyncio.create_task(self._server.serve(), name="web")
             logger.info("网站已启动：http://%s:%s", web.host, web.port)
         mode = "，演练模式（不发送飞书）" if self.dry_run else ""
         logger.info("观潮已启动：%s%s", "、".join(sorted(self.groups)), mode)
 
     async def stop(self) -> None:
-        """优雅退出：先停采集，再处理完已提交的写入与推送，最后关闭网站与各类连接"""
-        for task in self._collector_tasks:
-            task.cancel()
-        await asyncio.gather(*self._collector_tasks, return_exceptions=True)
-        await self.dispatcher.stop()
-        await self.sink.stop()
-        if self._server is not None:
-            # 信号由应用接管，需主动通知 uvicorn 退出（会一并关闭 SSE 连接）
-            self._server.handle_exit(signal.SIGTERM, None)
-        for task in self._tasks:
-            if task.get_name() != "web":
+        """优雅退出：先停采集，再处理完已提交的写入与推送，最后关闭网站与各类连接
+
+        对「部分启动」安全（组件未启动时对应步骤什么也不做）；各项资源关闭互不影响，
+        任何一步出错只记录日志，数据库连接池一定会释放。
+        """
+        try:
+            for task in self._collector_tasks:
                 task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        for collector in self.collectors:
-            if collector.client is not None:
-                await collector.client.aclose()
-        await self.notifier.aclose()
-        await self.engine.dispose()
+            await asyncio.gather(*self._collector_tasks, return_exceptions=True)
+            await self._guard("停止推送调度器", self.dispatcher.stop())
+            await self._guard("停止写入队列", self.sink.stop())
+            # 先结束所有 SSE 订阅，让响应正常收尾；否则 sse-starlette 会在 uvicorn 退出时
+            # 直接取消响应，uvicorn 随即记录 ERROR「ASGI callable returned without completing response」
+            self.broadcaster.close()
+            if self._server is not None:
+                await self._wait_streams_closed()
+                # 信号由应用接管，需主动通知 uvicorn 退出
+                self._server.handle_exit(signal.SIGTERM, None)
+            for task in self._tasks:
+                task.cancel()
+            waiting = [*self._tasks, *([self._web_task] if self._web_task is not None else [])]
+            await asyncio.gather(*waiting, return_exceptions=True)
+            for collector in self.collectors:
+                if collector.client is not None:
+                    await self._guard(f"关闭采集器 {collector.name} 的 HTTP 客户端", collector.client.aclose())
+            await self._guard("关闭通知器", self.notifier.aclose())
+        finally:
+            await self.engine.dispose()
         logger.info("观潮已停止")
+
+    @staticmethod
+    async def _guard(what: str, awaitable: Awaitable[None]) -> None:
+        """执行一个收尾步骤，出错只记录日志，不影响后续步骤"""
+        try:
+            await awaitable
+        except Exception:
+            logger.exception("%s失败", what)
+
+    async def _wait_streams_closed(self, timeout: float = 1.0) -> None:
+        """等待所有 SSE 订阅者结束迭代（最多 timeout 秒），再多让出几轮事件循环，让响应发完结尾"""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self.broadcaster.subscriber_count > 0 and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        for _ in range(5):
+            await asyncio.sleep(0)
 
 
 def _log_collector_exit(task: asyncio.Task) -> None:
@@ -194,21 +223,33 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def run(settings: Settings, *, groups: set[str], dry_run: bool) -> None:
+async def run(settings: Settings, *, groups: set[str], dry_run: bool) -> int:
+    """运行直到收到停止信号；返回进程退出码（0 正常退出，1 启动失败）"""
     app = Application(settings, groups=groups, dry_run=dry_run)
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    signals = (signal.SIGINT, signal.SIGTERM)
+    for sig in signals:
         loop.add_signal_handler(sig, stop_event.set)
-    await app.start()
+    exit_code = 0
     try:
-        await stop_event.wait()
+        try:
+            await app.start()
+        except Exception:
+            logger.exception("启动失败")
+            exit_code = 1
+        else:
+            await stop_event.wait()
+            logger.info("收到停止信号，正在退出…")
     finally:
-        logger.info("收到停止信号，正在退出…")
+        # 启动失败时同样要清理已创建的资源（stop 对部分启动安全）
         try:
             await asyncio.wait_for(app.stop(), timeout=STOP_TIMEOUT_S)
         except asyncio.TimeoutError:
             logger.error("退出超时（%s 秒），强制结束", STOP_TIMEOUT_S)
+        for sig in signals:
+            loop.remove_signal_handler(sig)
+    return exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -220,8 +261,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     setup_logging(settings.log, REPO_ROOT)
     try:
-        asyncio.run(run(settings, groups=set(args.only or GROUPS), dry_run=args.dry_run))
+        return asyncio.run(run(settings, groups=set(args.only or GROUPS), dry_run=args.dry_run))
     except ConfigError as exc:
         logger.error("%s", exc)
         return 2
-    return 0
