@@ -88,7 +88,10 @@ for _ in $(seq 1 20); do
   launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
   sleep 1
 done
-launchctl bootstrap "gui/$(id -u)" "$TARGET"
+if ! launchctl bootstrap "gui/$(id -u)" "$TARGET"; then
+  echo "加载服务失败，可用 launchctl print \"gui/$(id -u)/$LABEL\" 查看原因" >&2
+  exit 1
+fi
 echo "已安装并启动：$LABEL"
-echo "查看状态：launchctl print gui/$(id -u)/$LABEL | head -20"
-echo "查看日志：tail -f $REPO/log/tidewatch_\$(TZ=Asia/Shanghai date +%F).log"
+echo "查看状态：launchctl print \"gui/$(id -u)/$LABEL\" | head -20"
+echo "查看日志：tail -f \"$REPO/log/tidewatch_\$(TZ=Asia/Shanghai date +%F).log\""

@@ -17,7 +17,7 @@ needs_plutil = pytest.mark.skipif(shutil.which("plutil") is None, reason="需要
 
 
 class Sandbox:
-    def __init__(self, root: Path, repo_name: str = "repo") -> None:
+    def __init__(self, root: Path, repo_name: str = "repo", *, fail_bootstrap: bool = False) -> None:
         self.root = root
         self.repo = root / repo_name
         self.home = root / "home"
@@ -35,8 +35,12 @@ class Sandbox:
         self.bin.mkdir()
         fake = self.bin / "launchctl"
         # print 子命令返回非零，让脚本认为旧服务不存在、不用等待
-        fake.write_text(f'#!/bin/bash\necho "$@" >> "{self.log}"\n[ "$1" = "print" ] && exit 1\nexit 0\n',
-                        encoding="utf-8")
+        bootstrap_status = 1 if fail_bootstrap else 0
+        fake.write_text(
+            f'#!/bin/bash\necho "$@" >> "{self.log}"\n'
+            f'[ "$1" = "print" ] && exit 1\n[ "$1" = "bootstrap" ] && exit {bootstrap_status}\nexit 0\n',
+            encoding="utf-8",
+        )
         fake.chmod(0o755)
 
     @property
@@ -110,6 +114,25 @@ def test_dry_run_adds_argument(sandbox):
     result = sandbox.run("--dry-run")
     assert result.returncode == 0, result.stderr
     assert "<string>--dry-run</string>" in sandbox.target.read_text(encoding="utf-8")
+
+
+@needs_plutil
+def test_installs_from_repo_path_with_spaces_and_quotes_displayed_paths(tmp_path):
+    box = Sandbox(tmp_path, repo_name="repo with spaces")
+    result = box.run()
+    assert result.returncode == 0, result.stderr
+    assert str(box.repo) in box.target.read_text(encoding="utf-8")
+    assert f'launchctl print "gui/{os.getuid()}/{LABEL}"' in result.stdout
+    assert f'tail -f "{box.repo}/log/tidewatch_$(TZ=Asia/Shanghai date +%F).log"' in result.stdout
+
+
+@needs_plutil
+def test_bootstrap_failure_prints_chinese_hint_and_exits_nonzero(tmp_path):
+    box = Sandbox(tmp_path, fail_bootstrap=True)
+    result = box.run()
+    assert result.returncode != 0
+    assert "加载服务失败" in result.stderr
+    assert "launchctl print" in result.stderr
 
 
 @needs_plutil

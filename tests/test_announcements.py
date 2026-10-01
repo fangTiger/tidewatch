@@ -186,6 +186,21 @@ def test_classify_suspension_hint_without_any_verb_defaults_to_suspend():
     assert classify("OKX adjusts deposit confirmations on the Lisk network", None) == "other"
 
 
+@pytest.mark.parametrize(
+    ("title", "hint", "expected"),
+    [
+        ("OKX discloses updated deposit and withdrawal rules", None, "other"),
+        ("OKX shares enclosed deposit and withdrawal instructions", None, "other"),
+        ("OKX describes ceaseless deposit and withdrawal access", None, "other"),
+        ("OKX haltingly describes deposit and withdrawal changes", None, "other"),
+        ("Presumably deposits and withdrawals remain available", "suspension", "deposit_withdraw_suspend"),
+        ("Restorative maintenance affects deposits and withdrawals", "suspension", "deposit_withdraw_suspend"),
+    ],
+)
+def test_classify_action_words_do_not_match_inside_longer_words(title, hint, expected):
+    assert classify(title, hint) == expected
+
+
 # ---------------------------------------------------------------------------
 # 数字开头代码：2 字母规则只对裸词生效
 # ---------------------------------------------------------------------------

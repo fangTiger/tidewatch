@@ -25,8 +25,8 @@ from tidewatch.urls import safe_http_url
         "https://@/x",
         "https://a b/c",
         "https://example.com/a b",
-        " https://example.com/a",
-        "https://example.com/a ",
+        "\thttps://example.com/a",
+        "https://example.com/a\n",
         "https://example.com/a\nb",
         "https://example.com/a\r\nb",
         "https://example.com/a\tb",
@@ -65,3 +65,13 @@ def test_safe_http_url_rejects_unsafe_values(url):
 )
 def test_safe_http_url_preserves_valid_values(url):
     assert safe_http_url(url) == url
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("  https://example.com/a  ", "https://example.com/a"),
+    ],
+)
+def test_safe_http_url_trims_surrounding_whitespace(url, expected):
+    assert safe_http_url(url) == expected

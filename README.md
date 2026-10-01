@@ -29,6 +29,8 @@ python -m tidewatch --only web       # 只启动网站
 
 网站：http://127.0.0.1:8000（时间线）、http://127.0.0.1:8000/status（采集器状态与当日推送统计）
 
+注意：`--only web` 单独运行时只提供已有数据的查询与展示，网站没有实时推送；实时更新只来自同一进程内运行的采集流水线。
+
 ## 开机自启（launchd）
 
 ```bash
@@ -43,7 +45,7 @@ deploy/uninstall.sh          # 卸载
 
 - 阈值、关键词、频率：`config.yaml`（可在 `config.local.yaml` 按键覆盖；列表项按 `symbol`/`id` 合并，写 `remove: true` 删除默认项）
 - 币安公告：`.env` 中配置只读的 `BINANCE_API_KEY` 与 `BINANCE_API_SECRET` 时使用 WebSocket 实时推送，否则每 30 秒轮询（状态页显示「降级」）
-- 日志：`log/tidewatch_YYYY-MM-DD.log`，保留 14 天
+- 日志：`log/tidewatch_YYYY-MM-DD.log`，保留 14 天。`log/launchd.err.log` 只记录启动早期的错误且不会轮转，必要时请手动清理
 
 ## 测试
 

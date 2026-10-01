@@ -12,12 +12,25 @@ from tidewatch.pipeline.normalize import normalize_title
 # 合约关键词按单词边界匹配：避免 Uniswap、PancakeSwap、SushiSwap 这类币名里的 swap 被当成合约
 _PERP_RE = re.compile(r"\b(?:perps?|perpetuals?|futures?|swaps?)\b", re.IGNORECASE)
 _LISTING_WORDS = ("will list", "to list", "will launch", "lists ", "listing of")
-_SUSPEND_WORDS = ("suspend", "suspension", "cease", "halt", "close", "pause", "暂停")
+_SUSPEND_PATTERNS = (
+    re.compile(r"\bsuspend(?:s|ed|ing)?\b", re.IGNORECASE),
+    re.compile(r"\bsuspensions?\b", re.IGNORECASE),
+    re.compile(r"\bceas(?:e|es|ed|ing)\b", re.IGNORECASE),
+    re.compile(r"\bhalt(?:s|ed|ing)?\b", re.IGNORECASE),
+    re.compile(r"\bclos(?:e|es|ed|ing|ures?)\b", re.IGNORECASE),
+    re.compile(r"\bpaus(?:e|es|ed|ing)\b", re.IGNORECASE),
+    re.compile("暂停"),
+)
 # 恢复/重新开放类词汇。完成类只用较窄的短语：宽泛的 complet / enabl 会误伤
 # 「Suspend ... Until the Upgrade Is Completed」这类仍是暂停的公告
-_RESTORE_WORDS = (
-    "resum", "reopen", "restor", "enabled", "re-enable", "to enable", "will enable",
-    "completed the", "completes the", "has completed", "have completed",
+_RESTORE_PATTERNS = (
+    re.compile(r"\bresum(?:e|es|ed|ing|ptions?)\b", re.IGNORECASE),
+    re.compile(r"\breopen(?:s|ed|ing)?\b", re.IGNORECASE),
+    re.compile(r"\brestor(?:e|es|ed|ing|ations?)\b", re.IGNORECASE),
+    re.compile(r"(?<![\w-])enabled\b", re.IGNORECASE),
+    re.compile(r"\bre-enabl(?:e|es|ed|ing)\b", re.IGNORECASE),
+    re.compile(r"\b(?:to|will) enable\b", re.IGNORECASE),
+    re.compile(r"\b(?:completed the|completes the|has completed|have completed)\b", re.IGNORECASE),
 )
 
 _PAREN = re.compile(r"\(([A-Z0-9]{2,15})\)")
@@ -36,22 +49,22 @@ _STOP = {
 }
 
 
-def _first_index(lowered: str, words: tuple[str, ...]) -> int:
-    """words 中任一词在 lowered 里最早出现的位置；都没有出现返回 -1"""
-    positions = [pos for word in words if (pos := lowered.find(word)) >= 0]
+def _first_index(text: str, patterns: tuple[re.Pattern[str], ...]) -> int:
+    """patterns 中任一模式在 text 里最早出现的位置；都没有出现返回 -1"""
+    positions = [match.start() for pattern in patterns if (match := pattern.search(text)) is not None]
     return min(positions) if positions else -1
 
 
-def _is_restore(lowered: str) -> bool:
+def _is_restore(title: str) -> bool:
     """标题是否属于恢复类：先出现的动词优先
 
     恢复类先出现（或只出现恢复类）→ 恢复；暂停类先出现 → 暂停（即使后面有 resume / Completed，
     那只是说明何时恢复，如「Will Suspend Deposits ... Until the Upgrade Is Completed」）。
     """
-    restore_pos = _first_index(lowered, _RESTORE_WORDS)
+    restore_pos = _first_index(title, _RESTORE_PATTERNS)
     if restore_pos < 0:
         return False
-    suspend_pos = _first_index(lowered, _SUSPEND_WORDS)
+    suspend_pos = _first_index(title, _SUSPEND_PATTERNS)
     return suspend_pos < 0 or restore_pos < suspend_pos
 
 
@@ -72,12 +85,12 @@ def classify(title: str, hint: str | None) -> str:
         if any(word in lowered for word in _LISTING_WORDS):
             return "perp_listing" if perp else "spot_listing"
         return "other"
-    restore = _is_restore(lowered)
+    restore = _is_restore(title)
     if hint == "suspension":
         return "other" if restore else "deposit_withdraw_suspend"
     is_suspend = (
         ("deposit" in lowered or "withdraw" in lowered)
-        and any(word in lowered for word in _SUSPEND_WORDS)
+        and any(pattern.search(title) for pattern in _SUSPEND_PATTERNS)
         and not restore
     )
     return "deposit_withdraw_suspend" if is_suspend else "other"

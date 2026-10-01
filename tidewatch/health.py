@@ -100,6 +100,8 @@ class HealthMonitor:
             state.last_success = row["last_success_at"]
             state.failures = row["consecutive_failures"] or 0
             state.last_error = row["last_error"]
+            if state.last_error:
+                state.alert_detail = f"上次错误：{state.last_error}"
             # 只有告警确实发出过（有告警时间）才算已告警；否则重启后由 check_stale 补发
             state.alerted = state.status == "abnormal" and row["last_alert_at"] is not None
 

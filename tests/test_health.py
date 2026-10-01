@@ -343,6 +343,7 @@ async def test_load_resends_alert_that_never_succeeded(engine, settings, clock):
     assert restarted.status("jin10") == "abnormal"
     await restarted.check_stale()
     assert [ok for _, ok, _ in notifier.health] == [False, False]  # 补发了告警
+    assert notifier.health[1][2] == "上次错误：超时"
     assert (await _row(engine))["last_alert_at"] == clock.now
     await restarted.check_stale()
     assert len(notifier.health) == 2  # 补发成功后不再重复
@@ -360,6 +361,19 @@ async def test_load_does_not_resend_alert_already_delivered(engine, settings, cl
     await restarted.load()
     await restarted.check_stale()
     assert len(notifier.health) == 1  # 已经告警过：重启后不重复告警
+
+
+async def test_load_without_last_error_keeps_default_alert_detail(engine, settings, clock):
+    """持久化状态没有 last_error 时，重启补发仍使用默认告警说明"""
+    notifier = FakeNotifier([SendResult(False, detail="HTTP 500")])
+    first = _monitor(engine, settings, clock, notifier)
+    clock.advance(seconds=301)
+    await first.check_stale()
+    assert (await _row(engine))["last_error"] is None
+    restarted = _monitor(engine, settings, clock, notifier)
+    await restarted.load()
+    await restarted.check_stale()
+    assert notifier.health[1][2] == "采集器异常"
 
 
 # ---------- 休眠/唤醒 ----------
