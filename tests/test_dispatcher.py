@@ -4,7 +4,7 @@ import uuid
 from datetime import timedelta
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import insert, select, update
 
 from fakes import FakeNotifier
 from tidewatch.notify.base import EventCard, SendResult
@@ -21,6 +21,34 @@ class FakeMonotonic:
 
     def __call__(self) -> float:
         return self.value
+
+
+class _BlockingANotifier(FakeNotifier):
+    """阻塞 A 级发送，便于验证 S 级使用独立发送协程"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.a_started = asyncio.Event()
+        self.release_a = asyncio.Event()
+        self.s_sent = asyncio.Event()
+
+    async def send_event(self, card: EventCard, *, mention_all: bool) -> SendResult:
+        self.events.append((card, mention_all))
+        if card.level == "A":
+            self.a_started.set()
+            await self.release_a.wait()
+        else:
+            self.s_sent.set()
+        return self._next()
+
+
+class _CancelAfterGetQueue(asyncio.Queue):
+    """取出元素后取消当前消费者，稳定复现 get 与 _handle 之间的取消窗口"""
+
+    async def get(self):
+        item = await super().get()
+        asyncio.current_task().cancel()
+        return item
 
 
 @pytest.fixture
@@ -92,6 +120,37 @@ async def test_s_sent_immediately_with_mention(engine, sink, settings, clock):
     assert (await _statuses(engine))[pid][0] == "ok"
 
 
+async def test_s_send_is_not_blocked_by_a_send(engine, sink, settings, clock):
+    notifier = _BlockingANotifier()
+    [a_id] = await _seed(engine, clock, "A")
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier, sleep=_idle_sleep)
+    await dispatcher.start()
+    try:
+        await asyncio.wait_for(notifier.a_started.wait(), 1)
+        [s_id] = await _seed(engine, clock, "S")
+        dispatcher.enqueue([s_id])
+        await asyncio.wait_for(notifier.s_sent.wait(), 1)
+        assert [card.push_id for card, _ in notifier.events] == [a_id, s_id]
+    finally:
+        notifier.release_a.set()
+        await asyncio.wait_for(dispatcher.stop(), 5)
+
+
+async def test_failed_s_retry_is_not_blocked_by_failed_a(engine, sink, settings, clock):
+    notifier = _BlockingANotifier()
+    await _seed(engine, clock, "A", status="failed")
+    await _seed(engine, clock, "S", status="failed")
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier, sleep=_idle_sleep)
+    start_task = asyncio.create_task(dispatcher.start())
+    try:
+        await asyncio.wait_for(notifier.a_started.wait(), 1)
+        await asyncio.wait_for(notifier.s_sent.wait(), 1)
+    finally:
+        notifier.release_a.set()
+        await asyncio.wait_for(start_task, 5)
+        await asyncio.wait_for(dispatcher.stop(), 5)
+
+
 async def test_a_window_overflow_goes_to_digest(engine, sink, settings, clock):
     notifier = FakeNotifier()
     dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
@@ -132,6 +191,31 @@ async def test_immediate_retry_then_success(engine, sink, settings, clock):
     assert sleeps == [1.0] and (await _statuses(engine))[pid][0] == "ok"
 
 
+async def test_retry_expires_during_capped_backoff(engine, sink, settings, clock):
+    sleeps: list[float] = []
+
+    async def advancing_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock.advance(seconds=seconds)
+
+    notifier = FakeNotifier(
+        [SendResult(False, retryable=True, detail="code=11232"), SendResult(True, detail="code=0")]
+    )
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier, sleep=advancing_sleep)
+    [pid] = await _seed(engine, clock, "S")
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(push_log)
+            .where(push_log.c.id == pid)
+            .values(retry_until=clock.now + timedelta(seconds=0.25))
+        )
+    dispatcher.enqueue([pid])
+    await asyncio.wait_for(dispatcher.process_pending(), 1)
+    assert sleeps == [0.25]
+    assert len(notifier.events) == 1
+    assert (await _statuses(engine))[pid][0] == "expired"
+
+
 async def test_non_retryable_marks_failed(engine, sink, settings, clock):
     notifier = FakeNotifier([SendResult(False, retryable=False, detail="code=19021")])
     dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
@@ -167,6 +251,92 @@ async def test_retry_of_failed_digest_respects_window(engine, sink, settings, cl
     assert (await _statuses(engine))[ids[10]][0] == "ok"
 
 
+async def test_digest_rechecks_deadline_immediately_before_send(engine, sink, settings, clock):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    ids = await _seed(engine, clock, "A", 11)
+    dispatcher.enqueue(ids)
+    await asyncio.wait_for(dispatcher.process_pending(), 5)
+    digest_id = ids[10]
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(push_log)
+            .where(push_log.c.id == digest_id)
+            .values(retry_until=clock.now + timedelta(seconds=1))
+        )
+    original_load = dispatcher._load
+
+    async def load_then_expire(push_id: int):
+        pending = await original_load(push_id)
+        clock.advance(seconds=2)
+        return pending
+
+    dispatcher._load = load_then_expire
+    await asyncio.wait_for(dispatcher.flush_digest(), 1)
+    assert notifier.digests == []
+    assert (await _statuses(engine))[digest_id][0] == "expired"
+
+
+async def test_digest_rechecks_deadlines_after_expired_result_write(engine, sink, settings, clock):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    ids = await _seed(engine, clock, "A", 12)
+    dispatcher.enqueue(ids)
+    await asyncio.wait_for(dispatcher.process_pending(), 5)
+    first, second = ids[10:]
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(push_log)
+            .where(push_log.c.id == first)
+            .values(retry_until=clock.now - timedelta(seconds=1))
+        )
+        await conn.execute(
+            update(push_log)
+            .where(push_log.c.id == second)
+            .values(retry_until=clock.now + timedelta(seconds=1))
+        )
+    original_push_result = sink.push_result
+
+    async def push_result_then_advance(push_id: int, status: str, **kwargs):
+        result = await original_push_result(push_id, status, **kwargs)
+        if status == "expired":
+            clock.advance(seconds=2)
+        return result
+
+    sink.push_result = push_result_then_advance
+    await asyncio.wait_for(dispatcher.flush_digest(), 1)
+    assert notifier.digests == []
+    statuses = await _statuses(engine)
+    assert statuses[first][0] == "expired" and statuses[second][0] == "expired"
+
+
+async def test_digest_rechecks_cancel_after_expired_result_write(engine, sink, settings, clock):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    ids = await _seed(engine, clock, "A", 12)
+    dispatcher.enqueue(ids)
+    await asyncio.wait_for(dispatcher.process_pending(), 5)
+    first, second = ids[10:]
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(push_log)
+            .where(push_log.c.id == first)
+            .values(retry_until=clock.now - timedelta(seconds=1))
+        )
+    original_push_result = sink.push_result
+
+    async def push_result_then_cancel(push_id: int, status: str, **kwargs):
+        result = await original_push_result(push_id, status, **kwargs)
+        if push_id == first and status == "expired":
+            dispatcher.cancel([second])
+        return result
+
+    sink.push_result = push_result_then_cancel
+    await asyncio.wait_for(dispatcher.flush_digest(), 1)
+    assert notifier.digests == []
+    assert second not in dispatcher._tracked and second not in dispatcher._cancelled
+
+
 async def test_orphan_pending_recovered(engine, sink, settings, clock):
     notifier = FakeNotifier()
     dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
@@ -198,6 +368,50 @@ async def test_startup_loads_pending(engine, sink, settings, clock):
     await dispatcher.load_open()
     await dispatcher.process_pending()
     assert len(notifier.events) == 1 and (await _statuses(engine))[pid][0] == "ok"
+
+
+async def test_start_restores_recent_individual_a_window(engine, sink, settings, clock):
+    delivered_ids = await _seed(engine, clock, "A", 10, status="ok")
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(push_log)
+            .where(push_log.c.id.in_(delivered_ids))
+            .values(sent_at=clock.now - timedelta(minutes=4))
+        )
+    [pending_id] = await _seed(engine, clock, "A")
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier, sleep=_idle_sleep)
+    await dispatcher.start()
+    try:
+        async def wait_for_digest() -> None:
+            while dispatcher.digest_size != 1:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_for_digest(), 1)
+        assert notifier.events == []
+        assert (await _statuses(engine))[pending_id][0] == "pending"
+    finally:
+        await asyncio.wait_for(dispatcher.stop(), 5)
+
+
+async def test_start_ignores_individual_a_sent_before_window(engine, sink, settings, clock):
+    delivered_ids = await _seed(engine, clock, "A", 10, status="dry_run")
+    async with engine.begin() as conn:
+        await conn.execute(
+            update(push_log)
+            .where(push_log.c.id.in_(delivered_ids))
+            .values(sent_at=clock.now - timedelta(minutes=6))
+        )
+    [pending_id] = await _seed(engine, clock, "A")
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier, sleep=_idle_sleep)
+    await dispatcher.start()
+    try:
+        await _wait_status(engine, [pending_id], "ok", timeout=1)
+        assert [card.push_id for card, _ in notifier.events] == [pending_id]
+        assert dispatcher.digest_size == 0
+    finally:
+        await asyncio.wait_for(dispatcher.stop(), 5)
 
 
 async def test_superseded_removed_from_digest(engine, sink, settings, clock):
@@ -412,19 +626,67 @@ async def test_start_stop_sends_pending_and_failed(engine, sink, settings, clock
     assert dispatcher._tasks == []
 
 
+async def test_stop_during_route_allows_startup_recovery(engine, sink, settings, clock):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier, sleep=_idle_sleep)
+    [pid] = await _seed(engine, clock, "S")
+    route_started = asyncio.Event()
+    release_route = asyncio.Event()
+    original_route = dispatcher._route
+
+    async def blocked_route(push_id: int) -> None:
+        route_started.set()
+        await release_route.wait()
+        await original_route(push_id)
+
+    dispatcher._route = blocked_route
+    await dispatcher.start()
+    await asyncio.wait_for(route_started.wait(), 1)
+    await asyncio.wait_for(dispatcher.stop(), 5)
+
+    dispatcher._route = original_route
+    await dispatcher.start()
+    try:
+        await _wait_status(engine, [pid], "ok", timeout=1)
+    finally:
+        await asyncio.wait_for(dispatcher.stop(), 5)
+
+
+async def test_cancel_after_send_queue_get_allows_startup_recovery(engine, sink, settings, clock):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier, sleep=_idle_sleep)
+    dispatcher._s_queue = _CancelAfterGetQueue()
+    [pid] = await _seed(engine, clock, "S")
+    await dispatcher.start()
+
+    async def wait_for_s_worker_exit() -> None:
+        while not any(task.get_name() == "dispatch-send-s" and task.done() for task in dispatcher._tasks):
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(wait_for_s_worker_exit(), 1)
+    await asyncio.wait_for(dispatcher.stop(), 5)
+
+    dispatcher._s_queue = asyncio.Queue()
+    await dispatcher.start()
+    try:
+        await _wait_status(engine, [pid], "ok", timeout=1)
+    finally:
+        await asyncio.wait_for(dispatcher.stop(), 5)
+
+
 async def test_start_is_idempotent(engine, sink, settings, clock):
     dispatcher = _dispatcher(engine, sink, settings, clock, FakeNotifier(), sleep=_idle_sleep)
     await dispatcher.start()
     try:
         tasks = list(dispatcher._tasks)
         await dispatcher.start()  # 已启动：直接返回，不产生重复任务
-        assert len(tasks) == 3 and dispatcher._tasks == tasks
+        assert len(tasks) == 5 and dispatcher._tasks == tasks
     finally:
         await asyncio.wait_for(dispatcher.stop(), 5)
     assert dispatcher._tasks == [] and all(t.done() for t in tasks)
     await dispatcher.start()  # stop 之后可以再次启动
     try:
-        assert len(dispatcher._tasks) == 3
+        assert len(dispatcher._tasks) == 5
     finally:
         await asyncio.wait_for(dispatcher.stop(), 5)
 
@@ -443,7 +705,7 @@ async def test_start_creates_tasks_even_if_recovery_fails(engine, sink, settings
     with caplog.at_level(logging.ERROR):
         await dispatcher.start()  # 启动恢复出错不能阻止后台任务创建
     try:
-        assert len(dispatcher._tasks) == 3 and not any(t.done() for t in dispatcher._tasks)
+        assert len(dispatcher._tasks) == 5 and not any(t.done() for t in dispatcher._tasks)
         assert any(r.levelno == logging.ERROR for r in caplog.records)
         # 出错的一步之外，另一步照常完成
         if broken == "load_open":

@@ -2,8 +2,9 @@
 
 - S 级立即单独发送；A 级在滑动窗口内最多单独发送 N 条，超出进入汇总缓冲，定时合并发送
 - 发送失败先立即退避重试，仍失败标记 failed，由后台定时重试，超过期限标记 expired
-- 启动时加载未过期的 pending 记录并处理 failed 记录；被取代（superseded）的记录从队列与缓冲中移除
+- 启动时恢复 A 级滑动窗口，加载未过期的 pending 记录并处理 failed 记录；被取代（superseded）的记录从队列与缓冲中移除
 - 用 _tracked 记录已在队列、汇总缓冲或发送中的记录：入队去重，并定时找回因异常遗漏的 pending 记录
+- 入队记录先按数据库中的等级路由，S 与 A 分别由独立发送协程处理，避免 A 的网络等待阻塞 S
 - 所有状态回写都经 EventSink.push_result 串行执行
 - 容错：启动恢复、定时重试中单条记录或单个步骤出错只记录日志，不影响其他记录与后台任务
 - 调用顺序：先 attach()，再 start()，最后启动采集器
@@ -67,10 +68,14 @@ class Dispatcher:
         self._clock = clock
         self._sleep = sleep
         self._monotonic = monotonic
+        # 新记录先进入路由队列，再按数据库中的等级进入独立发送队列。
         self._queue: asyncio.Queue[int] = asyncio.Queue()
+        self._a_queue: asyncio.Queue[int] = asyncio.Queue()
+        self._s_queue: asyncio.Queue[int] = asyncio.Queue()
         self._digest: list[int] = []
         self._cancelled: set[int] = set()
         self._tracked: set[int] = set()  # 已在队列、汇总缓冲或发送中的记录
+        self._completion: dict[int, asyncio.Future[None]] = {}
         self._a_sent: deque[float] = deque()
         self._tasks: list[asyncio.Task] = []
         self._started = False  # 已启动（含启动过程中），防止重复 start 产生重复的后台任务
@@ -116,7 +121,7 @@ class Dispatcher:
     # ---------- 生命周期 ----------
 
     async def start(self) -> None:
-        """启动：先恢复未完成的 pending 记录，再立即处理一次 failed 记录，最后启动三个后台任务
+        """启动：恢复 A 级窗口与未完成记录，立即处理一次 failed 记录，最后启动后台任务
 
         恢复与重试各自捕获异常并记录日志，无论成败都会创建后台任务（未处理的记录之后由定时重试找回）。
         已启动时直接返回，不会产生重复任务。
@@ -126,23 +131,37 @@ class Dispatcher:
         self._started = True
         try:
             try:
+                await self.load_a_window()
+            except Exception:
+                logger.exception("启动恢复 A 级滑动窗口失败，本次运行从空窗口开始")
+            try:
                 await self.load_open()
             except Exception:
                 logger.exception("启动恢复未完成推送失败，稍后由定时重试找回")
+            self._tasks = [
+                asyncio.create_task(self._route_loop(), name="dispatch-route"),
+                asyncio.create_task(self._send_loop(), name="dispatch-send"),
+                asyncio.create_task(self._s_send_loop(), name="dispatch-send-s"),
+            ]
             try:
                 await self.retry_failed()
             except Exception:
                 logger.exception("启动时重试失败推送出错，稍后由定时重试继续")
-            self._tasks = [
-                asyncio.create_task(self._send_loop(), name="dispatch-send"),
-                asyncio.create_task(
-                    self._periodic(self._cfg.digest_interval_s, self.flush_digest), name="dispatch-digest"
-                ),
-                asyncio.create_task(
-                    self._periodic(self._cfg.retry_interval_s, self.retry_failed), name="dispatch-retry"
-                ),
-            ]
+            self._tasks.extend(
+                [
+                    asyncio.create_task(
+                        self._periodic(self._cfg.digest_interval_s, self.flush_digest), name="dispatch-digest"
+                    ),
+                    asyncio.create_task(
+                        self._periodic(self._cfg.retry_interval_s, self.retry_failed), name="dispatch-retry"
+                    ),
+                ]
+            )
         except BaseException:
+            for task in self._tasks:
+                task.cancel()
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks = []
             self._started = False  # 启动过程被取消等：允许再次 start
             raise
 
@@ -169,22 +188,101 @@ class Dispatcher:
         if ids:
             logger.info("启动恢复：继续发送 %d 条未完成推送", len(ids))
 
+    async def load_a_window(self) -> None:
+        """按 sent_at 恢复窗口内已单独送达的 A 级记录，并换算成 monotonic 时间点"""
+        wall_now = self._clock()
+        mono_now = self._monotonic()
+        cutoff = wall_now - timedelta(seconds=self._cfg.a_window_s)
+        async with self._engine.connect() as conn:
+            sent_times = (
+                await conn.execute(
+                    select(push_log.c.sent_at)
+                    .where(
+                        push_log.c.status.in_(("ok", "dry_run")),
+                        push_log.c.level == "A",
+                        push_log.c.batch_id.is_(None),
+                        push_log.c.sent_at > cutoff,
+                        push_log.c.sent_at <= wall_now,
+                    )
+                    .order_by(push_log.c.sent_at)
+                )
+            ).scalars().all()
+        self._a_sent.clear()
+        self._a_sent.extend(mono_now - (wall_now - sent_at).total_seconds() for sent_at in sent_times)
+        if sent_times:
+            logger.info("启动恢复：A 级滑动窗口内已有 %d 条单独推送", len(sent_times))
+
     async def process_pending(self) -> None:
         """同步处理发送队列中当前所有待发送记录后返回，不启动后台任务
 
         用于测试，以及需要「处理完再继续」的场景（正常运行时由 _send_loop 持续消费队列）。
         """
         while not self._queue.empty():
-            await self._handle(self._queue.get_nowait())
+            await self._route(self._queue.get_nowait())
+        while not self._s_queue.empty():
+            await self._handle(self._s_queue.get_nowait())
+        while not self._a_queue.empty():
+            await self._handle(self._a_queue.get_nowait())
 
-    async def _send_loop(self) -> None:
-        """后台任务：持续从队列取出推送并处理，单条处理出错只记录日志"""
+    async def _route_loop(self) -> None:
+        """后台任务：按 push_log.level 把新记录送入 S 或 A 发送队列"""
         while True:
             push_id = await self._queue.get()
+            try:
+                await self._route(push_id)
+            except asyncio.CancelledError:
+                # 路由途中停止时记录已离开队列；解除跟踪，重启后 load_open 才能重新找回。
+                self._tracked.discard(push_id)
+                self._cancelled.discard(push_id)
+                raise
+            except Exception:
+                self._tracked.discard(push_id)
+                self._cancelled.discard(push_id)
+                logger.exception("路由推送失败：%s", push_id)
+
+    async def _route(self, push_id: int) -> None:
+        """读取推送记录的等级并路由；记录不存在或已被取代时解除跟踪"""
+        if push_id in self._cancelled:
+            self._tracked.discard(push_id)
+            self._cancelled.discard(push_id)
+            return
+        async with self._engine.connect() as conn:
+            level = (
+                await conn.execute(select(push_log.c.level).where(push_log.c.id == push_id))
+            ).scalar_one_or_none()
+        if level is None:
+            self._tracked.discard(push_id)
+            return
+        queue = self._s_queue if level == "S" else self._a_queue
+        queue.put_nowait(push_id)
+
+    async def _send_loop(self) -> None:
+        """后台任务：持续从 A 级发送队列取出推送并处理，单条出错只记录日志"""
+        while True:
+            push_id = await self._a_queue.get()
             try:
                 await self._handle(push_id)
             except Exception:
                 logger.exception("处理推送失败：%s", push_id)
+            finally:
+                self._finish_completion(push_id)
+
+    async def _s_send_loop(self) -> None:
+        """后台任务：持续从独立的 S 级发送队列取出推送并处理"""
+        while True:
+            push_id = await self._s_queue.get()
+            try:
+                await self._handle(push_id)
+            except Exception:
+                logger.exception("处理 S 级推送失败：%s", push_id)
+            finally:
+                self._finish_completion(push_id)
+
+    def _finish_completion(self, push_id: int) -> None:
+        """唤醒等待本条后台重试完成的调用方；普通入队记录没有等待者"""
+        future = self._completion.pop(push_id, None)
+        if future is not None and not future.done():
+            future.set_result(None)
 
     async def _periodic(self, interval: float, func: Callable[[], Awaitable[None]]) -> None:
         """后台任务：每隔 interval 秒执行一次 func，func 出错只记录日志，下一轮继续"""
@@ -240,21 +338,31 @@ class Dispatcher:
         S 级 @所有人，A 级不 @；发送成功的状态取决于通知器（正式为 ok，演练为 dry_run），失败为 failed。
         """
         result = await self._send_with_retry(
-            lambda: self._notifier.send_event(pending.card, mention_all=pending.level == "S")
+            lambda: self._notifier.send_event(pending.card, mention_all=pending.level == "S"),
+            pending.retry_until,
         )
+        if result is None:
+            await self._sink.push_result(pending.push_id, "expired")
+            return
         status = self._notifier.status_on_success if result.ok else "failed"
         await self._sink.push_result(pending.push_id, status, response=result.detail)
 
-    async def _send_with_retry(self, send: Callable[[], Awaitable[SendResult]]) -> SendResult:
-        """立即退避重试：可重试的失败最多再试 retry_immediate 次，间隔 1、2、4… 秒"""
+    async def _send_with_retry(
+        self, send: Callable[[], Awaitable[SendResult]], retry_until: datetime
+    ) -> SendResult | None:
+        """在期限内立即退避重试；期限已过返回 None，等待不超过剩余期限"""
         delay = 1.0
-        result = await send()
-        for _ in range(self._cfg.retry_immediate):
-            if result.ok or not result.retryable:
-                break
-            await self._sleep(delay)
-            delay *= 2
+        for attempt in range(self._cfg.retry_immediate + 1):
+            if retry_until <= self._clock():
+                return None
             result = await send()
+            if result.ok or not result.retryable or attempt == self._cfg.retry_immediate:
+                break
+            remaining = (retry_until - self._clock()).total_seconds()
+            if remaining <= 0:
+                continue
+            await self._sleep(min(delay, remaining))
+            delay *= 2
         if not result.ok:
             logger.warning("推送发送失败：%s", result.detail)
         return result
@@ -264,16 +372,43 @@ class Dispatcher:
         ids = self._digest[:DIGEST_MAX]  # 被取代的推送在 cancel() 时已从缓冲移除
         self._digest = self._digest[DIGEST_MAX:]
         try:
-            now = self._clock()
             items = []
             for push_id in ids:
                 pending = await self._load(push_id)
-                if pending is not None and pending.status in OPEN_STATUSES and pending.retry_until > now:
+                if pending is not None and pending.status in OPEN_STATUSES:
                     items.append(pending)
             items = [p for p in items if p.push_id not in self._cancelled]  # 加载期间可能被新事件取代
             if not items:
                 return
-            result = await self._send_with_retry(lambda: self._notifier.send_digest([p.card for p in items]))
+            result: SendResult | None = None
+            delay = 1.0
+            for attempt in range(self._cfg.retry_immediate + 1):
+                while True:
+                    items = [p for p in items if p.push_id not in self._cancelled]
+                    if not items:
+                        return
+                    now = self._clock()
+                    expired = [p for p in items if p.retry_until <= now]
+                    if not expired:
+                        break
+                    for pending in expired:
+                        await self._sink.push_result(pending.push_id, "expired")
+                    expired_ids = {p.push_id for p in expired}
+                    items = [p for p in items if p.push_id not in expired_ids]
+                    if not items:
+                        return
+                    # 状态回写包含 await，循环到真正发送前没有新的过期项为止。
+                result = await self._notifier.send_digest([p.card for p in items])
+                if result.ok or not result.retryable or attempt == self._cfg.retry_immediate:
+                    break
+                remaining = min((p.retry_until - self._clock()).total_seconds() for p in items)
+                if remaining <= 0:
+                    continue
+                await self._sleep(min(delay, remaining))
+                delay *= 2
+            assert result is not None
+            if not result.ok:
+                logger.warning("推送发送失败：%s", result.detail)
             # 只有汇总真正发出去才记录批次号；失败的记录不带 batch_id，之后重发会归入新的批次
             status = self._notifier.status_on_success if result.ok else "failed"
             batch_id = uuid.uuid4().hex[:12] if result.ok else None
@@ -294,11 +429,18 @@ class Dispatcher:
         async with self._engine.connect() as conn:
             rows = (
                 await conn.execute(
-                    select(push_log.c.id, push_log.c.status, push_log.c.retry_until, push_log.c.created_at)
+                    select(
+                        push_log.c.id,
+                        push_log.c.status,
+                        push_log.c.level,
+                        push_log.c.retry_until,
+                        push_log.c.created_at,
+                    )
                     .where(push_log.c.status.in_(OPEN_STATUSES))
                     .order_by(push_log.c.id)
                 )
             ).all()
+        completions: list[asyncio.Future[None]] = []
         for row in rows:
             if row.id in self._cancelled or row.id in self._tracked:
                 continue
@@ -307,10 +449,19 @@ class Dispatcher:
                     await self._sink.push_result(row.id, "expired")
                 elif row.status == "failed" or now - row.created_at > orphan_age:
                     self._tracked.add(row.id)
-                    await self._handle(row.id)
+                    if self._tasks:
+                        future = asyncio.get_running_loop().create_future()
+                        self._completion[row.id] = future
+                        queue = self._s_queue if row.level == "S" else self._a_queue
+                        queue.put_nowait(row.id)
+                        completions.append(future)
+                    else:
+                        await self._handle(row.id)
             except Exception:
                 # 单条记录出错不能中断整轮维护，其余记录照常处理；出错的记录下一轮再试
                 logger.exception("重试推送失败：%s", row.id)
+        if completions:
+            await asyncio.gather(*completions)
 
     async def _load(self, push_id: int) -> _Pending | None:
         """从数据库加载推送记录及其事件、簇信息并组装成待发送内容；记录不存在时返回 None"""
