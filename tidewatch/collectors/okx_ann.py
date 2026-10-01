@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -11,6 +12,9 @@ from tidewatch.models import Event, FetchResult
 
 OKX_URL = "https://www.okx.com/api/v5/support/announcements"
 MAX_PAGES = 5
+
+logger = logging.getLogger(__name__)
+
 # annType → 分类大类
 _HINTS = {
     "announcements-new-listings": "listing",
@@ -65,6 +69,8 @@ class OkxAnnCollector(PollCollector):
                 or _ptime(items[-1]) < floor_ms
             ):
                 break
+        else:
+            logger.warning("OKX 公告翻页达到上限 %d 页仍未追上游标或补抓窗口，可能有更早的公告未采集", MAX_PAGES)
         # 只按补抓窗口过滤、不按游标过滤：延迟出现的旧公告也能采到，重复由去重键处理
         events = [parse_detail(item) for item in collected if _ptime(item) >= floor_ms]
         # 游标只前进不后退：接口暂时返回比游标更旧的数据时，保持原游标

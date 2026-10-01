@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator
@@ -19,7 +20,7 @@ from urllib.parse import urlencode
 from websockets.asyncio.client import connect
 
 from tidewatch.collectors.announcements import binance_dedupe_key, classify, extract_symbols
-from tidewatch.collectors.base import PollCollector, StreamCollector, parse_context, sort_events
+from tidewatch.collectors.base import PollCollector, StreamCollector, describe, parse_context, sort_events
 from tidewatch.config import CollectorCfg
 from tidewatch.models import Event, FetchResult
 from tidewatch.pipeline.normalize import clean_text
@@ -30,6 +31,14 @@ WS_TOPIC = "com_announcement_en"
 # 列表接口轮询的栏目及其分类大类
 LIST_CATALOGS = {48: "listing", 161: "delisting"}
 WS_RECV_TIMEOUT_S = 60
+# 日志里最多带多少个字符的原始消息
+_LOG_PREVIEW_CHARS = 200
+
+logger = logging.getLogger(__name__)
+
+
+class BinanceCommandError(RuntimeError):
+    """WS 的 COMMAND 消息返回了非 SUCCESS 的结果（如 API Key 无效）：连接级错误，必须断开重连，不能当作畸形消息跳过"""
 
 
 def _published(ms: int | str) -> datetime:
@@ -79,17 +88,26 @@ def parse_ws_message(raw: str | bytes) -> Event | None:
     """WS 消息 → 事件
 
     订阅确认（COMMAND/SUCCESS）等非数据消息返回 None；
-    命令被拒绝（COMMAND 且结果不是 SUCCESS，如 API Key 无效）抛 RuntimeError，让采集器报失败并重连。
+    命令被拒绝（COMMAND 且结果不是 SUCCESS，如 API Key 无效）抛 BinanceCommandError（RuntimeError 的子类），
+    让采集器报失败并重连；
+    单条消息本身畸形（非 JSON、不是 JSON 对象、DATA 缺字段）抛 ValueError / RuntimeError，
+    由调用方决定跳过，不影响连接。
     """
     message = json.loads(raw)
+    if not isinstance(message, dict):
+        raise ValueError(f"消息不是 JSON 对象：{type(message).__name__}")
     if message.get("type") == "COMMAND" and message.get("data") != "SUCCESS":
-        raise RuntimeError(f"币安公告 WS 返回错误：{message.get('data')}（{message.get('subType')}）")
+        raise BinanceCommandError(f"币安公告 WS 返回错误：{message.get('data')}（{message.get('subType')}）")
     if message.get("type") != "DATA":
         return None
     data = message.get("data")
     if isinstance(data, str):
         data = json.loads(data)
-    if not data or not data.get("title"):
+    if not data:
+        return None
+    if not isinstance(data, dict):
+        raise ValueError(f"DATA 载荷不是 JSON 对象：{type(data).__name__}")
+    if not data.get("title"):
         return None
     catalog_id = data.get("catalogId")
     with parse_context(f"币安公告 WS 消息 {data['title']}"):
@@ -101,6 +119,11 @@ def parse_ws_message(raw: str | bytes) -> Event | None:
             body=clean_text(data.get("body")),
             extra={"catalogName": data.get("catalogName")},
         )
+
+
+def _preview(raw: str | bytes) -> str:
+    text = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
+    return text[:_LOG_PREVIEW_CHARS]
 
 
 def signed_ws_url(api_secret: str, now_ms: int, nonce: str, *, base_url: str = BINANCE_WS_URL) -> str:
@@ -190,6 +213,7 @@ class BinanceAnnStream(_BinanceList, StreamCollector):
             open_timeout=20,
         ) as ws:
             await ws.send(json.dumps({"command": "SUBSCRIBE", "value": WS_TOPIC}))
+            logger.info("币安公告 WS 连接已建立并发送订阅（topic=%s）", WS_TOPIC)  # 不记录带签名的地址
             while True:
                 try:
                     raw = await asyncio.wait_for(ws.recv(), timeout=WS_RECV_TIMEOUT_S)
@@ -197,7 +221,17 @@ class BinanceAnnStream(_BinanceList, StreamCollector):
                     # 一段时间没有公告：连接仍由 websockets 自动 ping 保活，按心跳处理
                     yield FetchResult([], None)
                     continue
-                event = parse_ws_message(raw)
+                try:
+                    event = parse_ws_message(raw)
+                except BinanceCommandError:
+                    raise  # 订阅/鉴权被拒绝：必须断开重连
+                except Exception as exc:
+                    # 单条畸形消息（非 JSON、字段缺失等）不值得断开连接：记录原文开头后跳过
+                    logger.warning(
+                        "币安公告 WS 收到无法解析的消息，已跳过：%s；消息前 %d 字：%s",
+                        describe(exc), _LOG_PREVIEW_CHARS, _preview(raw),
+                    )
+                    continue
                 if event is None:
                     yield FetchResult([], None)
                 else:

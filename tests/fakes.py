@@ -6,6 +6,7 @@ import asyncio
 import socket
 from typing import Callable
 
+from tidewatch.models import FetchResult
 from tidewatch.notify.base import EventCard, Notifier, SendResult
 
 
@@ -34,9 +35,6 @@ class FakeNotifier(Notifier):
     async def send_health(self, source: str, healthy: bool, detail: str) -> SendResult:
         self.health.append((source, healthy, detail))
         return self._next()
-
-
-from tidewatch.models import FetchResult
 
 
 class FakeSink:

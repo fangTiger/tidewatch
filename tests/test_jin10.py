@@ -154,3 +154,14 @@ async def test_fetch_error_mentions_item_id_when_time_missing(settings, cursor):
     respx.get(JIN10_URL).mock(return_value=httpx.Response(200, json=page))
     with pytest.raises(RuntimeError, match="20260930104000000009"):
         await _collector(settings).fetch(cursor)
+
+
+@respx.mock
+@pytest.mark.parametrize("cursor", [None, {"last_id": "20260930100000000000"}])
+async def test_fetch_error_mentions_item_when_id_missing(settings, cursor):
+    """条目缺少 id：与缺少 time 的处理一致，整轮失败并在消息里带上能定位条目的信息（没有 id 就用时间与内容）"""
+    bad = {"time": "2026-09-30 10:40:00", "type": 0, "data": {"content": "缺少 id 的快讯"}}
+    page = {"status": 200, "data": [_item("20260930104100000000", "2026-09-30 10:41:00"), bad]}
+    respx.get(JIN10_URL).mock(return_value=httpx.Response(200, json=page))
+    with pytest.raises(RuntimeError, match="缺少 id.*2026-09-30 10:40:00.*缺少 id 的快讯"):
+        await _collector(settings).fetch(cursor)

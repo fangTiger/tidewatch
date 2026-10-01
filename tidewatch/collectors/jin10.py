@@ -27,7 +27,16 @@ def _parse_time(text: str) -> datetime:
 
 
 def _label(item: dict[str, Any]) -> str:
-    return f"金十条目 {item.get('id')}"
+    if "id" not in item:  # 没有 id 就用时间与内容开头定位条目
+        data = item.get("data")
+        content = clean_text(data.get("content"))[:30] if isinstance(data, dict) else ""
+        return f"金十条目（缺少 id，time={item.get('time')}，内容：{content}）"
+    return f"金十条目 {item['id']}"
+
+
+def _item_id(item: dict[str, Any]) -> str:
+    with parse_context(_label(item)):
+        return item["id"]
 
 
 def _item_time(item: dict[str, Any]) -> datetime:
@@ -78,7 +87,9 @@ class Jin10Collector(PollCollector):
             page = await self._page(max_time)
             if not page:
                 break
-            fresh = [item for item in page if last_id is None or item["id"] > last_id]
+            # 缺少 id 的条目与缺少 time 的处理一致：整轮失败，由健康监控告警（接口格式变化的信号），而不是悄悄跳过
+            ids = [_item_id(item) for item in page]
+            fresh = [item for item, item_id in zip(page, ids) if last_id is None or item_id > last_id]
             collected.extend(item for item in fresh if item["id"] not in seen)
             seen.update(item["id"] for item in fresh)
             # 首次运行只取第一页；本页出现已采集过的条目说明已追上游标

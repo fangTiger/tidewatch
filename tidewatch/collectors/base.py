@@ -88,7 +88,11 @@ class Backoff:
 
 
 class Collector(ABC):
-    """所有采集器的基类；子类需设置 name 与 group"""
+    """所有采集器的基类；子类需设置非空的 name（游标、健康状态与日志都以它为键）与 group
+
+    clock 提供业务时间（带时区的 datetime）；monotonic 与 sleep 是一对注入的计时源，限流器与退避都用它们，
+    测试里同时替换这两个就能完全控制时间的流逝。
+    """
 
     name: str = ""
     group: str = "news"
@@ -102,16 +106,20 @@ class Collector(ABC):
         client: Any,
         engine: Any,
         clock: Clock = utcnow,
+        monotonic: Callable[[], float] = time.monotonic,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
+        if not self.name:
+            raise ValueError(f"{type(self).__name__} 必须设置非空的 name：游标、健康状态与日志都以它为键")
         self.cfg = cfg
         self.sink = sink
         self.health = health
         self.client = client
         self.engine = engine
         self.clock = clock
+        self._monotonic = monotonic
         self._sleep = sleep
-        self.limiter = TokenBucket(cfg.rate_per_s, sleep=sleep)
+        self.limiter = TokenBucket(cfg.rate_per_s, monotonic=monotonic, sleep=sleep)
         self.backoff = Backoff()
 
     async def load_cursor(self) -> dict[str, Any] | None:
@@ -183,17 +191,15 @@ class StreamCollector(Collector):
     每次（重新）连接前先 gap_fill 补缺，连接期间另有后台任务每 gap_fill_interval_s 补缺一次；
     长连接结束（无论正常关闭还是出错）都按失败处理并退避后重连。
 
-    健康上报：只在收到长连接消息、且其中的事件入库成功后才上报成功（心跳没有事件，直接上报）；
-    补缺成功不代表长连接可用，补缺本身不上报成功，否则长连接持续失败时连续失败次数会被补缺清零。
-    退避重置：只有连接已持续 STABLE_CONNECTION_S 秒、或收到含事件的数据时才重置，仅靠心跳不算。
+    健康上报与退避重置使用同一个标准：收到含事件的数据且入库成功，或连接已持续 STABLE_CONNECTION_S 秒
+    时收到心跳，才上报成功并重置退避。刚连上就收到的心跳（如订阅确认）不算：否则「确认后立即断开」的震荡
+    每一轮都会上报成功，把连续失败清零，健康监控永远不会告警。
+    补缺成功不代表长连接可用，补缺本身不上报成功，原因相同。
     """
 
-    def __init__(
-        self, cfg: CollectorCfg, *, monotonic: Callable[[], float] = time.monotonic, **kwargs: Any
-    ) -> None:
+    def __init__(self, cfg: CollectorCfg, **kwargs: Any) -> None:
         super().__init__(cfg, **kwargs)
         self.cursor: dict[str, Any] | None = None
-        self._monotonic = monotonic
         # 串行化「合并游标 → 入库 → 赋值」：补缺任务与长连接消息并发提交时，游标不会被较旧的结果回退
         self._commit_lock = asyncio.Lock()
 
@@ -234,23 +240,31 @@ class StreamCollector(Collector):
                 await self._commit(await self.gap_fill(self.cursor))
                 filler = asyncio.create_task(self._gap_fill_loop(), name=f"{self.name}-gap-fill")
                 connected_at = self._monotonic()
-                # aclosing：入库失败退出循环时立即关闭长连接
+                # aclosing：入库失败退出循环或被取消时立即关闭长连接，不等垃圾回收
                 async with contextlib.aclosing(self.stream(self.cursor)) as messages:
                     async for result in messages:
                         if result.events or result.cursor is not None:
-                            await self._commit(result)  # 入库成功后才上报成功
-                        await self._report_success()  # 心跳没有事件，直接上报
+                            await self._commit(result)  # 入库成功后才往下走
+                        # 含事件的数据入库成功，或连接已稳定的心跳，才算健康
                         if result.events or self._monotonic() - connected_at >= STABLE_CONNECTION_S:
+                            await self._report_success()
                             self.backoff.reset()
                 raise ConnectionError("长连接已关闭")
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("采集器 %s 连接中断：%s", self.name, describe(exc))
                 await self._report_failure(exc)
-                if connected_at is not None and self._monotonic() - connected_at >= STABLE_CONNECTION_S:
+                lasted = None if connected_at is None else self._monotonic() - connected_at
+                if lasted is not None and lasted >= STABLE_CONNECTION_S:
                     self.backoff.reset()  # 稳定连接了足够久才断开：不沿用此前累积的退避
-                await self._sleep(self.backoff.next())
+                delay = self.backoff.next()
+                if lasted is None:
+                    logger.info("采集器 %s 连接前补缺失败：%s；%g 秒后重试", self.name, describe(exc), delay)
+                else:
+                    logger.info(
+                        "采集器 %s 长连接断开：%s；本次持续 %.0f 秒，%g 秒后重连", self.name, describe(exc), lasted, delay
+                    )
+                await self._sleep(delay)
             finally:
                 if filler is not None:
                     filler.cancel()

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -112,7 +113,7 @@ async def test_stream_gap_fill_then_stream_then_reconnect():
     ingested = [result for _, result in sink.calls]
     assert [len(r.events) for r in ingested] == [0, 1]  # 补缺结果 + WS 事件；心跳不入库
     assert collector.cursor == {"last_ms": 9}
-    assert len(health.successes) == 2  # 只在收到长连接消息时上报成功
+    assert len(health.successes) == 1  # 只有含事件且入库成功的消息上报成功；连接不足 60 秒的心跳不上报
     assert health.failures and "长连接" in health.failures[0][1]  # 连接结束后按失败处理并退避
     assert sleep.delays == [1]
 
@@ -268,13 +269,14 @@ async def test_stream_does_not_report_success_when_commit_fails():
     assert collector.cursor == {"last_ms": 5}  # 入库失败不推进游标
 
 
-async def test_stream_heartbeat_without_events_reports_success_directly():
+async def test_stream_short_heartbeat_does_not_report_success():
+    """连接不足 60 秒时，心跳（如订阅确认）不算成功：否则「确认后立即断开」的震荡会把连续失败清零"""
     sink, health = FakeSink(), FakeHealth()
     collector = _stream(HeartbeatOnlyStream, FakeSleep(stop_after=1), sink=sink, health=health)
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(collector.run(), timeout=5)
     assert len(sink.calls) == 1  # 只有补缺入库，心跳不入库
-    assert len(health.successes) == 1 and len(health.failures) == 1
+    assert health.successes == [] and len(health.failures) == 1
 
 
 async def test_stream_gap_fill_success_alone_does_not_report_success():
@@ -456,3 +458,240 @@ async def test_stream_periodic_gap_fill_runs_in_background():
     assert task.cancelled()
     assert sleep.calls[0] == 600  # 使用 gap_fill_interval_s
     assert collector.gap_cursors == [{"last_ms": 1}, {"last_ms": 5}]  # 定时补缺基于最新游标
+
+
+# ---------------------------------------------------------------------------
+# 长连接健康：心跳只有连接持续 >= 60 秒才上报成功
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("elapsed", "heartbeat", "expected_successes"),
+    [
+        (59.9, True, 0),  # 不足 60 秒的心跳：不上报
+        (60, True, 3),  # 3 轮连接各上报 1 次
+        (3600, True, 3),
+        (3600, False, 0),  # 长时间没有任何消息：没有可上报的东西
+    ],
+)
+async def test_stream_heartbeat_reports_success_only_after_stable_connection(elapsed, heartbeat, expected_successes):
+    health, sleep = FakeHealth(), FakeSleep(stop_after=3)
+    collector = _stream(
+        TimedStream, sleep, health=health, mono={"t": 1000.0}, elapsed=elapsed, heartbeat=heartbeat
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(collector.run(), timeout=5)
+    assert len(health.successes) == expected_successes
+    assert len(health.failures) == 3  # 每轮连接结束都按失败处理
+
+
+async def test_stream_event_data_reports_success_immediately_even_on_short_connection():
+    health, sleep = FakeHealth(), FakeSleep(stop_after=2)
+    collector = _stream(EventOnlyStream, sleep, health=health, monotonic=lambda: 1000.0)  # 时间不流逝：连接 0 秒
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(collector.run(), timeout=5)
+    assert len(health.successes) == 2
+
+
+async def test_stream_flapping_connection_never_reports_success():
+    """反复「订阅确认后立即断开」：每一轮都是失败，没有任何成功，退避持续增长"""
+    health, sleep = FakeHealth(), FakeSleep(stop_after=5)
+    collector = _stream(HeartbeatOnlyStream, sleep, health=health)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(collector.run(), timeout=5)
+    assert health.successes == [] and len(health.failures) == 5
+    assert sleep.delays == [1, 2, 4, 8, 16]
+
+
+# ---------------------------------------------------------------------------
+# 限流器与采集器共用注入的 monotonic / sleep
+# ---------------------------------------------------------------------------
+
+
+async def test_collector_limiter_uses_injected_monotonic_and_sleep():
+    clock = {"t": 100.0}
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    collector = DemoPoll(sink=FakeSink(), health=FakeHealth(), client=None, engine=None,
+                         sleep=fake_sleep, monotonic=lambda: clock["t"])
+    for _ in range(3):  # 速率 2/s、容量 2：第 3 次要等 0.5 秒
+        await asyncio.wait_for(collector.limiter.acquire(), timeout=5)
+    assert sleeps == [pytest.approx(0.5)]
+
+
+async def test_stream_collector_limiter_uses_injected_monotonic_and_sleep():
+    clock = {"t": 100.0}
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    collector = _stream(DemoStream, fake_sleep, monotonic=lambda: clock["t"])
+    for _ in range(3):
+        await asyncio.wait_for(collector.limiter.acquire(), timeout=5)
+    assert sleeps == [pytest.approx(0.5)]
+
+
+def test_collector_requires_non_empty_name():
+    class Nameless(PollCollector):
+        async def fetch(self, cursor):
+            return FetchResult([], None)
+
+    with pytest.raises(ValueError, match="name"):
+        Nameless(CFG, sink=FakeSink(), health=FakeHealth(), client=None, engine=None)
+
+
+# ---------------------------------------------------------------------------
+# make_client：global 但没有代理地址时提示直连
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("proxy_url", [None, ""])
+def test_make_client_warns_when_global_proxy_has_no_url(proxy_url, caplog):
+    with caplog.at_level(logging.WARNING, logger="tidewatch.collectors.http"):
+        client = make_client("global", proxy_url)
+    assert not client._mounts
+    assert any(r.levelno == logging.WARNING and "未配置代理地址，直连" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(("mode", "proxy_url"), [("direct", None), ("direct", "http://127.0.0.1:10808"), ("global", "http://127.0.0.1:10808")])
+def test_make_client_does_not_warn_otherwise(mode, proxy_url, caplog):
+    with caplog.at_level(logging.WARNING, logger="tidewatch.collectors.http"):
+        make_client(mode, proxy_url)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+# ---------------------------------------------------------------------------
+# 长连接生命周期日志
+# ---------------------------------------------------------------------------
+
+
+async def test_stream_logs_disconnect_reason_and_next_backoff_at_info(caplog):
+    sleep = FakeSleep(stop_after=2)
+    collector = _stream(HeartbeatOnlyStream, sleep)
+    with caplog.at_level(logging.INFO, logger="tidewatch.collectors.base"):
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(collector.run(), timeout=5)
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO and "长连接" in r.getMessage()]
+    assert len(messages) == 2
+    assert "demo_ws" in messages[0] and "长连接已关闭" in messages[0] and "1 秒后重连" in messages[0]
+    assert "2 秒后重连" in messages[1]
+
+
+class FailingGapFillStream(DemoStream):
+    async def gap_fill(self, cursor):
+        raise RuntimeError("补缺接口 500")
+
+
+async def test_stream_logs_gap_fill_failure_with_next_retry_delay(caplog):
+    collector = _stream(FailingGapFillStream, FakeSleep(stop_after=1))
+    with caplog.at_level(logging.INFO, logger="tidewatch.collectors.base"):
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(collector.run(), timeout=5)
+    messages = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert any("补缺接口 500" in m and "1 秒后" in m for m in messages)
+
+
+# ---------------------------------------------------------------------------
+# 长连接：异常 / 取消后 stream 生成器必须被关闭（aclosing）
+# ---------------------------------------------------------------------------
+
+
+class ClosableStream(DemoStream):
+    """推送一条含事件的消息后挂起；生成器被关闭时 closed 置位"""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.closed = False
+
+    async def stream(self, cursor):
+        try:
+            yield FetchResult([_event("ws1")], {"last_ms": 9})
+            await asyncio.Event().wait()
+        finally:
+            self.closed = True
+
+
+async def test_stream_generator_is_closed_before_backoff_when_commit_fails():
+    """入库失败退出循环时，必须在退避等待之前就关闭 stream 生成器（释放长连接），不能等垃圾回收"""
+    closed_at_backoff: list[bool] = []
+
+    async def sleep(seconds: float) -> None:
+        if seconds >= 600:  # 定时补缺任务：一直挂起，等被取消
+            await asyncio.Event().wait()
+        closed_at_backoff.append(collector.closed)
+        raise asyncio.CancelledError
+
+    collector = _stream(ClosableStream, sleep, sink=FakeSink(fail_on={2}))  # 第 2 次入库是长连接消息
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(collector.run(), timeout=5)
+    assert closed_at_backoff == [True]
+
+
+class HangingSink(FakeSink):
+    """第 2 次入库挂起：用于在长连接消息入库期间取消采集器"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hanging = asyncio.Event()
+
+    async def ingest(self, result, *, collector):
+        if self.calls:
+            self.hanging.set()
+            await asyncio.Event().wait()
+        return await super().ingest(result, collector=collector)
+
+
+async def test_stream_generator_is_closed_when_cancelled_during_commit():
+    sink = HangingSink()
+    collector = _stream(ClosableStream, FakeSleep(stop_after=5), sink=sink)
+    task = asyncio.ensure_future(collector.run())
+    try:
+        await asyncio.wait_for(sink.hanging.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+    finally:
+        task.cancel()
+        await asyncio.wait({task}, timeout=5)
+    assert collector.closed  # 取消后立即关闭，不依赖垃圾回收
+
+
+# ---------------------------------------------------------------------------
+# 健康成功上报本身失败：只记日志，不影响采集
+# ---------------------------------------------------------------------------
+
+
+class BrokenSuccessHealth(FakeHealth):
+    async def success(self, name: str) -> None:
+        raise RuntimeError("数据库断开，健康状态写不进去")
+
+
+async def test_poll_survives_success_report_failure(caplog):
+    sink, health, sleep = FakeSink(), BrokenSuccessHealth(), FakeSleep(stop_after=3)
+    collector = DemoPoll(sink=sink, health=health, client=None, engine=None, sleep=sleep)
+    with caplog.at_level(logging.ERROR, logger="tidewatch.collectors.base"):
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(collector.run(), timeout=5)
+    assert collector.seen == [None, {"n": 1}, {"n": 2}]  # 上报失败不影响游标推进
+    assert sleep.delays == [20, 20, 20]  # 按成功轮次等待，而不是退避
+    assert health.failures == []  # 上报失败不能被当成采集失败
+    assert any(r.levelno == logging.ERROR and "健康状态上报失败" in r.getMessage() for r in caplog.records)
+
+
+async def test_stream_survives_success_report_failure_and_still_resets_backoff(caplog):
+    sink, health, sleep = FakeSink(), BrokenSuccessHealth(), FakeSleep(stop_after=3)
+    collector = _stream(EventsEveryTimeStream, sleep, sink=sink, health=health)
+    with caplog.at_level(logging.ERROR, logger="tidewatch.collectors.base"):
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(collector.run(), timeout=5)
+    assert sleep.delays == [1, 1, 1]  # 含事件的数据入库成功，退避照常重置
+    assert collector.cursor == {"last_ms": 9}
+    assert len(health.failures) == 3  # 只有「长连接已关闭」被记为失败
+    assert all("长连接已关闭" in error for _, error in health.failures)
+    assert any(r.levelno == logging.ERROR and "健康状态上报失败" in r.getMessage() for r in caplog.records)
