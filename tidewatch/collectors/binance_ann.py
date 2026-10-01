@@ -30,6 +30,8 @@ BINANCE_WS_URL = "wss://api.binance.com/sapi/wss"
 WS_TOPIC = "com_announcement_en"
 # 列表接口轮询的栏目及其分类大类
 LIST_CATALOGS = {48: "listing", 161: "delisting"}
+PAGE_SIZE = 20
+MAX_PAGES = 5
 WS_RECV_TIMEOUT_S = 60
 # 日志里最多带多少个字符的原始消息
 _LOG_PREVIEW_CHARS = 200
@@ -135,30 +137,45 @@ def signed_ws_url(api_secret: str, now_ms: int, nonce: str, *, base_url: str = B
 
 
 class _BinanceList:
-    """列表接口：每个栏目取最新 20 条（混入类，依赖采集器基类的 client、limiter、clock、cfg）"""
+    """列表接口：各栏目按边界翻页补抓（混入类，依赖采集器基类的 client、limiter、clock、cfg）"""
+
+    async def _list_page(self, catalog_id: int, page_no: int) -> list[dict[str, Any]]:
+        await self.limiter.acquire()
+        response = await self.client.get(
+            BINANCE_LIST_URL,
+            params={"type": 1, "catalogId": catalog_id, "pageNo": page_no, "pageSize": PAGE_SIZE},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success"):
+            raise RuntimeError(f"币安公告接口返回错误：{payload.get('code')} {payload.get('message')}")
+        catalogs = (payload.get("data") or {}).get("catalogs") or []
+        return (catalogs[0].get("articles") if catalogs else None) or []
 
     async def fetch_list(self, cursor: dict[str, Any] | None) -> FetchResult:
         last = int((cursor or {}).get("last_ms", 0))
         floor_ms = int((self.clock() - timedelta(seconds=self.cfg.backfill_max_s)).timestamp() * 1000)
+        boundary_ms = max(last, floor_ms)
         events: list[Event] = []
         newest = last
         for catalog_id in LIST_CATALOGS:
-            await self.limiter.acquire()
-            response = await self.client.get(
-                BINANCE_LIST_URL, params={"type": 1, "catalogId": catalog_id, "pageNo": 1, "pageSize": 20}
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if not payload.get("success"):
-                raise RuntimeError(f"币安公告接口返回错误：{payload.get('code')} {payload.get('message')}")
-            catalogs = (payload.get("data") or {}).get("catalogs") or []
-            for article in (catalogs[0].get("articles") if catalogs else None) or []:
-                published_ms = _release_ms(article)
-                newest = max(newest, published_ms)
-                # 只按补抓窗口过滤、不按游标过滤：两个栏目共用一个游标，若按游标过滤，
-                # 某栏目延迟出现的较早公告会被永久跳过；重复条目由去重键处理
-                if published_ms >= floor_ms:
-                    events.append(parse_article(article, catalog_id))
+            for page_no in range(1, MAX_PAGES + 1):
+                articles = await self._list_page(catalog_id, page_no)
+                published = [_release_ms(article) for article in articles]
+                for article, published_ms in zip(articles, published):
+                    newest = max(newest, published_ms)
+                    # 只按补抓窗口过滤、不按游标过滤：两个栏目共用一个游标，若按游标过滤，
+                    # 某栏目延迟出现的较早公告会被永久跳过；重复条目由去重键处理
+                    if published_ms >= floor_ms:
+                        events.append(parse_article(article, catalog_id))
+                if len(articles) < PAGE_SIZE or any(published_ms <= boundary_ms for published_ms in published):
+                    break
+            else:
+                logger.warning(
+                    "币安公告栏目 %d 翻页达到上限 %d 页仍未追上游标或补抓窗口，可能有更早的公告未采集",
+                    catalog_id,
+                    MAX_PAGES,
+                )
         return FetchResult(sort_events(events), {"last_ms": newest} if newest else None)
 
 

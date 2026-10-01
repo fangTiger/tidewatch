@@ -17,7 +17,7 @@ from tidewatch.pipeline.normalize import clean_text
 
 JIN10_URL = "https://flash-api.jin10.com/get_flash_list"
 JIN10_HEADERS = {"x-app-id": "bVBF4FyRTn5NJF5n", "x-version": "1.0.0"}
-MAX_PAGES = 30
+MAX_PAGES = 60
 
 logger = logging.getLogger(__name__)
 

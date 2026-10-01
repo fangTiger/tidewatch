@@ -30,11 +30,15 @@
 - **THEN** `jin10` 状态变为异常并触发健康告警
 
 ### Requirement: 断点补抓
-系统 SHALL 在采集器启动时从 `collector_state.cursor` 继续采集，回溯时长 MUST NOT 超过该采集器的 `backfill_max`（一期三个采集器均为 6 小时）。
+系统 SHALL 在采集器启动时从 `collector_state.cursor` 继续采集，回溯时长 MUST NOT 超过该采集器的 `backfill_max`（一期三个采集器均为 6 小时）。每轮补抓翻页有上限（金十 60 页、OKX 10 页、币安每栏目 5 页）；触顶时记录警告，游标仍推进到最新，未翻到的更早数据不再补抓（这些上限远超 6 小时内的正常数据量）。
 
 #### Scenario: 重启后补抓
 - **WHEN** 进程停止 20 分钟后重启
 - **THEN** 金十采集器从上次的快讯 ID 继续，补回这 20 分钟的快讯
+
+#### Scenario: 补抓翻页触顶
+- **WHEN** 一轮补抓达到翻页上限仍未追上游标或补抓下限
+- **THEN** 记录警告并推进游标，不重复请求更早页
 
 ### Requirement: 金十快讯采集
 系统 SHALL 每 20 秒按增量 ID 轮询金十快讯（直连，不走代理），`occurred_at` 取快讯发布时间，`dedupe_key` 为 `jin10:{快讯ID}`，`max_push_age` 为 30 分钟，并保留源自带的 `important` 标记供分级使用。
@@ -44,7 +48,7 @@
 - **THEN** 生成一条 `category = news`、`event_type = flash` 的事件，`raw` 中保留 `important` 字段
 
 ### Requirement: 币安公告采集
-系统 SHALL 在配置了只读 API Key 与 Secret 时订阅币安公告 WS（`com_announcement_en`，每 30 秒 ping），并在每次（重）连接后以及每 10 分钟调用列表接口补缺；未配置时 MUST 退化为每 30 秒轮询列表接口，并在状态页标注「降级模式」。WS 与列表接口 MUST 使用同一去重键算法 `binance_ann:{sha1(规范化标题 + 发布日期)}`。
+系统 SHALL 在配置了只读 API Key 与 Secret 时订阅币安公告 WS（`com_announcement_en`，每 30 秒 ping），并在每次（重）连接后以及每 10 分钟调用列表接口补缺；未配置时 MUST 退化为每 30 秒轮询列表接口，并在状态页标注「降级模式」。WS 与列表接口 MUST 使用同一去重键算法 `binance_ann:{sha1(规范化标题 + 发布日期)}`。WS 模式下健康状态 SHALL 反映连接是否正常（消息、pong 与订阅确认）；列表补缺失败与单条 DATA 解析失败 SHALL 记录警告日志，一期 MUST NOT 计入健康状态（数据完整性监控留待后续）。
 
 #### Scenario: WS 与列表接口拿到同一公告
 - **WHEN** 同一条公告先经 WS 到达、随后又在补缺时从列表接口取回

@@ -19,6 +19,10 @@ def _collector(settings) -> Jin10Collector:
                           engine=None, clock=lambda: NOW)
 
 
+def test_page_limit_is_sixty():
+    assert jin10.MAX_PAGES == 60
+
+
 def test_parse_items_from_fixture():
     items = PAGE1["data"]
     locked = parse_item(items[0])

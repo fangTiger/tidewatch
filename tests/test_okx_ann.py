@@ -17,7 +17,11 @@ NOW = datetime.fromtimestamp(1790661613056 / 1000 + 60, tz=timezone.utc)
 
 def _collector(settings) -> OkxAnnCollector:
     return OkxAnnCollector(settings.collector("okx_ann"), sink=None, health=None, client=httpx.AsyncClient(trust_env=False),
-                           engine=None, clock=lambda: NOW)
+                          engine=None, clock=lambda: NOW)
+
+
+def test_page_limit_is_ten():
+    assert okx_ann.MAX_PAGES == 10
 
 
 def test_parse_details():
@@ -182,6 +186,7 @@ async def test_page_limit_logs_warning(settings, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="tidewatch.collectors.okx_ann"):
         result = await _collector(settings).fetch({"last_ptime": cursor})
     assert _requested_pages(route) == ["1", "2"] and len(result.events) == 2  # 翻到上限为止的条目仍然返回
+    assert result.cursor == {"last_ptime": NOW_MS - 100_000}  # 触顶仍推进到本轮最新公告
     assert any(r.levelno == logging.WARNING and "翻页" in r.getMessage() and "2" in r.getMessage() for r in caplog.records)
 
 

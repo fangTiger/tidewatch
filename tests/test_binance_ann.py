@@ -12,6 +12,7 @@ import respx
 from websockets.asyncio.server import serve
 
 from fakes import FakeHealth, FakeNotifier, FakeSink, FakeSleep, wait_until
+import tidewatch.collectors.binance_ann as binance_ann
 from tidewatch.collectors.announcements import binance_dedupe_key
 from tidewatch.collectors.binance_ann import (
     BINANCE_LIST_URL,
@@ -143,6 +144,74 @@ def _list_payload(articles: list[dict]) -> dict:
 
 def _article(code: str, title: str, release_ms: int) -> dict:
     return {"id": 1, "code": code, "title": title, "releaseDate": release_ms}
+
+
+def _page_articles(prefix: str, newest_ms: int, count: int = 20) -> list[dict]:
+    """生成按发布时间倒序排列的一页公告。"""
+    return [
+        _article(f"{prefix}-{index}", f"Binance Will List {prefix}{index} ({prefix}{index})", newest_ms - index * 1_000)
+        for index in range(count)
+    ]
+
+
+def _requested_pages(route, catalog_id: int) -> list[str]:
+    return [
+        call.request.url.params["pageNo"]
+        for call in route.calls
+        if call.request.url.params["catalogId"] == str(catalog_id)
+    ]
+
+
+@respx.mock
+async def test_fetch_list_paginates_then_stops_after_reaching_cursor(settings):
+    now_ms = int(NOW.timestamp() * 1_000)
+    cursor = now_ms - 60_000
+    pages = {
+        (48, 1): _page_articles("P1", now_ms - 1_000),
+        (48, 2): [*_page_articles("P2", now_ms - 21_000, 19), _article("cursor", "Binance Will List CUR (CUR)", cursor)],
+        (48, 3): _page_articles("NEVER", now_ms - 70_000),
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        key = (int(request.url.params["catalogId"]), int(request.url.params["pageNo"]))
+        return httpx.Response(200, json=_list_payload(pages.get(key, [])))
+
+    route = respx.get(BINANCE_LIST_URL).mock(side_effect=respond)
+    result = await _poll(settings).fetch({"last_ms": cursor})
+
+    assert _requested_pages(route, 48) == ["1", "2"]
+    assert _requested_pages(route, 161) == ["1"]
+    assert all(call.request.url.params["pageSize"] == "20" for call in route.calls)
+    assert len(result.events) == 40
+    assert result.cursor == {"last_ms": now_ms - 1_000}
+
+
+@respx.mock
+async def test_fetch_list_page_limit_warns_and_advances_cursor(settings, monkeypatch, caplog):
+    monkeypatch.setattr(binance_ann, "MAX_PAGES", 2)
+    now_ms = int(NOW.timestamp() * 1_000)
+    cursor = now_ms - 3_000_000
+    pages = {
+        (48, 1): _page_articles("P1", now_ms - 1_000),
+        (48, 2): _page_articles("P2", now_ms - 21_000),
+    }
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        key = (int(request.url.params["catalogId"]), int(request.url.params["pageNo"]))
+        return httpx.Response(200, json=_list_payload(pages.get(key, [])))
+
+    route = respx.get(BINANCE_LIST_URL).mock(side_effect=respond)
+    with caplog.at_level(logging.WARNING, logger="tidewatch.collectors.binance_ann"):
+        result = await _poll(settings).fetch({"last_ms": cursor})
+
+    assert _requested_pages(route, 48) == ["1", "2"]
+    assert result.cursor == {"last_ms": now_ms - 1_000}
+    assert any(
+        record.levelno == logging.WARNING
+        and "币安公告栏目 48" in record.getMessage()
+        and "翻页达到上限 2 页" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 @respx.mock

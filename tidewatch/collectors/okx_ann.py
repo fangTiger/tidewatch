@@ -11,7 +11,7 @@ from tidewatch.collectors.base import PollCollector, parse_context, sort_events
 from tidewatch.models import Event, FetchResult
 
 OKX_URL = "https://www.okx.com/api/v5/support/announcements"
-MAX_PAGES = 5
+MAX_PAGES = 10
 
 logger = logging.getLogger(__name__)
 

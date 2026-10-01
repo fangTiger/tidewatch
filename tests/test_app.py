@@ -4,6 +4,7 @@ import logging
 import os
 import signal
 import time
+from datetime import timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -18,7 +19,10 @@ from tidewatch.collectors.jin10 import Jin10Collector
 from tidewatch.collectors.okx_ann import OkxAnnCollector
 from tidewatch.config import ConfigError
 from tidewatch.notify.dryrun import DryRunNotifier
-from tidewatch.store.tables import collector_state
+from tidewatch.models import Event, FetchResult
+from tidewatch.pipeline.rules.engine import build_rule_engine
+from tidewatch.store.repo import load_cursor
+from tidewatch.store.tables import collector_state, event_clusters, events
 from tidewatch.web.embedded import EmbeddedServer
 
 
@@ -209,6 +213,80 @@ async def test_run_exits_zero_on_sigterm(engine, settings, caplog):
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_run_sigterm_waits_for_inflight_batch_atomically(engine, settings, monkeypatch):
+    """规范场景：SIGTERM 等待已提交批次完成，事件、簇与游标不会留下半截状态。"""
+
+    class BlockingRules:
+        def __init__(self) -> None:
+            self.real = build_rule_engine(settings)
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def evaluate(self, event, ctx):
+            self.entered.set()
+            await self.release.wait()
+            return await self.real.evaluate(event, ctx)
+
+    blocking = BlockingRules()
+    real_create_sink = app_module.create_event_sink
+
+    def create_blocking_sink(db_engine, app_settings, *, clock):
+        return real_create_sink(db_engine, app_settings, clock=clock, rules=blocking)
+
+    now = app_module.utcnow()
+    batch = FetchResult(
+        [
+            Event("jin10", "news", "flash", now - timedelta(minutes=2), "美国公布非农数据", "shutdown:1", raw={"important": 1}),
+            Event("jin10", "news", "flash", now - timedelta(minutes=1), "比特币突破新高", "shutdown:2", raw={"important": 0}),
+        ],
+        {"last_id": "shutdown:2"},
+    )
+
+    class BatchCollector:
+        name = "shutdown_test"
+        cfg = SimpleNamespace(stale_after_s=300)
+        client = None
+
+        def __init__(self, sink) -> None:
+            self.sink = sink
+
+        async def run(self) -> None:
+            await self.sink.ingest(batch, collector=self.name)
+            await asyncio.Event().wait()
+
+    def make_collectors(app: Application):
+        app.health.register(BatchCollector.name, BatchCollector.cfg.stale_after_s)
+        return [BatchCollector(app.sink)]
+
+    monkeypatch.setattr(app_module, "create_event_sink", create_blocking_sink)
+    monkeypatch.setattr(Application, "_make_collectors", make_collectors)
+    task = asyncio.create_task(run(settings, groups={"news"}, dry_run=True))
+    try:
+        await asyncio.wait_for(blocking.entered.wait(), timeout=5)
+        await wait_until(lambda: signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN, None))
+        os.kill(os.getpid(), signal.SIGTERM)
+        blocking.release.set()
+        assert await asyncio.wait_for(task, timeout=10) == 0
+    finally:
+        blocking.release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async with engine.connect() as conn:
+        event_rows = (await conn.execute(select(events.c.dedupe_key, events.c.cluster_id))).all()
+        cluster_ids = set((await conn.execute(select(event_clusters.c.id))).scalars())
+        cursor = await load_cursor(conn, BatchCollector.name)
+
+    if event_rows:
+        assert {row.dedupe_key for row in event_rows} == {"shutdown:1", "shutdown:2"}
+        assert all(row.cluster_id in cluster_ids for row in event_rows)
+        assert cursor == {"last_id": "shutdown:2"}
+    else:
+        assert cluster_ids == set()
+        assert cursor is None
 
 
 # ---------- 关键任务守护 ----------

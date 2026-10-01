@@ -66,12 +66,20 @@ mkdir -p "$REPO/log" "$TARGET_DIR"
 TMP=""
 BACKUP=""
 cleanup() {
+  status=$?
   if [[ -n "$TMP" ]]; then
     rm -f "$TMP"
   fi
   if [[ -n "$BACKUP" ]]; then
-    rm -f "$BACKUP"
+    if mv -f "$BACKUP" "$TARGET"; then
+      BACKUP=""
+      echo "安装被中断，已恢复原配置文件，可重新运行安装脚本或手动加载：launchctl bootstrap gui/$(id -u) $TARGET" >&2
+    else
+      echo "安装被中断，原配置文件恢复失败；备份保留在：$BACKUP，请手动处理" >&2
+      BACKUP=""
+    fi
   fi
+  exit "$status"
 }
 trap cleanup EXIT
 trap 'exit 1' INT TERM

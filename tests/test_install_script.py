@@ -25,6 +25,7 @@ class Sandbox:
         fail_bootstrap: bool = False,
         recover_bootstrap: bool = False,
         fail_restore: bool = False,
+        term_during_bootstrap: bool = False,
     ) -> None:
         self.root = root
         self.repo = root / repo_name
@@ -46,6 +47,7 @@ class Sandbox:
         bootstrap_status = 1 if fail_bootstrap else 0
         bootstrap_command = (
             f'if [ "$1" = "bootstrap" ]; then '
+            f'[ {str(term_during_bootstrap).lower()} = true ] && kill -TERM "$PPID" && sleep 0.2 && exit 0; '
             f'[ {str(recover_bootstrap).lower()} = true ] && '
             f'[ "$(grep -c \"^bootstrap\" \"{self.log}\")" -gt 1 ] && exit 0; '
             f'exit {bootstrap_status}; fi\n'
@@ -176,6 +178,27 @@ def test_bootstrap_failure_restores_existing_plist_and_service(tmp_path):
     bootstraps = [call for call in box.launchctl_calls() if call.startswith("bootstrap")]
     assert len(bootstraps) == 2
     assert all(str(box.target) in call for call in bootstraps)
+    assert [path.name for path in box.target.parent.iterdir()] == [f"{LABEL}.plist"]
+
+
+@needs_plutil
+def test_term_during_bootstrap_restores_existing_plist_without_loading(tmp_path):
+    box = Sandbox(tmp_path, term_during_bootstrap=True)
+    box.target.parent.mkdir(parents=True)
+    old_content = "旧服务配置"
+    box.target.write_text(old_content, encoding="utf-8")
+
+    result = box.run()
+
+    assert result.returncode != 0
+    assert box.target.read_text(encoding="utf-8") == old_content
+    assert [call for call in box.launchctl_calls() if call.startswith("bootstrap")] == [
+        f"bootstrap gui/{os.getuid()} {box.target}"
+    ]
+    assert (
+        f"安装被中断，已恢复原配置文件，可重新运行安装脚本或手动加载："
+        f"launchctl bootstrap gui/{os.getuid()} {box.target}"
+    ) in result.stderr
     assert [path.name for path in box.target.parent.iterdir()] == [f"{LABEL}.plist"]
 
 
