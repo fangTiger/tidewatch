@@ -10,8 +10,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import timedelta
-from typing import Any, Callable
+from datetime import datetime, timedelta
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -200,7 +200,7 @@ class EventSink:
             raise ValueError(f"非法的推送结果状态：{status}")
         return await self._submit(self._do_push_result, push_id, status, response, batch_id)
 
-    async def _submit(self, func, *args):
+    async def _submit(self, func: Callable[..., Awaitable[Any]], *args: Any) -> Any:
         if self._worker is None or self._worker.done() or self._closing:
             raise RuntimeError("EventSink 尚未启动、正在停止或工作协程已退出")
         future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -268,7 +268,9 @@ class EventSink:
         found = self._matcher.find(text)
         event.assets = list(dict.fromkeys([*event.assets, *found]))
 
-    async def _process(self, conn: AsyncConnection, event: Event, ctx: RuleContext, now) -> PushPlan | None:
+    async def _process(
+        self, conn: AsyncConnection, event: Event, ctx: RuleContext, now: datetime
+    ) -> PushPlan | None:
         try:
             async with conn.begin_nested():
                 rule = await self._rules.evaluate(event, ctx)

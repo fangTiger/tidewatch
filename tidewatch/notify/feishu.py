@@ -82,14 +82,16 @@ def _plain_div(content: str) -> dict[str, Any]:
 def _button_url(url: str | None) -> str | None:
     """返回可用作按钮链接的地址；无效时返回 None
 
-    有效条件：去掉首尾空白后，scheme 为 http/https（拒绝 javascript: 等协议）、主机非空，
-    且整串不含空白与控制字符（含换行、制表符），无法解析的地址（如 IPv6 括号不配对）也视为无效。
+    有效条件：去掉首尾空白后，scheme 为 http/https（拒绝 javascript: 等协议）、主机非空、端口合法（0~65535 的数字），
+    且整串不含空白、控制字符（Cc，含换行、制表符）与格式字符（Cf，如零宽空格、BOM、方向控制符，
+    它们肉眼不可见，可用来伪装域名）。无法解析的地址（如 IPv6 括号不配对）也视为无效。
     """
     cleaned = (url or "").strip()
-    if not cleaned or any(ch.isspace() or unicodedata.category(ch) == "Cc" for ch in cleaned):
+    if not cleaned or any(ch.isspace() or unicodedata.category(ch) in ("Cc", "Cf") for ch in cleaned):
         return None
     try:
         parts = urlsplit(cleaned)
+        _ = parts.port  # 端口不是数字或超出范围时这里会抛 ValueError
     except ValueError:
         return None
     # netloc 非空；再要求 hostname 非空，排除「https://@/x」这类只有用户信息、没有主机的地址

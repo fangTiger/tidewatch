@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from tidewatch.models import Event
 from tidewatch.pipeline.cluster import Clusterer
@@ -160,6 +160,8 @@ async def test_unsaved_event_rejected(engine, settings):
     async with engine.begin() as conn:
         with pytest.raises(ValueError, match="事件尚未入库"):
             await clusterer.create_single(conn, unsaved("新建簇"), NOW)
+        # 抛错发生在写库之前：pytest.raises 吞掉异常后事务会提交，此处确认没有留下半成品簇
+        assert (await conn.execute(select(func.count()).select_from(event_clusters))).scalar_one() == 0
     async with engine.begin() as conn:
         await _add(conn, clusterer, NFP)
         with pytest.raises(ValueError, match="事件尚未入库"):

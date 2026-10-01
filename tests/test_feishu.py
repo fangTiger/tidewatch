@@ -338,6 +338,9 @@ async def test_assets_line_limited_to_ten(make_notifier, count, expected_suffix)
         "https://example.com/\x00", "https://exa\x1bmple.com/",  # 含控制字符
         "https://example.com/\u3000a",  # 含全角空白
         "https://[::1/a",  # urlsplit 会抛 ValueError
+        "https://exa\u200bmple.com/a", "https://example.com/a\u200b",  # 含零宽空格（Unicode Cf 格式字符）
+        "\ufeffhttps://example.com/a", "https://example.com\u2060/a", "https://example.com/\u202etxt.exe",  # BOM、词连接符、方向控制
+        "https://example.com:99999/a", "https://example.com:abc/a", "https://example.com:-1/a",  # 非法端口
     ],
 )
 async def test_button_omitted_for_non_http_url(make_notifier, url):
@@ -350,7 +353,7 @@ async def test_button_omitted_for_non_http_url(make_notifier, url):
 @pytest.mark.parametrize(
     "url",
     ["http://example.com/a", "https://example.com/a", "HTTPS://Example.com/A", "https://example.com:8443/a?b=c&d=e#f",
-     "https://example.com/新闻/1"],
+     "https://example.com/新闻/1", "https://example.com:65535/a", "https://user:pw@example.com:8080/a"],
 )
 async def test_button_present_for_http_url(make_notifier, url):
     route = _ok_route()
