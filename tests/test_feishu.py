@@ -324,44 +324,6 @@ async def test_assets_line_limited_to_ten(make_notifier, count, expected_suffix)
     assert _asset_lines(payload) == ["资产：" + "、".join(assets[:10]) + expected_suffix]
 
 
-# ---------- 原文按钮 url 校验 ----------
-
-
-@respx.mock
-@pytest.mark.parametrize(
-    "url",
-    [
-        "javascript:alert(1)", "ftp://example.com/a", "flash.jin10.com/1", "", "   ",
-        "https://", "http://", "https:///path", "https://@/x",  # 缺少主机
-        "https://a b/c", "https://example.com/a b",  # 含空白
-        "https://example.com/a\nb", "https://example.com/a\r\nb", "https://example.com/a\tb",  # 含换行、制表符
-        "https://example.com/\x00", "https://exa\x1bmple.com/",  # 含控制字符
-        "https://example.com/\u3000a",  # 含全角空白
-        "https://[::1/a",  # urlsplit 会抛 ValueError
-        "https://exa\u200bmple.com/a", "https://example.com/a\u200b",  # 含零宽空格（Unicode Cf 格式字符）
-        "\ufeffhttps://example.com/a", "https://example.com\u2060/a", "https://example.com/\u202etxt.exe",  # BOM、词连接符、方向控制
-        "https://example.com:99999/a", "https://example.com:abc/a", "https://example.com:-1/a",  # 非法端口
-    ],
-)
-async def test_button_omitted_for_non_http_url(make_notifier, url):
-    route = _ok_route()
-    await make_notifier().send_event(_card(url=url), mention_all=False)
-    assert not _has_button(json.loads(route.calls.last.request.content))
-
-
-@respx.mock
-@pytest.mark.parametrize(
-    "url",
-    ["http://example.com/a", "https://example.com/a", "HTTPS://Example.com/A", "https://example.com:8443/a?b=c&d=e#f",
-     "https://example.com/新闻/1", "https://example.com:65535/a", "https://user:pw@example.com:8080/a"],
-)
-async def test_button_present_for_http_url(make_notifier, url):
-    route = _ok_route()
-    await make_notifier().send_event(_card(url=url), mention_all=False)
-    payload = json.loads(route.calls.last.request.content)
-    assert payload["card"]["elements"][-1]["actions"][0]["url"] == url
-
-
 # ---------- 正文与标题去重 ----------
 
 

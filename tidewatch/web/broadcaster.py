@@ -31,7 +31,13 @@ class Broadcaster:
             return
         for queue in list(self._subscribers):
             if queue.full():
-                queue.get_nowait()
+                # 整批积压已经不再可靠：清空旧消息，先通知客户端全量重同步，
+                # 再尽量保留触发溢出的最新消息。
+                while not queue.empty():
+                    queue.get_nowait()
+                queue.put_nowait(("resync", {}))
+                if queue.full():
+                    continue
             queue.put_nowait((event, data))
 
     def close(self) -> None:

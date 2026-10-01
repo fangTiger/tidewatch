@@ -1,12 +1,13 @@
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import insert, update
 
 from tidewatch.pipeline.decision import freshness_from_settings
 from tidewatch.store.tables import collector_state, event_clusters, events, push_log
-from tidewatch.web.queries import cluster_rows, collector_status, push_stats, timeline
+from tidewatch.web.queries import _local_time, _to_dict, cluster_rows, collector_status, push_stats, timeline
 
 NOW = datetime(2026, 9, 30, 2, 0, tzinfo=timezone.utc)
 
@@ -72,7 +73,7 @@ async def test_collector_status_and_push_stats(engine):
         await conn.execute(insert(push_log).values(  # 前一天（上海时间）的记录不计入
             cluster_id=cid, event_id=eid, level="A", kind="event", status="ok",
             retry_until=NOW, created_at=NOW - timedelta(days=1)))
-    rows = {r["name"]: r for r in await collector_status(engine)}
+    rows = {r["name"]: r for r in await collector_status(engine, now=NOW)}
     assert rows["jin10"]["status_text"] == "异常" and rows["jin10"]["last_error"] == "HTTP 503"
     assert rows["jin10"]["source_name"] == "金十快讯" and rows["jin10"]["last_success"] == "09:50:00"
     assert rows["binance_ann"]["mode_text"] == "降级"
@@ -99,34 +100,30 @@ async def test_row_assets_is_union_of_cluster_events(engine, settings):
     assert [r["title"] for r in rows] == ["代表事件"] and "SOL" in rows[0]["assets"]
 
 
-@pytest.mark.parametrize(
-    ("url", "expected"),
-    [
-        ("https://example.com/a?b=1", "https://example.com/a?b=1"),
-        ("http://example.com/a", "http://example.com/a"),
-        ("HTTPS://Example.com/A", "HTTPS://Example.com/A"),
-        ("javascript:alert(1)", None),
-        ("JavaScript:alert(1)", None),
-        (" javascript:alert(1)", None),
-        ("java\nscript:alert(1)", None),
-        ("data:text/html,<script>alert(1)</script>", None),
-        ("vbscript:msgbox(1)", None),
-        ("ftp://example.com/a", None),
-        ("//example.com/a", None),
-        ("example.com/a", None),
-        ("https://", None),
-        ("http://[::1/a", None),
-        ("", None),
-        (None, None),
-    ],
-)
-async def test_row_url_only_http_https(engine, settings, url, expected):
-    fresh = freshness_from_settings(settings)
-    async with engine.begin() as conn:
-        cid = await _cluster(conn, "A")
-        await _event(conn, cid, "A", "链接测试", url=url)
-    [row] = await timeline(engine, freshness=fresh)
-    assert row["url"] == expected
+@pytest.mark.parametrize("url", ["https://exa\u200bmple.com/a", "https://example.com:99999/", "https://@/x"])
+def test_web_row_rejects_shared_unsafe_urls(url):
+    row = SimpleNamespace(
+        cluster_id=1,
+        event_id=2,
+        category="news",
+        max_level="A",
+        title="链接测试",
+        url=url,
+        source="jin10",
+        source_count=1,
+        assets=[],
+        occurred_at=NOW,
+        collected_at=NOW,
+        committed_level=None,
+    )
+    assert _to_dict(row, lambda _source: None)["url"] is None
+
+
+def test_local_time_uses_short_form_only_for_today():
+    now = datetime(2026, 10, 1, 4, 0, tzinfo=timezone.utc)  # 上海时间 10 月 1 日 12:00
+    assert _local_time(datetime(2026, 10, 1, 1, 2, 3, tzinfo=timezone.utc), now=now) == "09:02:03"
+    assert _local_time(datetime(2026, 9, 30, 15, 2, 3, tzinfo=timezone.utc), now=now) == "09-30 23:02:03"
+    assert _local_time(None, now=now) == "—"
 
 
 async def test_equal_occurred_at_ordered_by_cluster_id_desc(engine, settings):

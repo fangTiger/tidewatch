@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import pytest
 
+from fakes import wait_until
 from tidewatch.models import Event, FetchResult
 from tidewatch.pipeline.sink import IngestOutcome, create_event_sink
 from tidewatch.web.broadcaster import Broadcaster
@@ -18,15 +19,16 @@ async def test_publish_subscribe_and_overflow():
     broadcaster = Broadcaster(max_queue=2)
     agen = broadcaster.subscribe()
     first = asyncio.create_task(_next(agen))
-    while broadcaster.subscriber_count == 0:  # 等订阅者完成注册（3.11 的 wait_for 会再包一层任务）
-        await asyncio.sleep(0)
+    await wait_until(lambda: broadcaster.subscriber_count == 1, timeout=2)
     broadcaster.publish("cluster.updated", {"cluster_id": 1, "title": "中文标题"})
     message = await first
     assert message["event"] == "cluster.updated"
     assert json.loads(message["data"]) == {"cluster_id": 1, "title": "中文标题"}
     for i in range(3):  # 队列容量 2：第 1 条被丢弃
         broadcaster.publish("tick", {"i": i})
-    assert json.loads((await _next(agen))["data"]) == {"i": 1}
+    resync = await _next(agen)
+    assert resync["event"] == "resync" and json.loads(resync["data"]) == {}
+    assert json.loads((await _next(agen))["data"]) == {"i": 2}
     await agen.aclose()
     assert broadcaster.subscriber_count == 0
 
@@ -38,8 +40,7 @@ async def test_live_updates_from_sink_and_health(engine, settings, clock):
     sink.on_ingest(live.on_ingest)
     agen = broadcaster.subscribe()
     pending = asyncio.create_task(_next(agen))
-    while broadcaster.subscriber_count == 0:
-        await asyncio.sleep(0)
+    await wait_until(lambda: broadcaster.subscriber_count == 1, timeout=2)
     await sink.start()
     try:
         event = Event(source="jin10", category="news", event_type="flash", occurred_at=clock.now - timedelta(minutes=1),
@@ -64,13 +65,13 @@ async def test_broadcaster_close_ends_subscribers():
     broadcaster = Broadcaster()
     agen = broadcaster.subscribe()
     first = asyncio.create_task(_next(agen))
-    while broadcaster.subscriber_count == 0:
-        await asyncio.sleep(0)
+    await wait_until(lambda: broadcaster.subscriber_count == 1, timeout=2)
     broadcaster.publish("tick", {"i": 1})
     assert json.loads((await first)["data"]) == {"i": 1}
     waiting = asyncio.create_task(agen.__anext__())  # 订阅者空闲，正在等待下一条消息
     await asyncio.sleep(0)
     broadcaster.close()
+    broadcaster.close()  # 重复关闭必须安全
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(waiting, timeout=2)
     assert broadcaster.subscriber_count == 0
@@ -86,8 +87,7 @@ async def test_broadcaster_close_with_full_queue():
     broadcaster = Broadcaster(max_queue=2)
     agen = broadcaster.subscribe()
     first = asyncio.create_task(_next(agen))
-    while broadcaster.subscriber_count == 0:
-        await asyncio.sleep(0)
+    await wait_until(lambda: broadcaster.subscriber_count == 1, timeout=2)
     broadcaster.publish("tick", {"i": 0})
     await first
     for i in range(1, 4):  # 订阅者不消费，队列被填满
@@ -127,8 +127,7 @@ async def test_process_once_requeues_batch_on_query_failure(settings, monkeypatc
     live = LiveUpdates(None, broadcaster, settings)
     agen = broadcaster.subscribe()
     first = asyncio.create_task(_next(agen))
-    while broadcaster.subscriber_count == 0:
-        await asyncio.sleep(0)
+    await wait_until(lambda: broadcaster.subscriber_count == 1, timeout=2)
     live.on_ingest(IngestOutcome(collector="jin10", event_ids=[1, 2], cluster_ids=[7, 5]))
     live.on_ingest(IngestOutcome(collector="jin10", event_ids=[3], cluster_ids=[9]))
     assert json.loads((await first)["data"]) == {"event_ids": [1, 2]}
@@ -142,10 +141,17 @@ async def test_process_once_requeues_batch_on_query_failure(settings, monkeypatc
     await agen.aclose()
 
 
-async def test_run_retries_after_failure_with_delay(settings, monkeypatch):
-    """run() 捕获查询异常后先等待 1 秒（sleep 可注入）再继续，且失败的批次随后被重试发布"""
-    flaky = _FlakyRows(fail_times=2)
-    monkeypatch.setattr("tidewatch.web.live.cluster_rows", flaky)
+async def test_run_uses_capped_exponential_backoff_and_resets_after_success(settings, monkeypatch):
+    """连续失败按 1、2、4…退避并封顶 30 秒；一次成功后下一批从 1 秒重新开始"""
+    calls: list[list[int]] = []
+
+    async def scheduled_rows(engine, cluster_ids, *, freshness):
+        calls.append(list(cluster_ids))
+        if len(calls) in {*range(1, 8), 9}:
+            raise ConnectionError("数据库暂时不可用")
+        return [{"cluster_id": cid, "title": f"簇 {cid}"} for cid in cluster_ids]
+
+    monkeypatch.setattr("tidewatch.web.live.cluster_rows", scheduled_rows)
     sleeps: list[float] = []
 
     async def fake_sleep(seconds: float) -> None:
@@ -156,16 +162,19 @@ async def test_run_retries_after_failure_with_delay(settings, monkeypatch):
     live = LiveUpdates(None, broadcaster, settings, sleep=fake_sleep)
     agen = broadcaster.subscribe()
     first = asyncio.create_task(_next(agen))
-    while broadcaster.subscriber_count == 0:
-        await asyncio.sleep(0)
+    await wait_until(lambda: broadcaster.subscriber_count == 1, timeout=2)
     runner = asyncio.create_task(live.run())
     try:
         live.on_ingest(IngestOutcome(collector="jin10", event_ids=[1], cluster_ids=[4]))
         await first  # event.created
         updated = json.loads((await _next(agen))["data"])
         assert updated == {"cluster_id": 4, "title": "簇 4"}
-        assert sleeps == [1, 1]  # 两次失败各等待 1 秒，而不是空转
-        assert flaky.calls == [[4], [4], [4]]
+        live.on_ingest(IngestOutcome(collector="jin10", event_ids=[2], cluster_ids=[5]))
+        assert (await _next(agen))["event"] == "event.created"
+        updated = json.loads((await _next(agen))["data"])
+        assert updated == {"cluster_id": 5, "title": "簇 5"}
+        assert sleeps == [1, 2, 4, 8, 16, 30, 30, 1]
+        assert calls == [[4]] * 8 + [[5]] * 2
     finally:
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)

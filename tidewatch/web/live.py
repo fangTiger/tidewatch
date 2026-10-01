@@ -15,11 +15,14 @@ from tidewatch.web.queries import cluster_rows
 
 logger = logging.getLogger(__name__)
 
-# 刷新失败（如数据库故障）后的等待时间，避免故障期间空转
-RETRY_DELAY_S = 1
+# 刷新失败（如数据库故障）后的退避范围，避免故障期间空转
+INITIAL_RETRY_DELAY_S = 1
+MAX_RETRY_DELAY_S = 30
 
 
 class LiveUpdates:
+    """把流水线回调汇聚为可供网页订阅的实时 SSE 更新。"""
+
     def __init__(
         self,
         engine: AsyncEngine,
@@ -40,6 +43,7 @@ class LiveUpdates:
         self._pending.put_nowait(sorted(set(outcome.cluster_ids)))
 
     def on_health(self, payload: dict[str, Any]) -> None:
+        """把健康监控提交后的状态变化立即广播给订阅者。"""
         self._broadcaster.publish("health.changed", payload)
 
     async def process_once(self) -> None:
@@ -58,10 +62,15 @@ class LiveUpdates:
             self._broadcaster.publish("cluster.updated", row)
 
     async def run(self) -> None:
+        """持续刷新待处理簇；失败时指数退避，任一次成功后重置等待时间。"""
+        retry_delay = INITIAL_RETRY_DELAY_S
         while True:
             self._pending.put_nowait(await self._pending.get())  # 等待至少一批
             try:
                 await self.process_once()
             except Exception:
-                logger.exception("实时更新失败，%s 秒后重试", RETRY_DELAY_S)
-                await self._sleep(RETRY_DELAY_S)
+                logger.exception("实时更新失败，%s 秒后重试", retry_delay)
+                await self._sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY_S)
+            else:
+                retry_delay = INITIAL_RETRY_DELAY_S

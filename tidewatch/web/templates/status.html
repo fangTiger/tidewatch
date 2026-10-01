@@ -7,11 +7,11 @@
   <tbody>
     {% for c in collectors %}
     <tr id="s-{{ c.name }}" class="st-{{ c.status }}">
-      <td>{{ c.source_name }}</td>
+      <td class="source-name">{{ c.source_name }}</td>
       <td class="status">{{ c.status_text }}</td>
       <td class="mode">{{ c.mode_text }}</td>
-      <td>{{ c.last_success }}</td>
-      <td>{{ c.last_event }}</td>
+      <td class="last-success">{{ c.last_success }}</td>
+      <td class="last-event">{{ c.last_event }}</td>
       <td class="failures">{{ c.consecutive_failures }}</td>
       <td class="error">{{ c.last_error }}</td>
     </tr>
@@ -22,11 +22,11 @@
 </table>
 <h2>今日推送</h2>
 <ul class="stats">
-  <li>已送达 <b>{{ stats.ok }}</b></li>
-  <li>演练 <b>{{ stats.dry_run }}</b></li>
-  <li>待发送 <b>{{ stats.pending }}</b></li>
-  <li>失败 <b>{{ stats.failed }}</b></li>
-  <li>过期 <b>{{ stats.expired }}</b></li>
-  <li>已取代 <b>{{ stats.superseded }}</b></li>
+  <li>已送达 <b data-push-status="ok">{{ stats.ok }}</b></li>
+  <li>演练 <b data-push-status="dry_run">{{ stats.dry_run }}</b></li>
+  <li>待发送 <b data-push-status="pending">{{ stats.pending }}</b></li>
+  <li>失败 <b data-push-status="failed">{{ stats.failed }}</b></li>
+  <li>过期 <b data-push-status="expired">{{ stats.expired }}</b></li>
+  <li>已取代 <b data-push-status="superseded">{{ stats.superseded }}</b></li>
 </ul>
 {% endblock %}

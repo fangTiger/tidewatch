@@ -15,12 +15,12 @@ import hmac
 import time
 import unicodedata
 from typing import Any, Callable
-from urllib.parse import urlsplit
 
 import httpx
 
 from tidewatch.clock import format_local
 from tidewatch.notify.base import EventCard, Notifier, SendResult, source_name
+from tidewatch.urls import safe_http_url
 
 # 频率限制等可重试的业务错误码
 RETRYABLE_CODES = {11232}
@@ -77,27 +77,6 @@ def _truncate(text: str, limit: int) -> str:
 def _plain_div(content: str) -> dict[str, Any]:
     """构造一个 plain_text 文本块（内容不会被解析为 Markdown、@ 或链接）"""
     return {"tag": "div", "text": {"tag": "plain_text", "content": content}}
-
-
-def _button_url(url: str | None) -> str | None:
-    """返回可用作按钮链接的地址；无效时返回 None
-
-    有效条件：去掉首尾空白后，scheme 为 http/https（拒绝 javascript: 等协议）、主机非空、端口合法（0~65535 的数字），
-    且整串不含空白、控制字符（Cc，含换行、制表符）与格式字符（Cf，如零宽空格、BOM、方向控制符，
-    它们肉眼不可见，可用来伪装域名）。无法解析的地址（如 IPv6 括号不配对）也视为无效。
-    """
-    cleaned = (url or "").strip()
-    if not cleaned or any(ch.isspace() or unicodedata.category(ch) in ("Cc", "Cf") for ch in cleaned):
-        return None
-    try:
-        parts = urlsplit(cleaned)
-        _ = parts.port  # 端口不是数字或超出范围时这里会抛 ValueError
-    except ValueError:
-        return None
-    # netloc 非空；再要求 hostname 非空，排除「https://@/x」这类只有用户信息、没有主机的地址
-    if parts.scheme not in ("http", "https") or not parts.netloc or not parts.hostname:
-        return None
-    return cleaned
 
 
 def _body_text(title: str, body: str) -> str:
@@ -199,7 +178,7 @@ class FeishuNotifier(Notifier):
         body = _body_text(card.title, card.body)
         if body:
             elements.append(_plain_div(body))
-        url = _button_url(card.url)
+        url = safe_http_url(card.url)
         if url:
             elements.append(
                 {

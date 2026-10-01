@@ -48,6 +48,20 @@ async def test_index_hides_c_by_default(client):
     assert "印度银行" in shown.text
 
 
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "Yes", "on", "ON"])
+async def test_show_c_accepts_truthy_strings(client, value):
+    response = await asyncio.wait_for(client.get("/api/timeline", params={"show_c": value}), timeout=3)
+    assert response.status_code == 200
+    assert any(row["level"] == "C" for row in response.json())
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "off", "abc", "", "2"])
+async def test_show_c_treats_other_values_as_false(client, value):
+    response = await asyncio.wait_for(client.get("/api/timeline", params={"show_c": value}), timeout=3)
+    assert response.status_code == 200
+    assert all(row["level"] != "C" for row in response.json())
+
+
 async def test_api_timeline_filters(client):
     rows = (await client.get("/api/timeline", params={"asset": "BTC"})).json()
     assert [r["title"] for r in rows] == ["比特币突破12万美元"]
@@ -73,7 +87,41 @@ async def test_fragment_and_status(client):
     assert status.status_code == 200 and "金十快讯" in status.text
     data = (await client.get("/api/status")).json()
     assert data["collectors"][0]["name"] == "jin10" and data["push_stats"]["pending"] == 1
+    assert set(data["collectors"][0]) >= {
+        "status", "mode", "last_success", "last_event", "consecutive_failures", "last_error",
+    }
+    for field in ("status", "mode", "last-success", "last-event", "failures", "error"):
+        assert f'class="{field}"' in status.text
+    for push_status in ("ok", "dry_run", "pending", "failed", "expired", "superseded"):
+        assert f'data-push-status="{push_status}"' in status.text
     assert (await client.get("/static/app.js")).status_code == 200
+
+
+async def test_stream_response_has_send_timeout(seeded, settings, clock):
+    app = create_app(seeded, Broadcaster(), settings, clock=clock)
+    route = next(route for route in app.routes if getattr(route, "path", None) == "/stream")
+    response = await asyncio.wait_for(route.endpoint(), timeout=2)
+    assert response.send_timeout == 10
+
+
+async def test_timeline_escapes_script_in_title(seeded, settings, clock):
+    async def scenario():
+        sink = create_event_sink(seeded, settings, clock=clock)
+        await sink.start()
+        try:
+            await sink.ingest(FetchResult([
+                Event(source="jin10", category="news", event_type="flash", occurred_at=clock.now,
+                      title="<script>alert(1)</script>", dedupe_key="jin10:script", raw={"important": 1})
+            ], None), collector="jin10")
+        finally:
+            await sink.stop()
+        app = create_app(seeded, Broadcaster(), settings, clock=clock)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+            return await http.get("/")
+
+    page = await asyncio.wait_for(scenario(), timeout=5)
+    assert "<script>alert(1)</script>" not in page.text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page.text
 
 
 @pytest.fixture
@@ -126,6 +174,7 @@ async def test_stream_delivers_published_events(live_server):
             broadcaster.publish("health.changed", {"name": "jin10", "status": "abnormal"})
             message = await asyncio.wait_for(_read_sse_message(lines), timeout=3)
             assert message["event"] == "health.changed" and json.loads(message["data"])["status"] == "abnormal"
+        await wait_until(lambda: broadcaster.subscriber_count == 0, timeout=3)
 
 
 # ---------- 嵌入式 uvicorn：启动失败的表现 ----------

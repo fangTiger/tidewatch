@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-import unicodedata
 from datetime import datetime, time as dtime
 from typing import Any
-from urllib.parse import urlsplit
 
 from sqlalchemy import case, exists, func, literal_column, select, true
 from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from tidewatch.clock import LOCAL_TZ, format_local
+from tidewatch.clock import LOCAL_TZ, format_local, utcnow
 from tidewatch.notify.base import source_name
 from tidewatch.pipeline.decision import FreshnessLookup
 from tidewatch.store.tables import collector_state, event_clusters, events, push_log
+from tidewatch.urls import safe_http_url
 
 LEVELS = ("S", "A", "B", "C")
 STATUS_TEXT = {"normal": "正常", "abnormal": "异常", "unknown": "未知"}
@@ -70,24 +69,6 @@ def _cluster_select():
     return stmt, rep
 
 
-def _safe_url(url: str | None) -> str | None:
-    """只保留 http/https 链接；其他协议（javascript:、data: 等）、无主机或无法解析的地址一律丢弃
-
-    外部来源的链接会渲染为 <a href>，javascript: 之类的协议会在点击时执行脚本。
-    含空白、控制字符（含换行、制表符）的地址也丢弃：浏览器会忽略其中的换行与制表符，可借此绕过协议检查。
-    """
-    cleaned = (url or "").strip()
-    if not cleaned or any(ch.isspace() or unicodedata.category(ch) == "Cc" for ch in cleaned):
-        return None
-    try:
-        parts = urlsplit(cleaned)
-    except ValueError:
-        return None
-    if parts.scheme not in ("http", "https") or not parts.netloc:
-        return None
-    return cleaned
-
-
 def _to_dict(row: Any, freshness: FreshnessLookup) -> dict[str, Any]:
     max_age = freshness(row.source)
     stale = max_age is not None and (row.collected_at - row.occurred_at) > max_age
@@ -97,7 +78,7 @@ def _to_dict(row: Any, freshness: FreshnessLookup) -> dict[str, Any]:
         "category": row.category,
         "level": row.max_level,
         "title": row.title,
-        "url": _safe_url(row.url),
+        "url": safe_http_url(row.url),
         "source": row.source,
         "source_name": source_name(row.source),
         "source_count": row.source_count,
@@ -148,13 +129,17 @@ async def cluster_rows(engine: AsyncEngine, cluster_ids: list[int], *, freshness
     return [_to_dict(row, freshness) for row in rows]
 
 
-def _local_time(value: datetime | None) -> str:
+def _local_time(value: datetime | None, *, now: datetime | None = None) -> str:
+    """显示上海本地时间：今天省略日期，其他日期保留月日。"""
     if value is None:
         return "—"
-    return format_local(value, "%H:%M:%S")
+    local_value = value.astimezone(LOCAL_TZ)
+    local_now = (now or utcnow()).astimezone(LOCAL_TZ)
+    fmt = "%H:%M:%S" if local_value.date() == local_now.date() else "%m-%d %H:%M:%S"
+    return local_value.strftime(fmt)
 
 
-async def collector_status(engine: AsyncEngine) -> list[dict[str, Any]]:
+async def collector_status(engine: AsyncEngine, *, now: datetime | None = None) -> list[dict[str, Any]]:
     """状态页：各采集器的健康状态"""
     async with engine.connect() as conn:
         rows = (await conn.execute(select(collector_state).order_by(collector_state.c.name))).mappings().all()
@@ -166,8 +151,8 @@ async def collector_status(engine: AsyncEngine) -> list[dict[str, Any]]:
             "status_text": STATUS_TEXT.get(row["status"], row["status"]),
             "mode": row["mode"],
             "mode_text": "降级" if row["mode"] == "degraded" else "正常",
-            "last_success": _local_time(row["last_success_at"]),
-            "last_event": _local_time(row["last_event_at"]),
+            "last_success": _local_time(row["last_success_at"], now=now),
+            "last_event": _local_time(row["last_event_at"], now=now),
             "consecutive_failures": row["consecutive_failures"],
             "last_error": row["last_error"] or "",
         }

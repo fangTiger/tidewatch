@@ -27,12 +27,12 @@ def create_app(engine: AsyncEngine, broadcaster: Broadcaster, settings: Any, *, 
     freshness = freshness_from_settings(settings)
     assets = [asset.symbol for asset in settings.watchlist.assets]
 
-    def _filters(category: str | None, level: str | None, asset: str | None, show_c: int) -> dict[str, Any]:
+    def _filters(category: str | None, level: str | None, asset: str | None, show_c: str | None) -> dict[str, Any]:
         return {
             "category": category if category in ("news", "exchange") else None,
             "level": level if level in LEVELS else None,
             "asset": asset or None,
-            "show_c": bool(show_c),
+            "show_c": (show_c or "").strip().lower() in {"1", "true", "yes", "on"},
         }
 
     async def _rows(filters: dict[str, Any]) -> list[dict[str, Any]]:
@@ -48,14 +48,14 @@ def create_app(engine: AsyncEngine, broadcaster: Broadcaster, settings: Any, *, 
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request, category: str | None = None, level: str | None = None,
-                    asset: str | None = None, show_c: int = 0):
+                    asset: str | None = None, show_c: str | None = None):
         filters = _filters(category, level, asset, show_c)
         context = {"rows": await _rows(filters), "filters": filters, "assets": assets, "active": "home"}
         return templates.TemplateResponse(request, "index.html", context)
 
     @app.get("/api/timeline")
     async def api_timeline(category: str | None = None, level: str | None = None,
-                           asset: str | None = None, show_c: int = 0):
+                           asset: str | None = None, show_c: str | None = None):
         return await _rows(_filters(category, level, asset, show_c))
 
     @app.get("/fragment/cluster/{cluster_id}", response_class=HTMLResponse)
@@ -67,19 +67,21 @@ def create_app(engine: AsyncEngine, broadcaster: Broadcaster, settings: Any, *, 
 
     @app.get("/status", response_class=HTMLResponse)
     async def status_page(request: Request):
+        now = clock()
         context = {
-            "collectors": await collector_status(engine),
-            "stats": await push_stats(engine, clock()),
+            "collectors": await collector_status(engine, now=now),
+            "stats": await push_stats(engine, now),
             "active": "status",
         }
         return templates.TemplateResponse(request, "status.html", context)
 
     @app.get("/api/status")
     async def api_status():
-        return {"collectors": await collector_status(engine), "push_stats": await push_stats(engine, clock())}
+        now = clock()
+        return {"collectors": await collector_status(engine, now=now), "push_stats": await push_stats(engine, now)}
 
     @app.get("/stream")
     async def stream():
-        return EventSourceResponse(broadcaster.subscribe(), ping=15)
+        return EventSourceResponse(broadcaster.subscribe(), ping=15, send_timeout=10)
 
     return app
