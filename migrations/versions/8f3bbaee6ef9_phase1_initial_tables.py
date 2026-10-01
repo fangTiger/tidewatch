@@ -1,7 +1,7 @@
 """phase1 initial tables
 
 Revision ID: 8f3bbaee6ef9
-Revises: 
+Revises:
 Create Date: 2026-09-30 15:51:47.452237
 
 """

@@ -17,7 +17,15 @@ needs_plutil = pytest.mark.skipif(shutil.which("plutil") is None, reason="需要
 
 
 class Sandbox:
-    def __init__(self, root: Path, repo_name: str = "repo", *, fail_bootstrap: bool = False) -> None:
+    def __init__(
+        self,
+        root: Path,
+        repo_name: str = "repo",
+        *,
+        fail_bootstrap: bool = False,
+        recover_bootstrap: bool = False,
+        fail_restore: bool = False,
+    ) -> None:
         self.root = root
         self.repo = root / repo_name
         self.home = root / "home"
@@ -36,12 +44,30 @@ class Sandbox:
         fake = self.bin / "launchctl"
         # print 子命令返回非零，让脚本认为旧服务不存在、不用等待
         bootstrap_status = 1 if fail_bootstrap else 0
+        bootstrap_command = (
+            f'if [ "$1" = "bootstrap" ]; then '
+            f'[ {str(recover_bootstrap).lower()} = true ] && '
+            f'[ "$(grep -c \"^bootstrap\" \"{self.log}\")" -gt 1 ] && exit 0; '
+            f'exit {bootstrap_status}; fi\n'
+        )
         fake.write_text(
             f'#!/bin/bash\necho "$@" >> "{self.log}"\n'
-            f'[ "$1" = "print" ] && exit 1\n[ "$1" = "bootstrap" ] && exit {bootstrap_status}\nexit 0\n',
+            f'[ "$1" = "print" ] && exit 1\n{bootstrap_command}exit 0\n',
             encoding="utf-8",
         )
         fake.chmod(0o755)
+        if fail_restore:
+            real_mv = shutil.which("mv", path=os.defpath)
+            assert real_mv is not None
+            mv_log = self.root / "mv.log"
+            fake_mv = self.bin / "mv"
+            fake_mv.write_text(
+                f'#!/bin/bash\necho "$@" >> "{mv_log}"\n'
+                f'[ "$(wc -l < \"{mv_log}\")" -gt 1 ] && exit 1\n'
+                f'exec "{real_mv}" "$@"\n',
+                encoding="utf-8",
+            )
+            fake_mv.chmod(0o755)
 
     @property
     def target(self) -> Path:
@@ -133,6 +159,40 @@ def test_bootstrap_failure_prints_chinese_hint_and_exits_nonzero(tmp_path):
     assert result.returncode != 0
     assert "加载服务失败" in result.stderr
     assert "launchctl print" in result.stderr
+
+
+@needs_plutil
+def test_bootstrap_failure_restores_existing_plist_and_service(tmp_path):
+    box = Sandbox(tmp_path, fail_bootstrap=True, recover_bootstrap=True)
+    box.target.parent.mkdir(parents=True)
+    old_content = "旧服务配置"
+    box.target.write_text(old_content, encoding="utf-8")
+
+    result = box.run()
+
+    assert result.returncode != 0
+    assert box.target.read_text(encoding="utf-8") == old_content
+    assert "新配置加载失败，已恢复原服务" in result.stderr
+    bootstraps = [call for call in box.launchctl_calls() if call.startswith("bootstrap")]
+    assert len(bootstraps) == 2
+    assert all(str(box.target) in call for call in bootstraps)
+    assert [path.name for path in box.target.parent.iterdir()] == [f"{LABEL}.plist"]
+
+
+@needs_plutil
+def test_restore_move_failure_keeps_backup_for_manual_recovery(tmp_path):
+    box = Sandbox(tmp_path, fail_bootstrap=True, fail_restore=True)
+    box.target.parent.mkdir(parents=True)
+    box.target.write_text("旧服务配置", encoding="utf-8")
+
+    result = box.run()
+
+    assert result.returncode != 0
+    backups = list(box.target.parent.glob(f"{LABEL}.backup.*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "旧服务配置"
+    assert "请手动处理" in result.stderr
+    assert str(backups[0]) in result.stderr
 
 
 @needs_plutil

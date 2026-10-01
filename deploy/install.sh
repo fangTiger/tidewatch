@@ -64,9 +64,13 @@ mkdir -p "$REPO/log" "$TARGET_DIR"
 
 # 先生成到同目录的临时文件，plutil 校验通过后再原子替换，避免半成品覆盖已安装的配置
 TMP=""
+BACKUP=""
 cleanup() {
   if [[ -n "$TMP" ]]; then
     rm -f "$TMP"
+  fi
+  if [[ -n "$BACKUP" ]]; then
+    rm -f "$BACKUP"
   fi
 }
 trap cleanup EXIT
@@ -78,6 +82,10 @@ if ! plutil -lint "$TMP" >/dev/null; then
   exit 1
 fi
 chmod 644 "$TMP"
+if [[ -f "$TARGET" ]]; then
+  BACKUP="$(mktemp "$TARGET_DIR/$LABEL.backup.XXXXXX")"
+  cp -p "$TARGET" "$BACKUP"
+fi
 mv -f "$TMP" "$TARGET"
 TMP=""
 echo "已生成：$TARGET"
@@ -89,8 +97,26 @@ for _ in $(seq 1 20); do
   sleep 1
 done
 if ! launchctl bootstrap "gui/$(id -u)" "$TARGET"; then
-  echo "加载服务失败，可用 launchctl print \"gui/$(id -u)/$LABEL\" 查看原因" >&2
+  if [[ -n "$BACKUP" ]]; then
+    if mv -f "$BACKUP" "$TARGET"; then
+      BACKUP=""
+      if launchctl bootstrap "gui/$(id -u)" "$TARGET"; then
+        echo "新配置加载失败，已恢复原服务" >&2
+      else
+        echo "新配置加载失败，恢复原服务也失败，请手动处理：$TARGET" >&2
+      fi
+    else
+      echo "新配置加载失败，旧配置恢复失败；备份保留在：$BACKUP，请手动处理" >&2
+      BACKUP=""
+    fi
+  else
+    echo "加载服务失败，可用 launchctl print \"gui/$(id -u)/$LABEL\" 查看原因" >&2
+  fi
   exit 1
+fi
+if [[ -n "$BACKUP" ]]; then
+  rm -f "$BACKUP"
+  BACKUP=""
 fi
 echo "已安装并启动：$LABEL"
 echo "查看状态：launchctl print \"gui/$(id -u)/$LABEL\" | head -20"
