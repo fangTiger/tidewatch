@@ -99,7 +99,7 @@ def test_classify_suspension_recovery_is_other(title, hint, expected):
         # 数字开头的代码
         ("Binance Futures Will Launch 1000PEPEUSDT USDⓈ-Margined Perpetual Contract", ["1000PEPE"]),
         ("OKX to list 1000SATSUSD X-Perp", ["1000SATS"]),
-        ("OKX to delist 1INCH, 2Z and 1000BONK spot trading pairs", ["1INCH", "2Z", "1000BONK"]),
+        ("OKX to delist 1INCH and 1000BONK spot trading pairs", ["1INCH", "1000BONK"]),
         ("Binance Will List Example (1MBABYDOGE) with Seed Tag", ["1MBABYDOGE"]),
         # 纯数字（日期等）不是币种
         ("Notice of Removal of Spot Trading Pairs - 2026-10-02 10:00", []),
@@ -122,3 +122,23 @@ def test_binance_dedupe_key_uses_utc_date_across_timezones():
     # 同一个北京时间日期、但 UTC 已跨日的两个时刻不同键
     later = datetime.fromisoformat("2026-10-01 09:00+08:00")  # UTC 10-01 01:00
     assert binance_dedupe_key("Binance Will List XYZ (XYZ)", cn) != binance_dedupe_key("Binance Will List XYZ (XYZ)", later)
+
+
+@pytest.mark.parametrize(
+    ("title", "symbols"),
+    [
+        # 数字开头的代码去掉数字后至少要有 2 个字母，否则不是币种（杠杆倍数、时间周期等）
+        ("Binance Futures Will Adjust Leverage to 20X for ABCUSDT Perpetual Contract", ["ABC"]),
+        ("OKX to update 24H volume rules for BTC", ["BTC"]),
+        ("OKX to delist BTC 3L and 3S leveraged tokens", ["BTC"]),
+        ("OKX to list 24HUSDT X-Perp", []),
+        ("OKX to list 20XUSD and 3LUSDT X-Perps", []),
+        # 满足条件的数字开头代码照常提取，带后缀的先去后缀再判断
+        ("OKX to list 1INCH spot trading pair", ["1INCH"]),
+        ("OKX to list 1000PEPE spot trading pair", ["1000PEPE"]),
+        ("Binance Futures Will Launch 1000PEPEUSDT Perpetual Contract", ["1000PEPE"]),
+        ("OKX to list 1000PEPEUSD X-Perp", ["1000PEPE"]),
+    ],
+)
+def test_extract_symbols_digit_leading_needs_two_letters(title, symbols):
+    assert extract_symbols(title) == symbols

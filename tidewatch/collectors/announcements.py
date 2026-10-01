@@ -59,7 +59,8 @@ def classify(title: str, hint: str | None) -> str:
 def extract_symbols(title: str) -> list[str]:
     """从英文标题中提取币种代码：优先取括号内代码，否则取大写词并去掉 USDT/USDC/USD 后缀
 
-    代码可以数字开头（1INCH、1000PEPEUSDT → 1000PEPE）；纯数字、停用词（交易所名、法币、稳定币、术语）不算币种。
+    代码可以数字开头（1INCH、1000PEPEUSDT → 1000PEPE），但去掉数字后至少要有 2 个字母（20X、24H、3L 不算）；
+    纯数字、停用词（交易所名、法币、稳定币、术语）不算币种。括号内的代码是标题明示的，不做字母数限制。
     """
     text = unicodedata.normalize("NFKC", title)
     found = _PAREN.findall(text)
@@ -71,6 +72,9 @@ def extract_symbols(title: str) -> list[str]:
                 if token.endswith(suffix) and len(token) > len(suffix) + 1:
                     token = token[: -len(suffix)]
                     break
+            # 数字开头的词（20X、24H、3L 这类杠杆倍数、时间周期）去掉数字后至少要有 2 个字母才算币种
+            if token[0].isdigit() and sum(ch.isalpha() for ch in token) < 2:
+                continue
             found.append(token)
     return [sym for sym in dict.fromkeys(found) if sym not in _STOP and not sym.isdigit()]
 
