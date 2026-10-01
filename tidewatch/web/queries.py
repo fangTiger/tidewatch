@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import datetime, time as dtime
 from typing import Any
+from urllib.parse import urlsplit
 
-from sqlalchemy import case, exists, func, select, true
+from sqlalchemy import case, exists, func, literal_column, select, true
+from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tidewatch.clock import LOCAL_TZ, format_local
@@ -21,11 +24,15 @@ _RANK = case({"S": 3, "A": 2, "B": 1}, value=events.c.final_level, else_=0)
 
 
 def _cluster_select():
-    """簇 + 代表事件（LATERAL 子查询：已推送取 rep_event_id，否则取等级最高、最早的一条）"""
+    """簇 + 代表事件（LATERAL 子查询：已推送取 rep_event_id，否则取等级最高、最早的一条）
+
+    assets 是簇内所有事件资产的并集（去重、排序，没有则为空数组），
+    与按资产筛选时「簇内任一事件含该资产」的口径一致。
+    """
     rep = (
         select(
             events.c.id, events.c.title, events.c.url, events.c.source,
-            events.c.occurred_at, events.c.collected_at, events.c.assets,
+            events.c.occurred_at, events.c.collected_at,
         )
         .where(events.c.cluster_id == event_clusters.c.id)
         .order_by(
@@ -36,6 +43,15 @@ def _cluster_select():
         )
         .limit(1)
         .lateral("rep")
+    )
+    unnested = func.unnest(events.c.assets).table_valued("asset").render_derived(name="unnested")
+    asset = unnested.c.asset
+    cluster_assets = (
+        select(func.coalesce(func.array_agg(aggregate_order_by(asset.distinct(), asset)), literal_column("'{}'::text[]")))
+        .select_from(events.join(unnested, true()))
+        .where(events.c.cluster_id == event_clusters.c.id)
+        .correlate(event_clusters)
+        .scalar_subquery()
     )
     stmt = select(
         event_clusters.c.id.label("cluster_id"),
@@ -49,9 +65,27 @@ def _cluster_select():
         rep.c.source,
         rep.c.occurred_at,
         rep.c.collected_at,
-        rep.c.assets,
+        cluster_assets.label("assets"),
     ).select_from(event_clusters.join(rep, true()))
     return stmt, rep
+
+
+def _safe_url(url: str | None) -> str | None:
+    """只保留 http/https 链接；其他协议（javascript:、data: 等）、无主机或无法解析的地址一律丢弃
+
+    外部来源的链接会渲染为 <a href>，javascript: 之类的协议会在点击时执行脚本。
+    含空白、控制字符（含换行、制表符）的地址也丢弃：浏览器会忽略其中的换行与制表符，可借此绕过协议检查。
+    """
+    cleaned = (url or "").strip()
+    if not cleaned or any(ch.isspace() or unicodedata.category(ch) == "Cc" for ch in cleaned):
+        return None
+    try:
+        parts = urlsplit(cleaned)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    return cleaned
 
 
 def _to_dict(row: Any, freshness: FreshnessLookup) -> dict[str, Any]:
@@ -63,7 +97,7 @@ def _to_dict(row: Any, freshness: FreshnessLookup) -> dict[str, Any]:
         "category": row.category,
         "level": row.max_level,
         "title": row.title,
-        "url": row.url,
+        "url": _safe_url(row.url),
         "source": row.source,
         "source_name": source_name(row.source),
         "source_count": row.source_count,
@@ -85,7 +119,7 @@ async def timeline(
     include_c: bool = False,
     limit: int = 200,
 ) -> list[dict[str, Any]]:
-    """首页时间线：按代表事件的发生时间倒序"""
+    """首页时间线：按代表事件的发生时间倒序，发生时间相同时按簇 id 倒序（顺序稳定）"""
     stmt, rep = _cluster_select()
     if category:
         stmt = stmt.where(event_clusters.c.category == category)
@@ -97,18 +131,18 @@ async def timeline(
         stmt = stmt.where(
             exists().where(events.c.cluster_id == event_clusters.c.id, events.c.assets.contains([asset]))
         )
-    stmt = stmt.order_by(rep.c.occurred_at.desc()).limit(limit)
+    stmt = stmt.order_by(rep.c.occurred_at.desc(), event_clusters.c.id.desc()).limit(limit)
     async with engine.connect() as conn:
         rows = (await conn.execute(stmt)).all()
     return [_to_dict(row, freshness) for row in rows]
 
 
 async def cluster_rows(engine: AsyncEngine, cluster_ids: list[int], *, freshness: FreshnessLookup) -> list[dict[str, Any]]:
-    """指定簇的时间线行（用于 SSE 增量更新），按代表事件发生时间倒序"""
+    """指定簇的时间线行（用于 SSE 增量更新），排序规则与 timeline 一致"""
     if not cluster_ids:
         return []
     stmt, rep = _cluster_select()
-    stmt = stmt.where(event_clusters.c.id.in_(cluster_ids)).order_by(rep.c.occurred_at.desc())
+    stmt = stmt.where(event_clusters.c.id.in_(cluster_ids)).order_by(rep.c.occurred_at.desc(), event_clusters.c.id.desc())
     async with engine.connect() as conn:
         rows = (await conn.execute(stmt)).all()
     return [_to_dict(row, freshness) for row in rows]

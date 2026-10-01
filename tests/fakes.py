@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import socket
+from typing import Callable
+
 from tidewatch.notify.base import EventCard, Notifier, SendResult
 
 
@@ -31,8 +35,6 @@ class FakeNotifier(Notifier):
         self.health.append((source, healthy, detail))
         return self._next()
 
-
-import asyncio
 
 from tidewatch.models import FetchResult
 
@@ -74,3 +76,20 @@ class FakeSleep:
         self.delays.append(seconds)
         if len(self.delays) >= self.stop_after:
             raise asyncio.CancelledError
+
+
+def free_port() -> int:
+    """取一个当前空闲的本机端口（供真实 uvicorn 的测试使用）"""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+async def wait_until(predicate: Callable[[], bool], timeout: float = 5.0) -> None:
+    """轮询等待条件成立；超时抛 TimeoutError，避免测试挂起"""
+
+    async def poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.02)
+
+    await asyncio.wait_for(poll(), timeout)

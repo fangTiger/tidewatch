@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 
 from tidewatch.models import Event, FetchResult
-from tidewatch.pipeline.sink import create_event_sink
+from tidewatch.pipeline.sink import IngestOutcome, create_event_sink
 from tidewatch.web.broadcaster import Broadcaster
 from tidewatch.web.live import LiveUpdates
 
@@ -99,3 +99,74 @@ async def test_broadcaster_close_with_full_queue():
 
     received = await asyncio.wait_for(drain(), timeout=2)  # 迭代必须结束而不是挂起
     assert received and received[-1] == 3 and len(received) <= 2  # 容量 2：最多剩两条消息，结束标记不占消息
+
+
+class _FlakyRows:
+    """替换 cluster_rows：前 fail_times 次调用抛异常，之后返回每个簇一行"""
+
+    def __init__(self, fail_times: int) -> None:
+        self.fail_times = fail_times
+        self.calls: list[list[int]] = []
+
+    async def __call__(self, engine, cluster_ids, *, freshness):
+        self.calls.append(list(cluster_ids))
+        if len(self.calls) <= self.fail_times:
+            raise ConnectionError("数据库暂时不可用")
+        return [{"cluster_id": cid, "title": f"簇 {cid}"} for cid in cluster_ids]
+
+
+async def _collect(agen, count: int) -> list[dict]:
+    return [await _next(agen) for _ in range(count)]
+
+
+async def test_process_once_requeues_batch_on_query_failure(settings, monkeypatch):
+    """查询失败时这批簇放回队列再抛出；之后重试成功仍会发布，不丢更新"""
+    flaky = _FlakyRows(fail_times=1)
+    monkeypatch.setattr("tidewatch.web.live.cluster_rows", flaky)
+    broadcaster = Broadcaster()
+    live = LiveUpdates(None, broadcaster, settings)
+    agen = broadcaster.subscribe()
+    first = asyncio.create_task(_next(agen))
+    while broadcaster.subscriber_count == 0:
+        await asyncio.sleep(0)
+    live.on_ingest(IngestOutcome(collector="jin10", event_ids=[1, 2], cluster_ids=[7, 5]))
+    live.on_ingest(IngestOutcome(collector="jin10", event_ids=[3], cluster_ids=[9]))
+    assert json.loads((await first)["data"]) == {"event_ids": [1, 2]}
+    assert json.loads((await _next(agen))["data"]) == {"event_ids": [3]}
+    with pytest.raises(ConnectionError):
+        await live.process_once()
+    await live.process_once()  # 第二次成功：第一次失败的整批簇都发布出来
+    assert flaky.calls == [[5, 7, 9], [5, 7, 9]]
+    rows = [json.loads(m["data"]) for m in await _collect(agen, 3)]
+    assert [r["cluster_id"] for r in rows] == [5, 7, 9]
+    await agen.aclose()
+
+
+async def test_run_retries_after_failure_with_delay(settings, monkeypatch):
+    """run() 捕获查询异常后先等待 1 秒（sleep 可注入）再继续，且失败的批次随后被重试发布"""
+    flaky = _FlakyRows(fail_times=2)
+    monkeypatch.setattr("tidewatch.web.live.cluster_rows", flaky)
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await asyncio.sleep(0)
+
+    broadcaster = Broadcaster()
+    live = LiveUpdates(None, broadcaster, settings, sleep=fake_sleep)
+    agen = broadcaster.subscribe()
+    first = asyncio.create_task(_next(agen))
+    while broadcaster.subscriber_count == 0:
+        await asyncio.sleep(0)
+    runner = asyncio.create_task(live.run())
+    try:
+        live.on_ingest(IngestOutcome(collector="jin10", event_ids=[1], cluster_ids=[4]))
+        await first  # event.created
+        updated = json.loads((await _next(agen))["data"])
+        assert updated == {"cluster_id": 4, "title": "簇 4"}
+        assert sleeps == [1, 1]  # 两次失败各等待 1 秒，而不是空转
+        assert flaky.calls == [[4], [4], [4]]
+    finally:
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        await agen.aclose()

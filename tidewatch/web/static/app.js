@@ -18,18 +18,21 @@
   if (table) {
     source.addEventListener("cluster.updated", async (e) => {
       const row = JSON.parse(e.data);
-      const existing = document.getElementById("c" + row.cluster_id);
       if (!matches(row)) {
-        if (existing) existing.remove();
+        const gone = document.getElementById("c" + row.cluster_id);
+        if (gone) gone.remove();
         return;
       }
       const resp = await fetch("/fragment/cluster/" + row.cluster_id);
       if (!resp.ok) return;
+      const html = (await resp.text()).trim();
       const holder = document.createElement("tbody");
-      holder.innerHTML = (await resp.text()).trim();
+      holder.innerHTML = html;
       const fresh = holder.firstElementChild;
       if (!fresh) return;
       fresh.classList.add("flash");
+      // 必须在 await 之后再查找已有行：等待期间并发的同簇事件可能已经插入了这一行，否则会出现重复行
+      const existing = document.getElementById("c" + row.cluster_id);
       if (existing) {
         existing.replaceWith(fresh);
         return;
@@ -37,8 +40,12 @@
       const body = table.tBodies[0];
       const empty = body.querySelector("tr.empty");
       if (empty) empty.remove();
-      // 按发生时间倒序插入
-      const before = Array.from(body.rows).find((r) => r.dataset.ts < row.occurred_at);
+      // 按发生时间倒序插入；发生时间相同时按簇 id 倒序（与服务端排序一致）
+      const ts = fresh.dataset.ts;
+      const cid = Number(fresh.dataset.cid);
+      const before = Array.from(body.rows).find(
+        (r) => r.dataset.ts < ts || (r.dataset.ts === ts && Number(r.dataset.cid) < cid)
+      );
       body.insertBefore(fresh, before || null);
     });
   }

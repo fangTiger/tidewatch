@@ -3,7 +3,6 @@ import gc
 import logging
 import os
 import signal
-import socket
 import time
 from types import SimpleNamespace
 
@@ -11,6 +10,7 @@ import httpx
 import pytest
 
 import tidewatch.app as app_module
+from fakes import free_port, wait_until
 from tidewatch.app import Application, parse_args, run
 from tidewatch.collectors.binance_ann import BinanceAnnPoll, BinanceAnnStream
 from tidewatch.collectors.jin10 import Jin10Collector
@@ -59,28 +59,12 @@ async def test_start_and_stop_cleanly(engine, settings):
 # ---------- 启动失败与部分启动 ----------
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-async def _wait_until(predicate, timeout: float = 5.0) -> None:
-    """轮询等待条件成立；超时抛 TimeoutError，避免测试挂起"""
-
-    async def poll() -> None:
-        while not predicate():
-            await asyncio.sleep(0.02)
-
-    await asyncio.wait_for(poll(), timeout)
-
-
 async def _start_web(settings) -> tuple[Application, str]:
     """在空闲端口上启动只含网站的应用，等到 uvicorn 完成启动后返回应用与基础地址"""
-    settings.web.port = _free_port()
+    settings.web.port = free_port()
     app = Application(settings, groups={"web"}, dry_run=True)
     await app.start()
-    await _wait_until(lambda: app._server.started)  # 启动失败时超时报错，不会挂起
+    await wait_until(lambda: app._server.started)  # 启动失败时超时报错，不会挂起
     return app, f"http://127.0.0.1:{settings.web.port}"
 
 
@@ -193,7 +177,7 @@ async def test_stop_ends_sse_streams_cleanly(engine, settings, caplog):
         async with httpx.AsyncClient(base_url=base, timeout=5) as http:
             async with http.stream("GET", "/stream") as response:
                 assert response.status_code == 200
-                await _wait_until(lambda: app.broadcaster.subscriber_count == 1)
+                await wait_until(lambda: app.broadcaster.subscriber_count == 1)
                 with caplog.at_level(logging.INFO):
                     started = time.monotonic()
                     await asyncio.wait_for(app.stop(), timeout=3)
@@ -209,10 +193,10 @@ async def test_stop_ends_sse_streams_cleanly(engine, settings, caplog):
 
 async def test_run_exits_zero_on_sigterm(engine, settings):
     """收到 SIGTERM 后 run() 正常退出并返回 0（只有信号处理器装好后才发送信号，避免杀掉测试进程）"""
-    settings.web.port = _free_port()
+    settings.web.port = free_port()
     task = asyncio.create_task(run(settings, groups={"web"}, dry_run=True))
     try:
-        await _wait_until(lambda: signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN, None))
+        await wait_until(lambda: signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN, None))
         await asyncio.sleep(0.3)  # 让应用完成启动
         os.kill(os.getpid(), signal.SIGTERM)
         assert await asyncio.wait_for(task, timeout=10) == 0

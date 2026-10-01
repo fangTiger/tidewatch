@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -15,12 +15,23 @@ from tidewatch.web.queries import cluster_rows
 
 logger = logging.getLogger(__name__)
 
+# 刷新失败（如数据库故障）后的等待时间，避免故障期间空转
+RETRY_DELAY_S = 1
+
 
 class LiveUpdates:
-    def __init__(self, engine: AsyncEngine, broadcaster: Broadcaster, settings: Any) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        broadcaster: Broadcaster,
+        settings: Any,
+        *,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
         self._engine = engine
         self._broadcaster = broadcaster
         self._freshness = freshness_from_settings(settings)
+        self._sleep = sleep
         self._pending: asyncio.Queue[list[int]] = asyncio.Queue()
 
     def on_ingest(self, outcome: IngestOutcome) -> None:
@@ -32,11 +43,18 @@ class LiveUpdates:
         self._broadcaster.publish("health.changed", payload)
 
     async def process_once(self) -> None:
-        """处理队列中所有待刷新的簇"""
+        """处理队列中所有待刷新的簇；查询失败时把这批簇放回队列再抛出，下次重试时不丢更新"""
         ids: set[int] = set()
         while not self._pending.empty():
             ids.update(self._pending.get_nowait())
-        for row in await cluster_rows(self._engine, sorted(ids), freshness=self._freshness):
+        batch = sorted(ids)
+        try:
+            rows = await cluster_rows(self._engine, batch, freshness=self._freshness)
+        except Exception:
+            if batch:
+                self._pending.put_nowait(batch)
+            raise
+        for row in rows:
             self._broadcaster.publish("cluster.updated", row)
 
     async def run(self) -> None:
@@ -45,4 +63,5 @@ class LiveUpdates:
             try:
                 await self.process_once()
             except Exception:
-                logger.exception("实时更新失败")
+                logger.exception("实时更新失败，%s 秒后重试", RETRY_DELAY_S)
+                await self._sleep(RETRY_DELAY_S)
