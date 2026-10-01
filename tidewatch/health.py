@@ -4,7 +4,11 @@
 - 告警只有在通知器确认发送成功后才算「已告警」并记录告警时间（限流据此计算）；
   发送失败或抛异常只记录日志，不影响采集器，下一次失败或下一次超时检查时会再次尝试
 - 只有成功发出过告警的异常，恢复时才发送恢复通知
-- 超时按「上次成功」与「登记时刻」中较晚者起算，避免重启、电脑唤醒后立即误报
+- 超时按「上次成功」与「登记时刻」中较晚者起算，避免重启后因很早以前的成功记录立即误报
+- 电脑休眠/唤醒：采集器在休眠期间不可能有成功请求，唤醒后若直接检查会全部误报。run() 记录上一轮检查的时刻，
+  发现两轮间隔远超检查周期（> 3 倍）就认为系统休眠过，把所有非异常采集器的登记时刻重置为当前时刻再检查；
+  这个判断只在 run() 里，check_stale() 本身按时钟如实计算超时
+- 重启后：已异常但此前没有成功发出过告警（last_alert_at 为空）的采集器，会在下一次检查时补发告警
 - success / failure / check_stale / set_mode 的状态转换由同一把锁串行化
 """
 
@@ -29,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 FAILURE_THRESHOLD = 5
 CHECK_INTERVAL_S = 30
+# 两轮检查的间隔超过检查周期的这么多倍，就认为系统休眠或进程被暂停过
+SLEEP_GAP_FACTOR = 3
 
 HealthListener = Callable[[dict[str, Any]], None]
 
@@ -94,7 +100,8 @@ class HealthMonitor:
             state.last_success = row["last_success_at"]
             state.failures = row["consecutive_failures"] or 0
             state.last_error = row["last_error"]
-            state.alerted = state.status == "abnormal"
+            # 只有告警确实发出过（有告警时间）才算已告警；否则重启后由 check_stale 补发
+            state.alerted = state.status == "abnormal" and row["last_alert_at"] is not None
 
     async def set_mode(self, name: str, mode: str) -> None:
         """记录运行模式（normal / degraded），例如币安公告无 API Key 时为 degraded"""
@@ -156,13 +163,28 @@ class HealthMonitor:
                     await self._change(name, "abnormal", f"超过 {int(state.stale_after_s)} 秒没有成功请求")
 
     async def run(self) -> None:
-        """后台循环：定期检查超时"""
+        """后台循环：定期检查超时；检测到系统休眠/暂停后先重新计时再检查，避免唤醒后集体误报"""
+        last_check = self._clock()
         while True:
             await self._sleep(CHECK_INTERVAL_S)
             try:
+                now = self._clock()
+                gap = (now - last_check).total_seconds()
+                if gap > SLEEP_GAP_FACTOR * CHECK_INTERVAL_S:
+                    logger.info("检测到系统休眠或暂停约 %d 秒，重新计算超时", gap)
+                    await self._restart_timeouts(now)
                 await self.check_stale()
             except Exception:
                 logger.exception("健康检查失败")
+            finally:
+                last_check = self._clock()
+
+    async def _restart_timeouts(self, now: datetime) -> None:
+        """把所有非异常采集器的登记时刻重置为 now：休眠期间没有成功请求不算采集器的问题"""
+        async with self._lock:
+            for state in self._states.values():
+                if state.status != "abnormal":
+                    state.registered_at = now
 
     async def _change(self, name: str, status: str, detail: str) -> None:
         """状态转换（调用方须已持有锁）：持久化、通知监听者，并按需发送告警或恢复通知"""

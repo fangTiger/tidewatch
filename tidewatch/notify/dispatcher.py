@@ -95,11 +95,18 @@ class Dispatcher:
             self._queue.put_nowait(push_id)
 
     def cancel(self, push_ids: list[int]) -> None:
-        """标记被取代的推送：不再发送，并从汇总缓冲移除"""
-        self._cancelled.update(push_ids)
-        removed = [i for i in self._digest if i in self._cancelled]
-        self._digest = [i for i in self._digest if i not in self._cancelled]
-        self._tracked.difference_update(removed)
+        """处理被取代的推送：不再发送
+
+        - 在汇总缓冲中：直接移除并解除跟踪，不留标记
+        - 仍在发送队列或发送中（已跟踪）：记入 _cancelled，处理到它时丢弃（处理结束后清除标记）
+        - 未被跟踪：不记录——数据库中它已是 superseded，重试循环不会再取到，记下来只会让集合无限增长
+        """
+        for push_id in push_ids:
+            if push_id in self._digest:
+                self._digest.remove(push_id)
+                self._tracked.discard(push_id)
+            elif push_id in self._tracked:
+                self._cancelled.add(push_id)
 
     @property
     def digest_size(self) -> int:
@@ -215,6 +222,7 @@ class Dispatcher:
         finally:
             if not keep:
                 self._tracked.discard(push_id)
+                self._cancelled.discard(push_id)  # 处理结束后标记不再有用（发送期间被取代的也在此清除）
 
     def _take_a_slot(self) -> bool:
         """A 级滑动窗口：窗口内已单独发送的数量未达上限时占用一个名额"""
@@ -253,8 +261,8 @@ class Dispatcher:
 
     async def flush_digest(self) -> None:
         """把汇总缓冲中的 A 级推送合并为一条消息发送（每条最多 DIGEST_MAX 个，其余留到下一轮）"""
-        ids = [i for i in self._digest if i not in self._cancelled][:DIGEST_MAX]
-        self._digest = [i for i in self._digest if i not in ids and i not in self._cancelled]
+        ids = self._digest[:DIGEST_MAX]  # 被取代的推送在 cancel() 时已从缓冲移除
+        self._digest = self._digest[DIGEST_MAX:]
         try:
             now = self._clock()
             items = []
@@ -262,6 +270,7 @@ class Dispatcher:
                 pending = await self._load(push_id)
                 if pending is not None and pending.status in OPEN_STATUSES and pending.retry_until > now:
                     items.append(pending)
+            items = [p for p in items if p.push_id not in self._cancelled]  # 加载期间可能被新事件取代
             if not items:
                 return
             result = await self._send_with_retry(lambda: self._notifier.send_digest([p.card for p in items]))
@@ -271,7 +280,9 @@ class Dispatcher:
             for pending in items:
                 await self._sink.push_result(pending.push_id, status, response=result.detail, batch_id=batch_id)
         finally:
-            self._tracked.difference_update(ids)  # 异常中断的记录仍是 pending，由 retry_failed 找回
+            # 异常中断的记录仍是 pending，由 retry_failed 找回
+            self._tracked.difference_update(ids)
+            self._cancelled.difference_update(ids)
 
     async def retry_failed(self) -> None:
         """定时维护：过期记录标为 expired；重发 failed 记录；找回因异常遗漏的 pending 记录

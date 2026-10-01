@@ -458,3 +458,62 @@ async def test_start_creates_tasks_even_if_recovery_fails(engine, sink, settings
         await _wait_status(engine, [new_id], "ok")
     finally:
         await asyncio.wait_for(dispatcher.stop(), 5)
+
+
+# ---------- cancel 的跟踪语义 ----------
+
+
+async def test_cancel_untracked_id_is_not_remembered(engine, sink, settings, clock):
+    """未跟踪的 id（数据库中已是 superseded，重试循环不会再取到）不加入 _cancelled，避免集合无限增长"""
+    dispatcher = _dispatcher(engine, sink, settings, clock, FakeNotifier())
+    dispatcher.cancel([12345, 67890])
+    assert dispatcher._cancelled == set() and dispatcher._tracked == set()
+
+
+async def test_cancel_digest_id_untracks_and_leaves_no_mark(engine, sink, settings, clock):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    ids = await _seed(engine, clock, "A", 12)
+    dispatcher.enqueue(ids)
+    await dispatcher.process_pending()
+    assert dispatcher.digest_size == 2
+    dispatcher.cancel([ids[10]])  # 汇总缓冲中的：直接移除
+    assert dispatcher._cancelled == set() and ids[10] not in dispatcher._tracked
+    assert ids[11] in dispatcher._tracked and dispatcher.digest_size == 1
+    await dispatcher.flush_digest()
+    assert [[c.push_id for c in cards] for cards in notifier.digests] == [[ids[11]]]
+    assert dispatcher._tracked == set() and dispatcher._cancelled == set()
+
+
+async def test_cancel_queued_id_keeps_mark_until_handled(engine, sink, settings, clock):
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    [queued, other] = await _seed(engine, clock, "S", 2)
+    dispatcher.enqueue([queued, other])
+    dispatcher.cancel([queued, 424242])  # 一个在发送队列中，一个未被跟踪
+    assert dispatcher._cancelled == {queued}
+    await dispatcher.process_pending()
+    assert [card.push_id for card, _ in notifier.events] == [other]  # 队列中被取代的不发送
+    assert dispatcher._cancelled == set() and dispatcher._tracked == set()
+
+
+async def test_cancel_during_flush_not_sent_and_no_leftover(engine, sink, settings, clock):
+    """汇总发送过程中（已从缓冲取出、正在加载）被取代的推送不发送，也不遗留标记"""
+    notifier = FakeNotifier()
+    dispatcher = _dispatcher(engine, sink, settings, clock, notifier)
+    ids = await _seed(engine, clock, "A", 13)
+    dispatcher.enqueue(ids)
+    await dispatcher.process_pending()
+    assert dispatcher.digest_size == 3
+    original_load = dispatcher._load
+
+    async def load_then_cancel(push_id: int):
+        pending = await original_load(push_id)
+        if push_id == ids[10]:
+            dispatcher.cancel([ids[11]])  # 加载第一条期间，第二条被新事件取代
+        return pending
+
+    dispatcher._load = load_then_cancel
+    await dispatcher.flush_digest()
+    assert [[c.push_id for c in cards] for cards in notifier.digests] == [[ids[10], ids[12]]]
+    assert dispatcher._tracked == set() and dispatcher._cancelled == set()

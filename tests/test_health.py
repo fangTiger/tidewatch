@@ -326,3 +326,100 @@ async def test_check_stale_tolerates_registration_during_iteration(engine, setti
     clock.advance(seconds=301)
     await monitor.check_stale()  # 遍历期间字典变化不能抛 RuntimeError
     assert monitor.status("jin10") == "abnormal" and monitor.status("okx_ann") == "unknown"
+
+
+# ---------- 重启恢复：告警未送达的异常要补发 ----------
+
+
+async def test_load_resends_alert_that_never_succeeded(engine, settings, clock):
+    """重启前异常告警没有成功发出（last_alert_at 为空）：重启后在下一次检查时补发"""
+    notifier = FakeNotifier([SendResult(False, detail="HTTP 500")])  # 第一次告警发送失败
+    first = _monitor(engine, settings, clock, notifier)
+    for _ in range(5):
+        await first.failure("jin10", "超时")
+    assert (await _row(engine))["status"] == "abnormal" and (await _row(engine))["last_alert_at"] is None
+    restarted = _monitor(engine, settings, clock, notifier)  # 模拟进程重启
+    await restarted.load()
+    assert restarted.status("jin10") == "abnormal"
+    await restarted.check_stale()
+    assert [ok for _, ok, _ in notifier.health] == [False, False]  # 补发了告警
+    assert (await _row(engine))["last_alert_at"] == clock.now
+    await restarted.check_stale()
+    assert len(notifier.health) == 2  # 补发成功后不再重复
+    await restarted.success("jin10")
+    assert [ok for _, ok, _ in notifier.health] == [False, False, True]  # 告警送达过，恢复时发恢复通知
+
+
+async def test_load_does_not_resend_alert_already_delivered(engine, settings, clock):
+    notifier = FakeNotifier()
+    first = _monitor(engine, settings, clock, notifier)
+    for _ in range(5):
+        await first.failure("jin10", "超时")
+    assert len(notifier.health) == 1
+    restarted = _monitor(engine, settings, clock, notifier)
+    await restarted.load()
+    await restarted.check_stale()
+    assert len(notifier.health) == 1  # 已经告警过：重启后不重复告警
+
+
+# ---------- 休眠/唤醒 ----------
+
+
+def _run_monitor(engine, settings, clock, notifier, steps: list[dict]) -> tuple[HealthMonitor, dict]:
+    """构造一个 run() 由注入的 sleep 驱动的监控器：第 n 次 sleep 把时钟拨动 steps[n]，用完后抛 CancelledError 结束循环"""
+    state = {"calls": 0}
+
+    async def fake_sleep(seconds: float) -> None:
+        if state["calls"] >= len(steps):
+            raise asyncio.CancelledError
+        clock.advance(**steps[state["calls"]])
+        state["calls"] += 1
+
+    monitor = HealthMonitor(engine, notifier, settings.dispatch, clock=clock, sleep=fake_sleep)
+    monitor.register("jin10", stale_after_s=300)
+    return monitor, state
+
+
+async def test_run_does_not_alert_after_system_sleep(engine, settings, clock, caplog):
+    """两轮检查间隔远大于检查周期（电脑休眠后唤醒）：重新计算超时，而不是误报异常"""
+    notifier = FakeNotifier()
+    monitor, state = _run_monitor(engine, settings, clock, notifier, [{"seconds": 30}, {"hours": 8}])
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(monitor.run(), timeout=5)
+    assert state["calls"] == 2
+    assert monitor.status("jin10") == "unknown" and notifier.health == []
+    assert any("检测到系统休眠或暂停约 28800 秒，重新计算超时" in r.getMessage() for r in caplog.records)
+
+
+async def test_run_still_detects_real_outage_after_sleep(engine, settings, clock):
+    """休眠唤醒后的重新计时不会让真正的故障漏报：唤醒后正常间隔下继续没有成功请求，超时后照常告警"""
+    notifier = FakeNotifier()
+    steps = [{"hours": 8}] + [{"seconds": 30}] * 11  # 唤醒后又过了 330 秒（> stale_after 300）
+    monitor, state = _run_monitor(engine, settings, clock, notifier, steps)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(monitor.run(), timeout=5)
+    assert state["calls"] == 12
+    assert monitor.status("jin10") == "abnormal" and [ok for _, ok, _ in notifier.health] == [False]
+
+
+async def test_run_sleep_reset_skips_abnormal_collectors(engine, settings, clock):
+    """休眠重置只作用于非异常的采集器；已经异常的保持异常，未送达的告警照常补发"""
+    notifier = FakeNotifier([SendResult(False, detail="HTTP 500")])
+    monitor, _ = _run_monitor(engine, settings, clock, notifier, [{"hours": 8}])
+    for _ in range(5):
+        await monitor.failure("jin10", "超时")  # 进入异常，首次告警发送失败
+    assert len(notifier.health) == 1
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(monitor.run(), timeout=5)
+    assert monitor.status("jin10") == "abnormal"
+    assert [ok for _, ok, _ in notifier.health] == [False, False]
+
+
+async def test_check_stale_itself_does_not_treat_clock_jump_as_sleep(engine, settings, clock):
+    """休眠检测只在 run() 里：直接调用 check_stale() 时大幅拨动时钟仍按超时处理"""
+    notifier = FakeNotifier()
+    monitor = _monitor(engine, settings, clock, notifier)
+    clock.advance(hours=8)
+    await monitor.check_stale()
+    assert monitor.status("jin10") == "abnormal"
