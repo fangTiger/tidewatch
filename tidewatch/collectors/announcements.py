@@ -9,18 +9,22 @@ from datetime import datetime, timezone
 
 from tidewatch.pipeline.normalize import normalize_title
 
-_PERP_WORDS = ("perpetual", "futures", "perp", "swap")
+# 合约关键词按单词边界匹配：避免 Uniswap、PancakeSwap、SushiSwap 这类币名里的 swap 被当成合约
+_PERP_RE = re.compile(r"\b(?:perps?|perpetuals?|futures?|swaps?)\b", re.IGNORECASE)
 _LISTING_WORDS = ("will list", "to list", "will launch", "lists ", "listing of")
 _SUSPEND_WORDS = ("suspend", "suspension", "cease", "halt", "close")
+# 出现这些词说明是恢复/重新开放类公告，不算暂停充提
+_RESTORE_WORDS = ("resum", "reopen", "enabl", "restor", "complet")
 
 _PAREN = re.compile(r"\(([A-Z0-9]{2,15})\)")
-_TOKEN = re.compile(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{1,14})(?![A-Za-z0-9])")
+# 币种代码可以数字开头（1INCH、1000PEPE）；纯数字（日期等）在 extract_symbols 中过滤
+_TOKEN = re.compile(r"(?<![A-Za-z0-9])([A-Z0-9][A-Z0-9]{1,14})(?![A-Za-z0-9])")
 _QUOTE_SUFFIXES = ("USDT", "USDC", "USD")
 # 常见的非币种大写词（交易所名、法币、术语）
 _STOP = {
     "OKX", "USD", "USDT", "USDC", "USDS", "API", "P2P", "NFT", "VIP", "UTC", "ETF", "FAQ", "KYC", "APR",
     "APY", "CEX", "DEX", "AMA", "OTC", "UAH", "EUR", "TRY", "BRL", "JPY", "IDR", "NGN", "ARS", "RUB",
-    "GBP", "AUD", "PERP", "WEB3", "UID", "IPO",
+    "GBP", "AUD", "PERP", "WEB3", "UID", "IPO", "FDUSD", "PYUSD", "SWAP",
 }
 
 
@@ -34,7 +38,8 @@ def classify(title: str, hint: str | None) -> str:
         spot_listing / perp_listing / delisting / perp_delisting / deposit_withdraw_suspend / other
     """
     lowered = title.lower()
-    perp = any(word in lowered for word in _PERP_WORDS)
+    perp = _PERP_RE.search(title) is not None
+    restore = any(word in lowered for word in _RESTORE_WORDS)
     if hint == "delisting":
         return "perp_delisting" if perp else "delisting"
     if hint == "listing":
@@ -42,21 +47,26 @@ def classify(title: str, hint: str | None) -> str:
             return "perp_listing" if perp else "spot_listing"
         return "other"
     if hint == "suspension":
-        return "other" if "resum" in lowered else "deposit_withdraw_suspend"
+        return "other" if restore else "deposit_withdraw_suspend"
     is_suspend = (
         ("deposit" in lowered or "withdraw" in lowered)
         and any(word in lowered for word in _SUSPEND_WORDS)
-        and "resum" not in lowered
+        and not restore
     )
     return "deposit_withdraw_suspend" if is_suspend else "other"
 
 
 def extract_symbols(title: str) -> list[str]:
-    """从英文标题中提取币种代码：优先取括号内代码，否则取大写词并去掉 USDT/USDC/USD 后缀"""
+    """从英文标题中提取币种代码：优先取括号内代码，否则取大写词并去掉 USDT/USDC/USD 后缀
+
+    代码可以数字开头（1INCH、1000PEPEUSDT → 1000PEPE）；纯数字、停用词（交易所名、法币、稳定币、术语）不算币种。
+    """
     text = unicodedata.normalize("NFKC", title)
     found = _PAREN.findall(text)
     if not found:
         for token in _TOKEN.findall(text):
+            if token in _STOP:  # 先排除停用词再去后缀：FDUSD、PYUSD 以 USD 结尾，去后缀后会变成 FD、PY
+                continue
             for suffix in _QUOTE_SUFFIXES:
                 if token.endswith(suffix) and len(token) > len(suffix) + 1:
                     token = token[: -len(suffix)]
