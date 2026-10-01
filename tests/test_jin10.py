@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import httpx
 import pytest
 import respx
 
+from tidewatch.collectors import jin10
 from tidewatch.collectors.jin10 import JIN10_URL, Jin10Collector, parse_item
 
 PAGE1 = json.loads((Path(__file__).parent / "fixtures" / "jin10" / "flash_page1.json").read_text(encoding="utf-8"))
@@ -70,3 +72,85 @@ async def test_bad_status_raises(settings):
     respx.get(JIN10_URL).mock(return_value=httpx.Response(200, json={"status": 500, "message": "错误", "data": []}))
     with pytest.raises(RuntimeError):
         await _collector(settings).fetch(None)
+
+
+def _item(item_id: str, time: str) -> dict:
+    return {"id": item_id, "time": time, "type": 0, "important": 0, "data": {"content": f"快讯{item_id}"}}
+
+
+@respx.mock
+async def test_events_sorted_by_time_then_dedupe_key(settings):
+    page = {"status": 200, "data": [  # 接口按时间倒序返回，同一秒的条目 id 乱序
+        _item("20260930104000000003", "2026-09-30 10:40:00"),
+        _item("20260930104000000001", "2026-09-30 10:40:00"),
+        _item("20260930103000000000", "2026-09-30 10:30:00"),
+        _item("20260930104000000002", "2026-09-30 10:40:00"),
+    ]}
+    respx.get(JIN10_URL).mock(return_value=httpx.Response(200, json=page))
+    result = await _collector(settings).fetch(None)
+    assert [e.dedupe_key for e in result.events] == [
+        "jin10:20260930103000000000", "jin10:20260930104000000001",
+        "jin10:20260930104000000002", "jin10:20260930104000000003",
+    ]
+
+
+@respx.mock
+async def test_fixture_events_sorted_ascending(settings):
+    respx.get(JIN10_URL).mock(return_value=httpx.Response(200, json=PAGE1))
+    events = (await _collector(settings).fetch(None)).events
+    times = [e.occurred_at for e in events]
+    assert times == sorted(times) and times[0] < times[-1]
+
+
+@respx.mock
+async def test_overlapping_pages_do_not_duplicate_events(settings):
+    # 翻页时 max_time 多取 1 秒，第二页会与第一页重叠（这里重叠第一页最后一条）
+    overlap = PAGE1["data"][-1]
+    page2 = {"status": 200, "data": [
+        overlap,
+        _item("20260930103000000000", "2026-09-30 10:30:00"),
+        _item("20260930100000000000", "2026-09-30 10:00:00"),  # 游标
+    ]}
+    route = respx.get(JIN10_URL).mock(side_effect=[httpx.Response(200, json=PAGE1), httpx.Response(200, json=page2)])
+    result = await _collector(settings).fetch({"last_id": "20260930100000000000"})
+    keys = [e.dedupe_key for e in result.events]
+    assert route.call_count == 2
+    assert len(keys) == len(set(keys)) == 21
+
+
+@respx.mock
+async def test_page_limit_logs_warning(settings, monkeypatch, caplog):
+    monkeypatch.setattr(jin10, "MAX_PAGES", 2)
+    page2 = {"status": 200, "data": [_item("20260930103000000001", "2026-09-30 10:30:00"),
+                                     _item("20260930103000000002", "2026-09-30 10:29:00")]}
+    respx.get(JIN10_URL).mock(side_effect=[httpx.Response(200, json=PAGE1), httpx.Response(200, json=page2)])
+    with caplog.at_level(logging.WARNING, logger="tidewatch.collectors.jin10"):
+        result = await _collector(settings).fetch({"last_id": "20260930000000000000"})
+    assert len(result.events) == 22  # 翻到上限为止的条目仍然返回
+    assert any(r.levelno == logging.WARNING and "翻页" in r.getMessage() and "2" in r.getMessage() for r in caplog.records)
+
+
+@respx.mock
+async def test_no_page_limit_warning_when_cursor_reached(settings, caplog):
+    older = {"status": 200, "data": [_item("20260930100000000000", "2026-09-30 10:00:00")]}
+    respx.get(JIN10_URL).mock(side_effect=[httpx.Response(200, json=PAGE1), httpx.Response(200, json=older)])
+    with caplog.at_level(logging.WARNING, logger="tidewatch.collectors.jin10"):
+        await _collector(settings).fetch({"last_id": "20260930100000000000"})
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_parse_item_error_mentions_item_id():
+    bad = {"id": "20260930104000000009", "type": 0, "data": {"content": "缺少时间字段"}}
+    with pytest.raises(RuntimeError, match="20260930104000000009"):
+        parse_item(bad)
+
+
+@respx.mock
+@pytest.mark.parametrize("cursor", [None, {"last_id": "20260930100000000000"}])
+async def test_fetch_error_mentions_item_id_when_time_missing(settings, cursor):
+    bad = {"id": "20260930104000000009", "type": 0, "data": {"content": "缺少时间字段"}}
+    # 作为整页最后一条时，翻页逻辑也要读取它的时间
+    page = {"status": 200, "data": [_item("20260930104100000000", "2026-09-30 10:41:00"), bad]}
+    respx.get(JIN10_URL).mock(return_value=httpx.Response(200, json=page))
+    with pytest.raises(RuntimeError, match="20260930104000000009"):
+        await _collector(settings).fetch(cursor)

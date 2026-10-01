@@ -7,11 +7,11 @@ import contextlib
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterator
 
 from tidewatch.clock import Clock, utcnow
 from tidewatch.config import CollectorCfg
-from tidewatch.models import FetchResult
+from tidewatch.models import Event, FetchResult
 from tidewatch.store.repo import load_cursor
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,20 @@ def describe(exc: BaseException) -> str:
     """异常的简短中文可读描述；异常没有消息时（如 TimeoutError）退回 repr，避免只剩类型名与冒号"""
     text = f"{type(exc).__name__}：{exc}" if str(exc) else repr(exc)
     return text[:300]
+
+
+def sort_events(events: list[Event]) -> list[Event]:
+    """按发生时间升序排序，同一时间按去重键排序：保证先发生的事件先入库，结果顺序稳定可复现"""
+    return sorted(events, key=lambda event: (event.occurred_at, event.dedupe_key))
+
+
+@contextlib.contextmanager
+def parse_context(what: str) -> Iterator[None]:
+    """单条数据解析失败时，在异常消息里带上条目标识（id、url 等），否则只能看到 KeyError: 'time' 而无从定位"""
+    try:
+        yield
+    except Exception as exc:
+        raise RuntimeError(f"{what} 解析失败：{describe(exc)}") from exc
 
 
 class TokenBucket:

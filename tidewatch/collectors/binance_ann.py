@@ -19,7 +19,7 @@ from urllib.parse import urlencode
 from websockets.asyncio.client import connect
 
 from tidewatch.collectors.announcements import binance_dedupe_key, classify, extract_symbols
-from tidewatch.collectors.base import PollCollector, StreamCollector
+from tidewatch.collectors.base import PollCollector, StreamCollector, parse_context, sort_events
 from tidewatch.config import CollectorCfg
 from tidewatch.models import Event, FetchResult
 from tidewatch.pipeline.normalize import clean_text
@@ -54,20 +54,36 @@ def _make_event(
     )
 
 
+def _article_label(article: dict[str, Any]) -> str:
+    return f"币安公告 {article.get('code') or article.get('id') or article.get('title')}"
+
+
+def _release_ms(article: dict[str, Any]) -> int:
+    with parse_context(_article_label(article)):
+        return int(article["releaseDate"])
+
+
 def parse_article(article: dict[str, Any], catalog_id: int) -> Event:
-    """列表接口的一篇公告 → 事件"""
-    return _make_event(
-        article["title"],
-        _published(article["releaseDate"]),
-        catalog_id,
-        url=f"https://www.binance.com/en/support/announcement/{article['code']}",
-        extra={"code": article.get("code")},
-    )
+    """列表接口的一篇公告 → 事件；解析失败时异常消息带上公告 code"""
+    with parse_context(_article_label(article)):
+        return _make_event(
+            article["title"],
+            _published(article["releaseDate"]),
+            catalog_id,
+            url=f"https://www.binance.com/en/support/announcement/{article['code']}",
+            extra={"code": article.get("code")},
+        )
 
 
 def parse_ws_message(raw: str | bytes) -> Event | None:
-    """WS 消息 → 事件；订阅确认等非数据消息返回 None"""
+    """WS 消息 → 事件
+
+    订阅确认（COMMAND/SUCCESS）等非数据消息返回 None；
+    命令被拒绝（COMMAND 且结果不是 SUCCESS，如 API Key 无效）抛 RuntimeError，让采集器报失败并重连。
+    """
     message = json.loads(raw)
+    if message.get("type") == "COMMAND" and message.get("data") != "SUCCESS":
+        raise RuntimeError(f"币安公告 WS 返回错误：{message.get('data')}（{message.get('subType')}）")
     if message.get("type") != "DATA":
         return None
     data = message.get("data")
@@ -76,14 +92,15 @@ def parse_ws_message(raw: str | bytes) -> Event | None:
     if not data or not data.get("title"):
         return None
     catalog_id = data.get("catalogId")
-    return _make_event(
-        data["title"],
-        _published(data["publishDate"]),
-        catalog_id,
-        url=f"https://www.binance.com/en/support/announcement/list/{catalog_id}" if catalog_id else None,
-        body=clean_text(data.get("body")),
-        extra={"catalogName": data.get("catalogName")},
-    )
+    with parse_context(f"币安公告 WS 消息 {data['title']}"):
+        return _make_event(
+            data["title"],
+            _published(data["publishDate"]),
+            catalog_id,
+            url=f"https://www.binance.com/en/support/announcement/list/{catalog_id}" if catalog_id else None,
+            body=clean_text(data.get("body")),
+            extra={"catalogName": data.get("catalogName")},
+        )
 
 
 def signed_ws_url(api_secret: str, now_ms: int, nonce: str, *, base_url: str = BINANCE_WS_URL) -> str:
@@ -113,13 +130,13 @@ class _BinanceList:
                 raise RuntimeError(f"币安公告接口返回错误：{payload.get('code')} {payload.get('message')}")
             catalogs = (payload.get("data") or {}).get("catalogs") or []
             for article in (catalogs[0].get("articles") if catalogs else None) or []:
-                published_ms = int(article["releaseDate"])
+                published_ms = _release_ms(article)
                 newest = max(newest, published_ms)
                 # 只按补抓窗口过滤、不按游标过滤：两个栏目共用一个游标，若按游标过滤，
                 # 某栏目延迟出现的较早公告会被永久跳过；重复条目由去重键处理
                 if published_ms >= floor_ms:
                     events.append(parse_article(article, catalog_id))
-        return FetchResult(events, {"last_ms": newest} if newest else None)
+        return FetchResult(sort_events(events), {"last_ms": newest} if newest else None)
 
 
 class BinanceAnnPoll(_BinanceList, PollCollector):
