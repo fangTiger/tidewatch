@@ -194,19 +194,90 @@ async def test_stop_ends_sse_streams_cleanly(engine, settings, caplog):
     assert errors == []
 
 
-async def test_run_exits_zero_on_sigterm(engine, settings):
+async def test_run_exits_zero_on_sigterm(engine, settings, caplog):
     """收到 SIGTERM 后 run() 正常退出并返回 0（只有信号处理器装好后才发送信号，避免杀掉测试进程）"""
     settings.web.port = free_port()
     task = asyncio.create_task(run(settings, groups={"web"}, dry_run=True))
     try:
         await wait_until(lambda: signal.getsignal(signal.SIGTERM) not in (signal.SIG_DFL, signal.SIG_IGN, None))
         await asyncio.sleep(0.3)  # 让应用完成启动
-        os.kill(os.getpid(), signal.SIGTERM)
-        assert await asyncio.wait_for(task, timeout=10) == 0
+        with caplog.at_level(logging.INFO, logger="tidewatch.app"):
+            os.kill(os.getpid(), signal.SIGTERM)
+            assert await asyncio.wait_for(task, timeout=10) == 0
+        assert not any("关键任务" in record.getMessage() for record in caplog.records)
     finally:
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+
+
+# ---------- 关键任务守护 ----------
+
+
+class _CrashingCollector:
+    """启动后立即崩溃的采集器替身。"""
+
+    name = "crashing"
+    cfg = SimpleNamespace(stale_after_s=300)
+    client = None
+
+    async def run(self) -> None:
+        raise RuntimeError("采集器崩溃")
+
+
+def _make_crashing_collector(app: Application):
+    app.health.register(_CrashingCollector.name, _CrashingCollector.cfg.stale_after_s)
+    return [_CrashingCollector()]
+
+
+async def test_run_returns_nonzero_when_collector_task_crashes(engine, settings, monkeypatch, caplog):
+    """采集器关键任务抛异常时，run() 主动收尾并返回非零。"""
+    monkeypatch.setattr(Application, "_make_collectors", _make_crashing_collector)
+    with caplog.at_level(logging.INFO, logger="tidewatch.app"):
+        code = await asyncio.wait_for(run(settings, groups={"news"}, dry_run=True), timeout=5)
+    assert code == 1
+    assert any(
+        "关键任务 collector-crashing 意外结束，进程将退出以便 launchd 重启" in record.getMessage()
+        for record in caplog.records
+    )
+    assert any("观潮已停止" in record.getMessage() for record in caplog.records)
+
+
+async def test_run_returns_nonzero_when_health_task_returns(engine, settings, monkeypatch, caplog):
+    """健康监控关键任务正常返回也属于意外结束。"""
+    monkeypatch.setattr(Application, "_make_collectors", lambda app: [])
+
+    async def return_immediately(self) -> None:
+        return None
+
+    monkeypatch.setattr(app_module.HealthMonitor, "run", return_immediately)
+    with caplog.at_level(logging.INFO, logger="tidewatch.app"):
+        code = await asyncio.wait_for(run(settings, groups={"news"}, dry_run=True), timeout=5)
+    assert code == 1
+    assert any(
+        "关键任务 health 意外结束，进程将退出以便 launchd 重启：正常返回" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+async def test_application_exposes_all_component_background_tasks(engine, settings):
+    """应用守护范围包含 sink、调度器和应用直接创建的全部后台任务。"""
+    app = Application(settings, groups={"news"}, dry_run=True)
+    await _quiet(app)
+    await asyncio.wait_for(app.start(), timeout=5)
+    try:
+        names = {task.get_name() for task in app.critical_tasks()}
+        assert names >= {
+            "health",
+            "event-sink",
+            "dispatch-route",
+            "dispatch-send",
+            "dispatch-send-s",
+            "dispatch-digest",
+            "dispatch-retry",
+        }
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)
 
 
 # ---------- 网站启动失败：端口被占用 ----------

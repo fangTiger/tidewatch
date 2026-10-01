@@ -156,6 +156,10 @@ class EventSink:
             self._closing = False
             self._worker = asyncio.create_task(self._run(), name="event-sink")
 
+    def background_tasks(self) -> tuple[asyncio.Task, ...]:
+        """返回当前工作协程的只读快照，供应用层守护。"""
+        return (self._worker,) if self._worker is not None else ()
+
     async def stop(self) -> None:
         """处理完队列中已有的命令后停止；停止过程中新提交的命令立即报错
 

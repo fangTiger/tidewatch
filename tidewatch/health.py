@@ -4,6 +4,7 @@
 - 告警只有在通知器确认发送成功后才算「已告警」并记录告警时间（限流据此计算）；
   发送失败或抛异常只记录日志，不影响采集器，下一次失败或下一次超时检查时会再次尝试
 - 只有成功发出过告警的异常，恢复时才发送恢复通知
+- 恢复通知发送失败时保留内存待发标记，由下一轮超时检查补发；补发前再次异常则丢弃过时通知
 - 超时按「上次成功」与「登记时刻」中较晚者起算，避免重启后因很早以前的成功记录立即误报
 - 电脑休眠/唤醒：采集器在休眠期间不可能有成功请求，唤醒后若直接检查会全部误报。run() 记录上一轮检查的时刻，
   发现两轮间隔远超检查周期（> 3 倍）就认为系统休眠过，把所有非异常采集器的登记时刻重置为当前时刻再检查；
@@ -51,6 +52,7 @@ class _State:
     last_error: str | None = None
     alerted: bool = False  # 本次异常是否已成功发出告警（决定恢复时是否发恢复通知）
     alert_detail: str = "采集器异常"  # 本次异常的原因，告警发送失败后重试时使用
+    recovery_pending: bool = False  # 恢复通知发送失败后，等待下一轮检查补发
 
 
 class HealthMonitor:
@@ -150,7 +152,7 @@ class HealthMonitor:
                     await self._try_alert(name)
 
     async def check_stale(self) -> None:
-        """检查是否有采集器超过 stale_after 没有成功请求；已异常但未成功告警的采集器在此补发告警"""
+        """检查请求是否超时，并补发尚未送达的异常告警或恢复通知"""
         async with self._lock:
             now = self._clock()
             # 遍历快照：告警发送期间可能有新的采集器登记
@@ -163,6 +165,8 @@ class HealthMonitor:
                 since = max(state.last_success, state.registered_at) if state.last_success else state.registered_at
                 if (now - since).total_seconds() > state.stale_after_s:
                     await self._change(name, "abnormal", f"超过 {int(state.stale_after_s)} 秒没有成功请求")
+                elif state.recovery_pending and await self._send(name, True, "恢复正常"):
+                    state.recovery_pending = False
 
     async def run(self) -> None:
         """后台循环：定期检查超时；检测到系统休眠/暂停后先重新计时再检查，避免唤醒后集体误报"""
@@ -197,6 +201,7 @@ class HealthMonitor:
         self._emit(name)
         if status == "abnormal":
             logger.warning("采集器异常：%s，%s", name, detail)
+            state.recovery_pending = False
             state.alerted = False
             state.alert_detail = detail
             await self._try_alert(name)
@@ -205,7 +210,7 @@ class HealthMonitor:
             alerted = state.alerted
             state.alerted = False
             if alerted:  # 只有本次异常成功发出过告警才发恢复通知，避免只收到「恢复」
-                await self._send(name, True, detail)
+                state.recovery_pending = not await self._send(name, True, detail)
 
     async def _try_alert(self, name: str) -> None:
         """在不处于限流期时尝试发送异常告警（调用方须已持有锁）

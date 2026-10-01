@@ -191,6 +191,42 @@ async def test_poll_ingest_failures_turn_real_health_abnormal(engine, settings, 
     assert [(source, ok) for source, ok, _ in notifier.health] == [("demo", False)]
 
 
+async def test_poll_empty_successes_for_three_hours_stay_healthy(engine, settings, clock):
+    """规范场景：连续三小时成功轮询但没有公告，不应触发健康告警（旧实现本来就通过）。"""
+    notifier = FakeNotifier()
+    cfg = settings.collector("okx_ann")
+    monitor = HealthMonitor(engine, notifier, settings.dispatch, clock=clock)
+    monitor.register("okx_ann", stale_after_s=cfg.stale_after_s)
+    elapsed = 0.0
+
+    async def advancing_sleep(seconds: float) -> None:
+        nonlocal elapsed
+        clock.advance(seconds=seconds)
+        elapsed += seconds
+        await monitor.check_stale()
+        if elapsed >= 3 * 60 * 60:
+            raise asyncio.CancelledError
+
+    class EmptyOkxPoll(PollCollector):
+        name = "okx_ann"
+
+        async def load_cursor(self):
+            return None
+
+        async def fetch(self, cursor):
+            return FetchResult([], None)
+
+    collector = EmptyOkxPoll(
+        cfg, sink=FakeSink(), health=monitor, client=None, engine=engine, clock=clock, sleep=advancing_sleep
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(collector.run(), timeout=10)
+
+    assert elapsed >= 3 * 60 * 60
+    assert monitor.status("okx_ann") == "normal"
+    assert notifier.health == []
+
+
 class CancelledFetchPoll(DemoPoll):
     async def fetch(self, cursor):
         raise asyncio.CancelledError

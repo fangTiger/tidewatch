@@ -9,7 +9,7 @@ from tidewatch.models import Event, FetchResult
 from tidewatch.pipeline.rules.engine import build_rule_engine
 from tidewatch.pipeline.sink import create_event_sink
 from tidewatch.store.repo import load_cursor
-from tidewatch.store.tables import events, push_log
+from tidewatch.store.tables import event_clusters, events, push_log
 
 NFP = "美国9月非农就业人口增加8.2万人"
 
@@ -304,3 +304,46 @@ async def test_cancelling_stop_does_not_cancel_worker(engine, settings, clock):
     assert len(await asyncio.wait_for(ingest, 5)) == 1
     await event_sink.stop()  # 再次 stop 等待工作协程自然结束
     assert event_sink._worker is None
+
+
+async def test_stop_waits_for_inflight_batch_without_partial_transaction(engine, settings, clock):
+    """规范场景：退出等待当前批次完成，十秒内结束且不会留下半截事务（旧实现本来就通过）。"""
+    blocking = _BlockingRules(build_rule_engine(settings))
+    event_sink = create_event_sink(engine, settings, clock=clock, rules=blocking)
+    await event_sink.start()
+    batch = FetchResult(
+        [_flash(clock, "atomic:1", NFP), _flash(clock, "atomic:2", "比特币突破12万美元", important=0)],
+        {"last_id": "atomic:2"},
+    )
+    ingest = asyncio.create_task(event_sink.ingest(batch, collector="jin10"))
+    stopping: asyncio.Task | None = None
+    try:
+        await asyncio.wait_for(blocking.entered.wait(), timeout=5)
+        stopping = asyncio.create_task(event_sink.stop())
+        await asyncio.sleep(0)
+        assert not stopping.done()
+        blocking.release.set()
+        await asyncio.wait_for(asyncio.gather(ingest, stopping), timeout=10)
+    finally:
+        blocking.release.set()
+        cleanup = [ingest]
+        if stopping is not None:
+            cleanup.append(stopping)
+        for task in cleanup:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*cleanup, return_exceptions=True)
+        await asyncio.wait_for(event_sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        event_rows = (await conn.execute(select(events.c.dedupe_key, events.c.cluster_id))).all()
+        cluster_ids = set((await conn.execute(select(event_clusters.c.id))).scalars())
+        cursor = await load_cursor(conn, "jin10")
+
+    if event_rows:
+        assert {row.dedupe_key for row in event_rows} == {"atomic:1", "atomic:2"}
+        assert all(row.cluster_id in cluster_ids for row in event_rows)
+        assert cursor == {"last_id": "atomic:2"}
+    else:
+        assert cluster_ids == set()
+        assert cursor is None

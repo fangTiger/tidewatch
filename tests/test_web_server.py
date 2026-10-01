@@ -1,15 +1,19 @@
 import asyncio
 import json
+import re
 from datetime import timedelta
+from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
 import pytest
 import uvicorn
+from sqlalchemy import update
 
 from fakes import free_port, wait_until
 from tidewatch.models import Event, FetchResult
 from tidewatch.pipeline.sink import create_event_sink
+from tidewatch.store.tables import collector_state
 from tidewatch.web.broadcaster import Broadcaster
 from tidewatch.web.embedded import EmbeddedServer
 from tidewatch.web.server import create_app
@@ -95,6 +99,24 @@ async def test_fragment_and_status(client):
     for push_status in ("ok", "dry_run", "pending", "failed", "expired", "superseded"):
         assert f'data-push-status="{push_status}"' in status.text
     assert (await client.get("/static/app.js")).status_code == 200
+
+
+async def test_status_marks_abnormal_collector_red(seeded, settings, clock):
+    """规范场景：异常采集器行带 st-abnormal，样式表将其显示为红色（旧实现本来就通过）。"""
+    async with seeded.begin() as conn:
+        await conn.execute(
+            update(collector_state)
+            .where(collector_state.c.name == "jin10")
+            .values(status="abnormal", last_error="接口超时")
+        )
+    app = create_app(seeded, Broadcaster(), settings, clock=clock)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+        page = await asyncio.wait_for(http.get("/status"), timeout=3)
+
+    assert 'id="s-jin10" class="st-abnormal"' in page.text
+    assert "接口超时" in page.text
+    css = (Path(__file__).resolve().parents[1] / "tidewatch/web/static/style.css").read_text(encoding="utf-8")
+    assert re.search(r"tr\.st-abnormal\s+td\s*\{[^}]*color:\s*var\(--s\)", css)
 
 
 async def test_stream_response_has_send_timeout(seeded, settings, clock):

@@ -165,6 +165,10 @@ class Dispatcher:
             self._started = False  # 启动过程被取消等：允许再次 start
             raise
 
+    def background_tasks(self) -> tuple[asyncio.Task, ...]:
+        """返回当前后台任务的只读快照，供应用层守护。"""
+        return tuple(self._tasks)
+
     async def stop(self) -> None:
         """停止：取消并等待所有后台任务退出（任务内的异常被吞掉），之后可以再次 start()"""
         for task in self._tasks:

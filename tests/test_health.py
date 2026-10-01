@@ -232,6 +232,68 @@ async def test_recovery_exception_does_not_propagate(engine, settings, clock):
     assert (await _row(engine))["status"] == "normal"
 
 
+async def test_failed_recovery_notice_is_retried_by_check_stale(engine, settings, clock):
+    """恢复通知发送失败后，由下一轮健康检查补发；成功后不再重复。"""
+    async def scenario() -> None:
+        notifier = FakeNotifier(
+            [SendResult(True), SendResult(False, detail="HTTP 500"), SendResult(True)]
+        )
+        monitor = _monitor(engine, settings, clock, notifier)
+        for _ in range(5):
+            await monitor.failure("jin10", "超时")
+
+        await monitor.success("jin10")
+        assert [ok for _, ok, _ in notifier.health] == [False, True]
+
+        await monitor.check_stale()
+        assert [ok for _, ok, _ in notifier.health] == [False, True, True]
+        await monitor.check_stale()
+        assert [ok for _, ok, _ in notifier.health] == [False, True, True]
+
+    await asyncio.wait_for(scenario(), timeout=5)
+
+
+async def test_pending_recovery_notice_is_discarded_when_abnormal_again(engine, settings, clock):
+    """恢复通知待补发期间再次异常时，丢弃已经过时的恢复通知。"""
+    async def scenario() -> None:
+        notifier = FakeNotifier([SendResult(True), SendResult(False, detail="HTTP 500")])
+        monitor = _monitor(engine, settings, clock, notifier)
+        for _ in range(5):
+            await monitor.failure("jin10", "第一次异常")
+        await monitor.success("jin10")
+        assert [ok for _, ok, _ in notifier.health] == [False, True]
+
+        for _ in range(5):
+            await monitor.failure("jin10", "再次异常")
+        await monitor.success("jin10")
+        await monitor.check_stale()
+
+        assert monitor.status("jin10") == "normal"
+        assert [ok for _, ok, _ in notifier.health] == [False, True]
+
+    await asyncio.wait_for(scenario(), timeout=5)
+
+
+async def test_pending_recovery_notice_is_discarded_when_stale_again(engine, settings, clock):
+    """恢复通知待补发期间再次超时时，应先转为异常而不是补发过时恢复。"""
+    async def scenario() -> None:
+        notifier = FakeNotifier([SendResult(True), SendResult(False, detail="HTTP 500")])
+        monitor = _monitor(engine, settings, clock, notifier)
+        for _ in range(5):
+            await monitor.failure("jin10", "第一次异常")
+        await monitor.success("jin10")
+
+        clock.advance(seconds=301)
+        await monitor.check_stale()
+        await monitor.success("jin10")
+        await monitor.check_stale()
+
+        assert monitor.status("jin10") == "normal"
+        assert [ok for _, ok, _ in notifier.health] == [False, True]
+
+    await asyncio.wait_for(scenario(), timeout=5)
+
+
 async def test_never_alerted_exception_then_success_does_not_raise(engine, settings, clock):
     notifier = _RaisingNotifier({1, 2, 3})
     monitor = _monitor(engine, settings, clock, notifier)

@@ -173,6 +173,18 @@ class Application:
                 return
             await asyncio.sleep(0.01)
 
+    def critical_tasks(self) -> tuple[asyncio.Task, ...]:
+        """返回所有关键后台任务的只读快照。"""
+        tasks = [
+            *self._tasks,
+            *self._collector_tasks,
+            *self.sink.background_tasks(),
+            *self.dispatcher.background_tasks(),
+        ]
+        if self._web_task is not None:
+            tasks.append(self._web_task)
+        return tuple(dict.fromkeys(tasks))
+
     def _log_web_exit(self, task: asyncio.Task) -> None:
         """网站在完成启动后意外结束时记录错误"""
         if task.cancelled() or self._stopping or not self._web_ready:
@@ -253,9 +265,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 async def run(settings: Settings, *, groups: set[str], dry_run: bool) -> int:
-    """运行直到收到停止信号；返回进程退出码（0 正常退出，1 启动失败）"""
+    """运行直到收到停止信号或关键任务意外结束；返回进程退出码"""
     app = Application(settings, groups=groups, dry_run=dry_run)
     stop_event = asyncio.Event()
+    stop_waiter: asyncio.Task | None = None
     loop = asyncio.get_running_loop()
     signals = (signal.SIGINT, signal.SIGTERM)
     for sig in signals:
@@ -268,9 +281,30 @@ async def run(settings: Settings, *, groups: set[str], dry_run: bool) -> int:
             logger.exception("启动失败：%s", exc)
             exit_code = 1
         else:
-            await stop_event.wait()
-            logger.info("收到停止信号，正在退出…")
+            stop_waiter = asyncio.create_task(stop_event.wait(), name="stop-signal")
+            critical = app.critical_tasks()
+            done, _ = await asyncio.wait((stop_waiter, *critical), return_when=asyncio.FIRST_COMPLETED)
+            if stop_waiter in done:
+                logger.info("收到停止信号，正在退出…")
+            else:
+                exit_code = 1
+                for task in critical:
+                    if not task.done():
+                        continue
+                    if task.cancelled():
+                        reason = "任务被取消"
+                    else:
+                        exc = task.exception()
+                        reason = "正常返回" if exc is None else f"{type(exc).__name__}：{exc}"
+                    logger.error(
+                        "关键任务 %s 意外结束，进程将退出以便 launchd 重启：%s",
+                        task.get_name(),
+                        reason,
+                    )
     finally:
+        if stop_waiter is not None and not stop_waiter.done():
+            stop_waiter.cancel()
+            await asyncio.gather(stop_waiter, return_exceptions=True)
         # 启动失败时同样要清理已创建的资源（stop 对部分启动安全）
         try:
             await asyncio.wait_for(app.stop(), timeout=STOP_TIMEOUT_S)
