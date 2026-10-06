@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
-from tidewatch.collectors.base import Backoff, TokenBucket
+from tidewatch.collectors.base import Backoff, TokenBucket, describe
 from tidewatch.collectors.http import make_client
 from tidewatch.hyperliquid.client import HyperliquidRestClient
 from tidewatch.hyperliquid.importer import AliasCache, LeaderboardImporter
@@ -139,6 +139,7 @@ class HyperliquidRuntime:
         self.reconcile_queue = PriorityReconcileQueue()
         self._reconcile_backoffs: dict[str, Backoff] = {}
         self._next_reconcile: dict[str, float] = {}
+        self._inflight_reconciles: set[str] = set()
         self._core_addresses: set[str] = set()
         self._ws_configured = False
         self._ws_config_lock = asyncio.Lock()
@@ -192,23 +193,62 @@ class HyperliquidRuntime:
 
     async def run_rest(self) -> None:
         """运行重点钱包优先级对账调度。"""
+        workers = asyncio.create_task(
+            self.run_reconcile_workers(),
+            name="hl-reconcile-workers",
+        )
+        try:
+            while not self._stop.is_set():
+                if workers.done():
+                    await workers
+                now = self.monotonic()
+                focus = await self.registry.list_wallets(tier="focus", excluded=False)
+                if not focus:
+                    await self.monitor.run_due_fill_queries()
+                    await self._set_health_mode("hl_rest", "degraded")
+                    await self.health.success("hl_rest")
+                    if await self._wait_or_stop(
+                        min(5, self.settings.frequencies.focus_reconcile_interval_s)
+                    ):
+                        return
+                    continue
+                await self._set_health_mode("hl_rest", "normal")
+                await self.schedule_focus_wallets(now, focus=focus)
+                if not self.reconcile_queue and not self._inflight_reconciles:
+                    await self.monitor.run_due_fill_queries()
+                if await self._wait_or_stop(
+                    min(1, self.settings.frequencies.hot_reconcile_interval_s)
+                ):
+                    return
+        finally:
+            workers.cancel()
+            await asyncio.gather(workers, return_exceptions=True)
+
+    async def run_reconcile_workers(self) -> None:
+        """运行有界钱包对账工作池；每次取任务时重新应用优先级。"""
+        async with asyncio.TaskGroup() as group:
+            for index in range(self.settings.reconcile_concurrency):
+                group.create_task(
+                    self._run_reconcile_worker(),
+                    name=f"hl-reconcile-{index}",
+                )
+
+    async def _run_reconcile_worker(self) -> None:
         while not self._stop.is_set():
             now = self.monotonic()
-            focus = await self.registry.list_wallets(tier="focus", excluded=False)
-            if not focus:
-                await self.monitor.run_due_fill_queries()
-                await self._set_health_mode("hl_rest", "degraded")
-                await self.health.success("hl_rest")
-                if await self._wait_or_stop(min(5, self.settings.frequencies.focus_reconcile_interval_s)):
+            task = self.reconcile_queue.pop_ready(
+                now,
+                excluded=self._inflight_reconciles,
+            )
+            if task is None:
+                if await self._wait_or_stop(0.05):
                     return
                 continue
-            await self._set_health_mode("hl_rest", "normal")
-            await self.schedule_focus_wallets(now, focus=focus)
-            handled = await self.run_reconcile_once(now)
-            if not handled:
-                await self.monitor.run_due_fill_queries()
-                if await self._wait_or_stop(0.1):
-                    return
+            self._inflight_reconciles.add(task.address)
+            try:
+                await self._execute_reconcile(task, now)
+            finally:
+                self._inflight_reconciles.discard(task.address)
 
     async def run_trades_ws(self) -> None:
         await self._idle_health("hl_trades_ws")
@@ -369,7 +409,7 @@ class HyperliquidRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await self.health.failure("hl_core_ws", str(exc))
+                await self.health.failure("hl_core_ws", describe(exc))
                 raise
 
     @property
@@ -400,7 +440,10 @@ class HyperliquidRuntime:
                 self._next_reconcile.pop(address, None)
         distance_limit = Decimal(str(self.settings.events.hot_liquidation_distance_ratio))
         for wallet in wallets:
-            if wallet.address in self.reconcile_queue:
+            if (
+                wallet.address in self.reconcile_queue
+                or wallet.address in self._inflight_reconciles
+            ):
                 continue
             if self._next_reconcile.get(wallet.address, now) > now:
                 continue
@@ -418,9 +461,18 @@ class HyperliquidRuntime:
 
     async def run_reconcile_once(self, now: float) -> bool:
         """处理一项到期任务；预算不足时短暂顺延并保留原优先级。"""
-        task = self.reconcile_queue.pop_ready(now)
+        task = self.reconcile_queue.pop_ready(now, excluded=self._inflight_reconciles)
         if task is None:
             return False
+        self._inflight_reconciles.add(task.address)
+        try:
+            await self._execute_reconcile(task, now)
+        finally:
+            self._inflight_reconciles.discard(task.address)
+        return True
+
+    async def _execute_reconcile(self, task: ScheduledReconcile, now: float) -> None:
+        """执行单钱包任务并按结果完成、顺延或退避。"""
         try:
             complete = await self.monitor.reconcile(task.address)
         except asyncio.CancelledError:
@@ -435,16 +487,15 @@ class HyperliquidRuntime:
                 task.priority.name,
                 delay,
             )
-            await self.health.failure("hl_rest", str(exc))
+            await self.health.failure("hl_rest", describe(exc))
             self.reconcile_queue.defer(task, due_at=now + delay)
-            return True
+            return
         if not complete:
             self.reconcile_queue.defer(task, due_at=now + 0.1)
-            return True
+            return
         interval = await self._interval_after(task)
         self._reconcile_backoffs.pop(task.address, None)
-        self._next_reconcile[task.address] = now + interval
-        return True
+        self._next_reconcile[task.address] = self.monotonic() + interval
 
     async def sync_core_subscriptions(self) -> None:
         """把数据库核心名单与 WS 用户订阅同步。"""
@@ -573,12 +624,12 @@ class HyperliquidRuntime:
 
     async def stop(self) -> None:
         """停止新接收并立即取消在途后台请求，避免等待 HTTP 超时。"""
-        self._stop.set()
         current = asyncio.current_task()
         managed = [task for task in self._tasks if task is not current]
         for task in managed:
             if not task.done():
                 task.cancel()
+        self._stop.set()
         await self.ws.aclose()
         if managed:
             await asyncio.gather(*managed, return_exceptions=True)

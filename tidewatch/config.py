@@ -177,6 +177,8 @@ class HyperliquidFrequenciesCfg(_Strict):
     hot_reconcile_interval_s: float = Field(default=20, gt=0)
     focus_reconcile_interval_s: float = Field(default=180, gt=0)
     fill_query_min_interval_s: float = Field(default=60, gt=0)
+    account_type_cache_s: float = Field(default=3600, gt=0)
+    fill_timeout_warning_interval_s: float = Field(default=1800, gt=0)
     leaderboard_interval_s: float = Field(default=43200, gt=0)
     tier_recompute_interval_s: float = Field(default=86400, gt=0)
     profile_interval_s: float = Field(default=86400, gt=0)
@@ -258,6 +260,7 @@ class HyperliquidCfg(_Strict):
     aliases_url: str = "https://api.hypurrscan.io/globalAliases"
     monitor_budget_per_min: float = Field(default=900, gt=0)
     batch_budget_per_min: float = Field(default=300, gt=0)
+    reconcile_concurrency: int = Field(default=8, gt=0)
     frequencies: HyperliquidFrequenciesCfg = HyperliquidFrequenciesCfg()
     tiers: HyperliquidTiersCfg = HyperliquidTiersCfg()
     events: HyperliquidEventsCfg = HyperliquidEventsCfg()

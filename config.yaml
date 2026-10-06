@@ -10,6 +10,7 @@ hyperliquid:
   aliases_url: https://api.hypurrscan.io/globalAliases
   monitor_budget_per_min: 900
   batch_budget_per_min: 300
+  reconcile_concurrency: 8
   frequencies:
     ws_ping_interval_s: 50
     core_state_interval_s: 5
@@ -17,6 +18,8 @@ hyperliquid:
     hot_reconcile_interval_s: 20
     focus_reconcile_interval_s: 180
     fill_query_min_interval_s: 60
+    account_type_cache_s: 3600
+    fill_timeout_warning_interval_s: 1800
     leaderboard_interval_s: 43200
     tier_recompute_interval_s: 86400
     profile_interval_s: 86400

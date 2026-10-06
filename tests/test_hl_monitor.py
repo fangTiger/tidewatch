@@ -506,8 +506,75 @@ async def test_multi_request_reconcile_resumes_completed_steps_after_budget_defe
     assert rest.calls == ["clearinghouseState", "userAbstraction", "userAbstraction"]
 
 
-async def test_unmatched_fill_lookup_falls_back_to_twap_and_minute_guard_does_not_delay_event(
+async def test_reconcile_starts_independent_state_and_account_queries_concurrently(
     engine, settings, clock
+):
+    started: set[str] = set()
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            started.add(request_type)
+            if started == {"clearinghouseState", "userAbstraction"}:
+                both_started.set()
+            await release.wait()
+            if request_type == "clearinghouseState":
+                return True, _empty_state()
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            raise AssertionError(request_type)
+
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=None,
+        clock=clock,
+    )
+    task = asyncio.create_task(monitor.reconcile(ADDRESS))
+    try:
+        await asyncio.wait_for(both_started.wait(), timeout=0.2)
+        release.set()
+        assert await asyncio.wait_for(task, timeout=1)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_account_type_cache_refreshes_after_one_hour(engine, settings, clock):
+    abstraction_calls = 0
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            nonlocal abstraction_calls
+            if request_type == "clearinghouseState":
+                return True, _empty_state()
+            if request_type == "userAbstraction":
+                abstraction_calls += 1
+                return True, "disabled"
+            raise AssertionError(request_type)
+
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=None,
+        clock=clock,
+    )
+    assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=1)
+    clock.advance(seconds=settings.hyperliquid.frequencies.account_type_cache_s - 1)
+    assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=1)
+    clock.advance(seconds=1)
+    assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=1)
+
+    assert abstraction_calls == 2
+
+
+async def test_unmatched_fill_lookup_falls_back_to_twap_and_minute_guard_does_not_delay_event(
+    engine, settings, clock, caplog
 ):
     calls: list[str] = []
 
@@ -563,9 +630,12 @@ async def test_unmatched_fill_lookup_falls_back_to_twap_and_minute_guard_does_no
             select(hl_state.c.cursor).where(hl_state.c.name == f"fills:{ADDRESS}")
         )
     assert first_cursor["last_query_at"] == clock.now.isoformat()
+    caplog.set_level("DEBUG", logger="tidewatch.hyperliquid.monitor")
     second = await asyncio.wait_for(monitor.lookup_fill_evidence(ADDRESS, {"BTC"}), timeout=5)
 
     assert first["tid"] == 99 and second is None
+    assert any("成交补查节流中" in record.message for record in caplog.records)
+    assert not any("成交补查超过" in record.message for record in caplog.records)
     assert calls == ["userFillsByTime", "userTwapSliceFills"]
     assert monitor.deferred_fill_count == 1
     clock.advance(seconds=settings.hyperliquid.frequencies.fill_query_min_interval_s)
@@ -653,7 +723,9 @@ async def test_deferred_fill_query_is_restored_after_monitor_restart(engine, set
     ]
 
 
-async def test_fill_lookup_timeout_does_not_hold_snapshot_event(engine, settings, clock):
+async def test_fill_lookup_timeout_does_not_hold_snapshot_event(
+    engine, settings, clock, caplog
+):
     clearing_calls = 0
 
     class Rest:
@@ -661,7 +733,13 @@ async def test_fill_lookup_timeout_does_not_hold_snapshot_event(engine, settings
             nonlocal clearing_calls
             if request_type == "clearinghouseState":
                 clearing_calls += 1
-                return True, _empty_state() if clearing_calls == 1 else _state()
+                states = [
+                    _empty_state(),
+                    _state(szi="60", value="6000000"),
+                    _state(szi="30", value="3000000"),
+                    _state(szi="60", value="6000000"),
+                ]
+                return True, states[min(clearing_calls - 1, len(states) - 1)]
             if request_type == "userAbstraction":
                 return True, "disabled"
             if request_type == "userFillsByTime":
@@ -680,18 +758,84 @@ async def test_fill_lookup_timeout_does_not_hold_snapshot_event(engine, settings
         clock=clock,
         fill_lookup_timeout_s=0.01,
     )
+    caplog.set_level("DEBUG", logger="tidewatch.hyperliquid.monitor")
     try:
         assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=0.5)
         clock.advance(seconds=1)
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=0.5)
+        clock.advance(seconds=90)
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=0.5)
+        clock.advance(seconds=settings.hyperliquid.frequencies.fill_timeout_warning_interval_s)
         assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=0.5)
     finally:
         await asyncio.wait_for(sink.stop(), timeout=5)
 
     async with engine.connect() as conn:
-        event = (await conn.execute(select(events.c.dedupe_key))).scalar_one()
+        event_keys = (await conn.execute(select(events.c.dedupe_key))).scalars().all()
         cursor = await conn.scalar(select(hl_state.c.cursor).where(hl_state.c.name == f"fills:{ADDRESS}"))
-    assert event.endswith(f":{int(clock.now.timestamp() * 1000)}")
+    assert len(event_keys) == 3
+    assert all(key.startswith(f"hl:{ADDRESS}:BTC:") for key in event_keys)
     assert cursor["pending_coins"] == ["BTC"]
+    timeout_records = [
+        record for record in caplog.records if "成交补查超过" in record.message
+    ]
+    assert [record.levelname for record in timeout_records] == ["WARNING", "DEBUG", "WARNING"]
+
+
+async def test_empty_account_lookup_errors_use_exception_type(
+    engine, settings, clock, caplog
+):
+    class AccountRest:
+        async def try_info(self, request_type: str, **params):
+            if request_type == "userAbstraction":
+                raise asyncio.TimeoutError()
+            raise AssertionError(request_type)
+
+    account_monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=AccountRest(),
+        sink=None,
+        clock=clock,
+    )
+    caplog.set_level("WARNING", logger="tidewatch.hyperliquid.monitor")
+    account_value = await asyncio.wait_for(
+        account_monitor._core_account_value(ADDRESS, _empty_state()),
+        timeout=1,
+    )
+
+    assert account_value == Decimal("800000")
+    assert any(
+        "账户类型查询失败，暂按普通账户处理：TimeoutError()" in record.message
+        for record in caplog.records
+    )
+    caplog.clear()
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            if request_type == "userAbstraction":
+                return True, "unifiedAccount"
+            if request_type == "spotClearinghouseState":
+                raise asyncio.TimeoutError()
+            raise AssertionError(request_type)
+
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=None,
+        clock=clock,
+    )
+    value = await asyncio.wait_for(
+        monitor._core_account_value(ADDRESS, _empty_state()),
+        timeout=1,
+    )
+
+    assert value == Decimal("800000")
+    assert any(
+        "现货 USDC 查询失败，使用最近缓存：TimeoutError()" in record.message
+        for record in caplog.records
+    )
 
 
 async def test_reconcile_refreshes_known_hip3_dex_without_overwriting_main_dex(

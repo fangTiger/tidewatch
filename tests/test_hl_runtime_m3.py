@@ -11,6 +11,7 @@ from sqlalchemy import func, insert, select
 from websockets.asyncio.server import serve
 
 from fakes import async_timeout
+from tidewatch.hyperliquid.client import BASE_WEIGHTS
 from tidewatch.hyperliquid.monitor import ReconcilePriority
 from tidewatch.hyperliquid.runtime import HyperliquidRuntime
 from tidewatch.pipeline.sink import create_event_sink
@@ -391,6 +392,199 @@ async def test_focus_scheduler_uses_three_minute_period_and_budget_deferral_keep
         assert len(runtime.reconcile_queue) == 1
     finally:
         await runtime.close_resources()
+
+
+@async_timeout(5)
+async def test_two_hundred_focus_wallets_finish_within_three_minute_latency_model(
+    engine, settings, clock
+):
+    """按 160 倍缩放模拟每请求 0.8 秒，证明调度吞吐而非预算是关键。"""
+    addresses = [f"0x{index + 1:040x}" for index in range(200)]
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets),
+            [
+                {"address": address, "tier": "focus", "source": "manual"}
+                for address in addresses
+            ],
+        )
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+    )
+    runtime.monitor.hot_wallets = lambda: asyncio.sleep(0, result=[])
+    request_delay_s = 0.005
+    scale = 0.8 / request_delay_s
+    active_wallets = 0
+    max_active_wallets = 0
+    completed = 0
+    request_count = 0
+
+    async def fake_request() -> None:
+        nonlocal request_count
+        request_count += 1
+        await asyncio.sleep(request_delay_s)
+
+    async def reconcile(address: str) -> bool:
+        nonlocal active_wallets, max_active_wallets, completed
+        active_wallets += 1
+        max_active_wallets = max(max_active_wallets, active_wallets)
+        try:
+            await fake_request()
+            await fake_request()
+        finally:
+            active_wallets -= 1
+        completed += 1
+        if completed == len(addresses):
+            runtime._stop.set()
+        return True
+
+    runtime.monitor.reconcile = reconcile
+    started_at = time.monotonic()
+    try:
+        await asyncio.wait_for(runtime.run_rest(), timeout=4)
+    finally:
+        await runtime.close_resources()
+    modeled_elapsed_s = (time.monotonic() - started_at) * scale
+
+    assert completed == 200
+    assert request_count == 400
+    assert 1 < max_active_wallets <= settings.hyperliquid.reconcile_concurrency
+    assert modeled_elapsed_s <= settings.hyperliquid.frequencies.focus_reconcile_interval_s
+
+
+@async_timeout()
+async def test_reconcile_concurrency_keeps_same_wallet_single_flight(
+    engine, settings, clock
+):
+    settings.hyperliquid.frequencies.trade_debounce_s = 0.01
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+    )
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    calls = 0
+
+    async def reconcile(address: str) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_started.set()
+        return True
+
+    runtime.monitor.reconcile = reconcile
+    runtime.reconcile_queue.schedule(
+        ADDRESS, ReconcilePriority.NORMAL, due_at=100.0, reason="普通对账"
+    )
+    runner = asyncio.create_task(runtime.run_reconcile_workers())
+    try:
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        runtime.trigger_trade(ADDRESS)
+        await asyncio.sleep(0.05)
+        assert calls == 1
+        release_first.set()
+        await asyncio.wait_for(second_started.wait(), timeout=1)
+    finally:
+        runtime._stop.set()
+        release_first.set()
+        await asyncio.wait_for(runner, timeout=1)
+        await runtime.close_resources()
+
+    assert calls == 2
+
+
+@async_timeout()
+async def test_free_reconcile_slot_takes_trade_before_waiting_normal_wallets(
+    engine, settings, clock
+):
+    settings.hyperliquid.reconcile_concurrency = 2
+    settings.hyperliquid.frequencies.trade_debounce_s = 0.01
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+    )
+    runtime.monitor.hot_wallets = lambda: asyncio.sleep(0, result=[])
+    normal_addresses = [f"0x{index + 1:040x}" for index in range(4)]
+    trade_address = "0x0000000000000000000000000000000000000999"
+    releases = {address: asyncio.Event() for address in normal_addresses}
+    first_wave_started = asyncio.Event()
+    trade_started = asyncio.Event()
+    started: list[str] = []
+
+    async def reconcile(address: str) -> bool:
+        started.append(address)
+        if len(started) == 2:
+            first_wave_started.set()
+        if address == trade_address:
+            trade_started.set()
+            return True
+        await releases[address].wait()
+        return True
+
+    runtime.monitor.reconcile = reconcile
+    for address in normal_addresses:
+        runtime.reconcile_queue.schedule(
+            address,
+            ReconcilePriority.NORMAL,
+            due_at=0,
+            reason="普通对账",
+        )
+    runner = asyncio.create_task(runtime.run_reconcile_workers())
+    try:
+        await asyncio.wait_for(first_wave_started.wait(), timeout=1)
+        runtime.trigger_trade(trade_address)
+        await asyncio.sleep(0.02)
+        releases[started[0]].set()
+        await asyncio.wait_for(trade_started.wait(), timeout=1)
+    finally:
+        runtime._stop.set()
+        for release in releases.values():
+            release.set()
+        await asyncio.wait_for(runner, timeout=1)
+        await runtime.close_resources()
+
+    assert started[2] == trade_address
+
+
+def test_monitor_budget_estimate_stays_below_nine_hundred_per_minute(settings):
+    """按最保守的全统一账户估算常态状态请求，不含按变化触发的成交补查。"""
+    focus_count = settings.hyperliquid.tiers.focus_limit
+    hot_count = settings.hyperliquid.tiers.hot_limit
+    normal_count = focus_count - hot_count
+    clearing_weight = BASE_WEIGHTS["clearinghouseState"]
+    spot_weight = BASE_WEIGHTS["spotClearinghouseState"]
+    abstraction_weight = BASE_WEIGHTS.get("userAbstraction", 2)
+    normal_per_minute = (
+        normal_count
+        * (clearing_weight + spot_weight)
+        / (settings.hyperliquid.frequencies.focus_reconcile_interval_s / 60)
+    )
+    hot_per_minute = (
+        hot_count
+        * (clearing_weight + spot_weight)
+        / (settings.hyperliquid.frequencies.hot_reconcile_interval_s / 60)
+    )
+    abstraction_per_minute = (
+        focus_count
+        * abstraction_weight
+        / (settings.hyperliquid.frequencies.account_type_cache_s / 60)
+    )
+
+    assert normal_per_minute + hot_per_minute + abstraction_per_minute < 900
 
 
 @async_timeout()

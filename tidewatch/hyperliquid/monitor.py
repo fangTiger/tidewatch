@@ -8,7 +8,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import Any
 
 from sqlalchemy import select
@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
+from tidewatch.collectors.base import describe
 from tidewatch.hyperliquid.baseline import (
     load_last_observed_at,
     load_monitor_baseline,
@@ -96,8 +97,18 @@ class PriorityReconcileQueue:
             elif due_at < current.due_at:
                 self._tasks[normalized] = incoming
 
-    def pop_ready(self, now: float) -> ScheduledReconcile | None:
-        ready = [task for task in self._tasks.values() if task.due_at <= now]
+    def pop_ready(
+        self,
+        now: float,
+        *,
+        excluded: set[str] | None = None,
+    ) -> ScheduledReconcile | None:
+        blocked = excluded or set()
+        ready = [
+            task
+            for task in self._tasks.values()
+            if task.due_at <= now and task.address not in blocked
+        ]
         if not ready:
             return None
         task = min(ready, key=lambda item: (item.priority, item.due_at, item.address))
@@ -124,6 +135,19 @@ class _ReconcileProgress:
     states: dict[str, Any]
     abstraction: Any = _MISSING
     spot: Any = _MISSING
+
+
+class _FillLookupStatus(Enum):
+    COMPLETE = "complete"
+    THROTTLED = "throttled"
+    DEFERRED = "deferred"
+    TIMEOUT = "timeout"
+
+
+@dataclass(frozen=True)
+class _FillLookupResult:
+    evidence: Mapping[str, Any] | None
+    status: _FillLookupStatus
 
 
 def select_hot_wallets(
@@ -206,10 +230,12 @@ class HyperliquidMonitor:
         self.account_lookup_timeout_s = account_lookup_timeout_s
         self.mids: dict[str, Decimal] = {}
         self._account_types: dict[str, Any] = {}
+        self._account_type_cached_at: dict[str, datetime] = {}
         self._spot_states: dict[str, Mapping[str, Any]] = {}
         self._recent_fills: dict[tuple[str, str], Mapping[str, Any]] = {}
         self._deferred_fills: dict[str, tuple[datetime, set[str]]] = {}
         self._pending_reconciles: dict[str, _ReconcileProgress] = {}
+        self._fill_timeout_warnings: dict[str, datetime] = {}
 
     @property
     def deferred_fill_count(self) -> int:
@@ -245,25 +271,39 @@ class HyperliquidMonitor:
                     *sorted(position_dexes | remembered_dexes | set(self.cfg.hip3_dexes)),
                 ),
                 states={},
-                abstraction=self._account_types.get(normalized, _MISSING),
+                abstraction=self._cached_account_type(normalized),
             )
             self._pending_reconciles[normalized] = progress
 
+        pending: list[tuple[str, str | None, Any]] = []
         for dex in progress.dexes:
-            if dex in progress.states:
-                continue
-            params = {"user": normalized, **({"dex": dex} if dex else {})}
-            available, state = await self._try_info("clearinghouseState", **params)
-            if not available:
-                return False
-            progress.states[dex] = state
-
+            if dex not in progress.states:
+                params = {"user": normalized, **({"dex": dex} if dex else {})}
+                pending.append(
+                    ("state", dex, self._try_info("clearinghouseState", **params))
+                )
         if progress.abstraction is _MISSING:
-            available, abstraction = await self._try_info("userAbstraction", user=normalized)
-            if not available:
+            pending.append(
+                (
+                    "abstraction",
+                    None,
+                    self._try_info("userAbstraction", user=normalized),
+                )
+            )
+        if pending:
+            results = await asyncio.gather(*(request for _, _, request in pending))
+            complete = True
+            for (kind, dex, _), (available, value) in zip(pending, results, strict=True):
+                if not available:
+                    complete = False
+                elif kind == "state":
+                    assert dex is not None
+                    progress.states[dex] = value
+                else:
+                    progress.abstraction = value
+                    self._cache_account_type(normalized, value)
+            if not complete:
                 return False
-            progress.abstraction = abstraction
-            self._account_types[normalized] = abstraction
         if _is_unified(progress.abstraction) and progress.spot is _MISSING:
             available, spot = await self._try_info("spotClearinghouseState", user=normalized)
             if not available:
@@ -291,6 +331,17 @@ class HyperliquidMonitor:
         remember: bool = True,
     ) -> Mapping[str, Any] | None:
         """按一分钟保护补查成交，成功提交成交与游标后返回本次最佳证据。"""
+        result = await self._lookup_fill_evidence(address, changed_coins, remember=remember)
+        return result.evidence
+
+    async def _lookup_fill_evidence(
+        self,
+        address: str,
+        changed_coins: set[str],
+        *,
+        remember: bool = True,
+    ) -> _FillLookupResult:
+        """补查成交并区分节流、预算顺延与真实网络超时。"""
         normalized = normalize_address(address)
         state_name = f"fills:{normalized}"
         async with self.engine.connect() as conn:
@@ -298,7 +349,7 @@ class HyperliquidMonitor:
             baseline_at = await load_monitor_baseline(conn, normalized)
         if baseline_at is None:
             self._deferred_fills.pop(normalized, None)
-            return None
+            return _FillLookupResult(None, _FillLookupStatus.COMPLETE)
         cursor = dict(cursor) if isinstance(cursor, Mapping) else {}
         last_query = _parse_datetime(cursor.get("last_query_at"))
         now = self.clock()
@@ -311,18 +362,31 @@ class HyperliquidMonitor:
                     last_query
                     + timedelta(seconds=self.cfg.frequencies.fill_query_min_interval_s),
                 )
-                return None
+                logger.debug(
+                    "钱包 %s…%s 成交补查节流中，%.1f 秒后可再次查询",
+                    normalized[:6],
+                    normalized[-4:],
+                    self.cfg.frequencies.fill_query_min_interval_s - elapsed,
+                )
+                return _FillLookupResult(None, _FillLookupStatus.THROTTLED)
 
         baseline_ms = int(baseline_at.timestamp() * 1000)
         start_time = max(int(cursor.get("last_time") or 0), baseline_ms)
-        available, raw_fills = await self._try_info(
-            "userFillsByTime",
-            user=normalized,
-            startTime=start_time,
-        )
+        try:
+            available, raw_fills = await asyncio.wait_for(
+                self._try_info(
+                    "userFillsByTime",
+                    user=normalized,
+                    startTime=start_time,
+                ),
+                timeout=self.fill_lookup_timeout_s,
+            )
+        except asyncio.TimeoutError:
+            await self._defer_fill_query(normalized, changed_coins, now + timedelta(seconds=1))
+            return _FillLookupResult(None, _FillLookupStatus.TIMEOUT)
         if not available:
             await self._defer_fill_query(normalized, changed_coins, now + timedelta(seconds=1))
-            return None
+            return _FillLookupResult(None, _FillLookupStatus.DEFERRED)
         fills = [
             item
             for item in _unwrap_fills(raw_fills, is_twap=False)
@@ -331,14 +395,25 @@ class HyperliquidMonitor:
         await self._store_fills(normalized, fills, last_query_at=now)
         matching = [fill for fill, _ in fills if fill.get("coin") in changed_coins]
         if not matching:
-            available, raw_twap = await self._try_info("userTwapSliceFills", user=normalized)
+            try:
+                available, raw_twap = await asyncio.wait_for(
+                    self._try_info("userTwapSliceFills", user=normalized),
+                    timeout=self.fill_lookup_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                await self._defer_fill_query(
+                    normalized,
+                    changed_coins,
+                    now + timedelta(seconds=1),
+                )
+                return _FillLookupResult(None, _FillLookupStatus.TIMEOUT)
             if not available:
                 await self._defer_fill_query(
                     normalized,
                     changed_coins,
                     now + timedelta(seconds=self.cfg.frequencies.fill_query_min_interval_s),
                 )
-                return None
+                return _FillLookupResult(None, _FillLookupStatus.DEFERRED)
             twap_fills = [
                 item
                 for item in _unwrap_fills(raw_twap, is_twap=True)
@@ -354,7 +429,8 @@ class HyperliquidMonitor:
                 coin = evidence.get("coin")
                 if isinstance(coin, str):
                     self._recent_fills[(normalized, coin)] = evidence
-        return max(matching, key=lambda item: int(item.get("time") or 0), default=None)
+        evidence = max(matching, key=lambda item: int(item.get("time") or 0), default=None)
+        return _FillLookupResult(evidence, _FillLookupStatus.COMPLETE)
 
     async def run_due_fill_queries(self) -> None:
         """执行到期的合并补查；失败或预算不足时保留任务稍后重试。"""
@@ -367,18 +443,9 @@ class HyperliquidMonitor:
         ]
         for address, coins in due:
             self._deferred_fills.pop(address, None)
-            try:
-                await asyncio.wait_for(
-                    self.lookup_fill_evidence(address, set(coins), remember=False),
-                    timeout=self.fill_lookup_timeout_s,
-                )
-            except asyncio.TimeoutError:
-                await self._defer_fill_query(
-                    address,
-                    coins,
-                    self.clock() + timedelta(seconds=1),
-                )
-                logger.warning("钱包 %s…%s 延期成交补查超时，将继续顺延", address[:6], address[-4:])
+            result = await self._lookup_fill_evidence(address, set(coins), remember=False)
+            if result.status is _FillLookupStatus.TIMEOUT:
+                self._log_fill_timeout(address, deferred=True)
 
     async def _defer_fill_query(
         self,
@@ -629,23 +696,10 @@ class HyperliquidMonitor:
         changed_coins = {new.coin for old, new in transitions if old.szi != new.szi}
         fill = None
         if changed_coins and allow_fill_lookup and not establishing_baseline:
-            try:
-                fill = await asyncio.wait_for(
-                    self.lookup_fill_evidence(address, changed_coins),
-                    timeout=self.fill_lookup_timeout_s,
-                )
-            except asyncio.TimeoutError:
-                await self._defer_fill_query(
-                    address,
-                    changed_coins,
-                    self.clock() + timedelta(seconds=1),
-                )
-                logger.warning(
-                    "钱包 %s…%s 成交补查超过 %g 秒，先按快照生成事件",
-                    address[:6],
-                    address[-4:],
-                    self.fill_lookup_timeout_s,
-                )
+            result = await self._lookup_fill_evidence(address, changed_coins)
+            fill = result.evidence
+            if result.status is _FillLookupStatus.TIMEOUT:
+                self._log_fill_timeout(address)
 
         async with self.engine.connect() as conn:
             wallet_row = (
@@ -801,8 +855,9 @@ class HyperliquidMonitor:
 
     async def _core_account_value(self, address: str, clearing: Any) -> Decimal:
         """有界刷新核心钱包账户类型与现货 USDC，失败时使用最近缓存。"""
-        abstraction = self._account_types.get(address)
-        if abstraction is None:
+        cached = self._cached_account_type(address)
+        abstraction = None if cached is _MISSING else cached
+        if cached is _MISSING:
             try:
                 available, value = await asyncio.wait_for(
                     self._try_info("userAbstraction", user=address),
@@ -813,12 +868,12 @@ class HyperliquidMonitor:
                     "钱包 %s…%s 账户类型查询失败，暂按普通账户处理：%s",
                     address[:6],
                     address[-4:],
-                    exc,
+                    describe(exc),
                 )
             else:
                 if available:
                     abstraction = value
-                    self._account_types[address] = value
+                    self._cache_account_type(address, value)
         abstraction = abstraction or "disabled"
         spot = self._spot_states.get(address)
         if _is_unified(abstraction):
@@ -832,13 +887,54 @@ class HyperliquidMonitor:
                     "钱包 %s…%s 现货 USDC 查询失败，使用最近缓存：%s",
                     address[:6],
                     address[-4:],
-                    exc,
+                    describe(exc),
                 )
             else:
                 if available and isinstance(value, Mapping):
                     spot = value
                     self._spot_states[address] = value
         return combined_account_value(abstraction, clearing, spot)
+
+    def _cached_account_type(self, address: str) -> Any:
+        cached_at = self._account_type_cached_at.get(address)
+        if cached_at is None:
+            return _MISSING
+        age = (self.clock() - cached_at).total_seconds()
+        if age >= self.cfg.frequencies.account_type_cache_s:
+            self._account_types.pop(address, None)
+            self._account_type_cached_at.pop(address, None)
+            return _MISSING
+        return self._account_types.get(address, _MISSING)
+
+    def _cache_account_type(self, address: str, value: Any) -> None:
+        self._account_types[address] = value
+        self._account_type_cached_at[address] = self.clock()
+
+    def _log_fill_timeout(self, address: str, *, deferred: bool = False) -> None:
+        """同钱包真实成交补查超时每半小时至多记录一次 WARNING。"""
+        now = self.clock()
+        previous = self._fill_timeout_warnings.get(address)
+        warning_interval = self.cfg.frequencies.fill_timeout_warning_interval_s
+        emit_warning = (
+            previous is None or (now - previous).total_seconds() >= warning_interval
+        )
+        log = logger.warning if emit_warning else logger.debug
+        if deferred:
+            log(
+                "钱包 %s…%s 延期成交补查超过 %g 秒，将继续顺延",
+                address[:6],
+                address[-4:],
+                self.fill_lookup_timeout_s,
+            )
+        else:
+            log(
+                "钱包 %s…%s 成交补查超过 %g 秒，先按快照生成事件",
+                address[:6],
+                address[-4:],
+                self.fill_lookup_timeout_s,
+            )
+        if emit_warning:
+            self._fill_timeout_warnings[address] = now
 
 
 async def _initialize_fill_cursor(
