@@ -296,6 +296,9 @@ async def test_start_syncs_configured_core_before_spawning_tasks(engine, setting
     runtime = HyperliquidRuntime(settings.hyperliquid, _Health(), engine=engine, clock=clock)
     await asyncio.wait_for(runtime.start(), timeout=1)
     try:
+        assert "hl-discovery-cleanup" in {
+            task.get_name() for task in runtime.background_tasks()
+        }
         async with engine.connect() as conn:
             row = (
                 await conn.execute(select(hl_wallets).where(hl_wallets.c.address == configured))

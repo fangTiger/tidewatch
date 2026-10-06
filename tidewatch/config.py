@@ -185,6 +185,8 @@ class HyperliquidFrequenciesCfg(_Strict):
     label_refresh_interval_s: float = Field(default=86400, gt=0)
     discovery_window_s: float = Field(default=3, gt=0)
     discovery_cache_s: float = Field(default=3600, gt=0)
+    discovery_state_retention_s: float = Field(default=7200, gt=0)
+    discovery_cleanup_interval_s: float = Field(default=300, gt=0)
 
 
 class HyperliquidTiersCfg(_Strict):

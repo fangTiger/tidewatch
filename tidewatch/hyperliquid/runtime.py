@@ -212,6 +212,7 @@ class HyperliquidRuntime:
             self.settings.proxy,
         )
         await self.registry.sync_configured_core()
+        await self.discovery.cleanup_expired_state()
         await self.discovery.restore_pending()
         self._stop.clear()
         specs: tuple[tuple[str, Callable[[], Awaitable[None]]], ...] = (
@@ -219,6 +220,7 @@ class HyperliquidRuntime:
             ("hl-trades-ws", self.run_trades_ws),
             ("hl-core-ws", self.run_core_ws),
             ("hl-trade-messages", self.run_trade_messages),
+            ("hl-discovery-cleanup", self.run_discovery_cleanup),
             ("hl-core-subscriptions", self.run_core_subscriptions),
             ("hl-core-messages", self.run_core_messages),
             ("hl-leaderboard", self.run_leaderboard),
@@ -330,6 +332,15 @@ class HyperliquidRuntime:
             ) if isinstance(raw, list) else 0
             if latest:
                 await self.discovery.flush_due(latest)
+
+    async def run_discovery_cleanup(self) -> None:
+        """按配置周期删除过期的发现窗口与未达标缓存。"""
+        while not self._stop.is_set():
+            await self.discovery.cleanup_expired_state()
+            if await self._wait_or_stop(
+                self.settings.frequencies.discovery_cleanup_interval_s
+            ):
+                return
 
     async def run_core_subscriptions(self) -> None:
         """轮询数据库名单并动态增减核心钱包订阅。"""

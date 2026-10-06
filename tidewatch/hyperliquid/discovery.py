@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -26,6 +26,7 @@ from tidewatch.store.tables import hl_state, hl_wallets
 
 logger = logging.getLogger(__name__)
 ZERO_HASH = "0x" + "0" * 64
+MAX_TAKER_TIMESTAMPS = 301
 
 
 @dataclass(frozen=True)
@@ -155,8 +156,8 @@ class TradeDiscovery:
             window_seconds=cfg.frequencies.discovery_window_s
         )
         self._taker_times: dict[str, deque[int]] = defaultdict(deque)
-        self._processed: set[str] = set()
-        self._queued: set[str] = set()
+        self._processed: dict[str, datetime] = {}
+        self._queued: dict[str, datetime] = {}
 
     async def handle_message(self, message: Any) -> None:
         """解析一批成交流消息并更新窗口与一小时吃单计数。"""
@@ -166,12 +167,17 @@ class TradeDiscovery:
             while times and times[0] < cutoff:
                 times.popleft()
             times.append(trade.time_ms)
+            while len(times) > MAX_TAKER_TIMESTAMPS:
+                times.popleft()
             self.aggregator.add(trade)
 
     async def flush_due(self, through_ms: int) -> None:
         """关闭到期窗口，并按名单、风格、频率与缓存决定后续动作。"""
+        self._evict_taker_times(through_ms)
         threshold = Decimal(str(self.cfg.events.discovery_trade_notional_usd))
         for window in self.aggregator.pop_due(through_ms):
+            if window.notional_usd < threshold:
+                continue
             request = QualificationRequest(**window.__dict__)
             name = self._window_state_name(request)
             if (
@@ -179,12 +185,9 @@ class TradeDiscovery:
                 or name in self._queued
                 or await self._window_already_handled(name)
             ):
-                self._processed.add(name)
+                self._processed[name] = self.clock()
                 continue
             await self._write_window(request, status="closed", processed=False)
-            if window.notional_usd < threshold:
-                await self.mark_processed(request, outcome="below_threshold")
-                continue
             wallet = await self._wallet(window.address)
             if wallet is not None and wallet["tier"] in {"focus", "core"}:
                 if self.trigger_reconcile is not None:
@@ -214,8 +217,41 @@ class TradeDiscovery:
                 await self.process_qualification(request)
             else:
                 await _invoke(self.schedule_query, request)
-                self._queued.add(name)
+                self._queued[name] = self.clock()
                 await self._write_window(request, status="queued", processed=False)
+
+    async def cleanup_expired_state(self) -> int:
+        """删除过期发现状态，并同步淘汰进程内幂等索引。"""
+        now = self.clock()
+        window_cutoff = now - timedelta(
+            seconds=self.cfg.frequencies.discovery_state_retention_s
+        )
+        cache_cutoff = now - timedelta(
+            seconds=self.cfg.frequencies.discovery_cache_s
+        )
+        stmt = delete(hl_state).where(
+            or_(
+                and_(
+                    hl_state.c.name.like("discovery_window:%"),
+                    hl_state.c.updated_at <= window_cutoff,
+                ),
+                and_(
+                    hl_state.c.name.like("discovery_cache:%"),
+                    hl_state.c.updated_at <= cache_cutoff,
+                ),
+            )
+        )
+        async with self.engine.begin() as conn:
+            result = await conn.execute(stmt)
+        for memory in (self._processed, self._queued):
+            expired = [
+                name
+                for name, updated_at in memory.items()
+                if updated_at <= window_cutoff
+            ]
+            for name in expired:
+                memory.pop(name, None)
+        return result.rowcount or 0
 
     async def restore_pending(self) -> None:
         """重启时恢复已持久化但尚未完成的资格查询。"""
@@ -250,7 +286,7 @@ class TradeDiscovery:
                 logger.warning("忽略损坏的发现查询游标 %s：%s", name, exc)
                 continue
             await _invoke(self.schedule_query, request)
-            self._queued.add(name)
+            self._queued[name] = self.clock()
 
     async def may_schedule(self, address: str) -> bool:
         """未达标缓存过期后才允许重新安排资格查询。"""
@@ -360,8 +396,8 @@ class TradeDiscovery:
     ) -> None:
         """持久化窗口终态，保证重启回放不会重复处理。"""
         name = self._window_state_name(request)
-        self._processed.add(name)
-        self._queued.discard(name)
+        self._processed[name] = self.clock()
+        self._queued.pop(name, None)
         await self._write_window(
             request,
             status=outcome,
@@ -402,6 +438,18 @@ class TradeDiscovery:
                 select(hl_state.c.cursor).where(hl_state.c.name == name)
             )
         return isinstance(cursor, Mapping) and bool(cursor.get("processed"))
+
+    def _evict_taker_times(self, through_ms: int) -> None:
+        """淘汰一小时窗口外的吃单计数及不再活跃的地址键。"""
+        cutoff = through_ms - 3_600_000
+        inactive: list[str] = []
+        for address, times in self._taker_times.items():
+            while times and times[0] < cutoff:
+                times.popleft()
+            if not times:
+                inactive.append(address)
+        for address in inactive:
+            self._taker_times.pop(address, None)
 
     async def _write_window(
         self,

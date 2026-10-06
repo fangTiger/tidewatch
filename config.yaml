@@ -31,6 +31,8 @@ hyperliquid:
     label_refresh_interval_s: 86400
     discovery_window_s: 3
     discovery_cache_s: 3600
+    discovery_state_retention_s: 7200
+    discovery_cleanup_interval_s: 300
   tiers:
     core_limit: 10
     focus_limit: 200

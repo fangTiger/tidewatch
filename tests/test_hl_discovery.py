@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -151,6 +151,184 @@ def test_replayed_normal_trade_is_deduplicated_without_dropping_distinct_twap_sl
     [window] = aggregator.pop_due(3_000)
     assert window.trade_count == 3
     assert window.notional_usd == Decimal("300")
+
+
+@async_timeout()
+async def test_many_below_threshold_windows_do_not_persist_discovery_state(
+    engine, settings, clock
+):
+    discovery = TradeDiscovery(
+        settings.hyperliquid,
+        engine=engine,
+        registry=WalletRegistry(engine, clock=clock),
+        monitor=None,
+        rest=None,
+        sink=None,
+        clock=clock,
+    )
+    trades = [
+        _trade(
+            address=f"0x{index + 1:040x}",
+            time_ms=1_000,
+            px="100",
+            sz="1",
+            tid=index + 1,
+            trade_hash=f"0x{index + 1:064x}",
+        )
+        for index in range(200)
+    ]
+
+    await discovery.handle_message({"channel": "trades", "data": trades})
+    await discovery.flush_due(3_000)
+
+    async with engine.connect() as conn:
+        count = await conn.scalar(
+            select(func.count()).select_from(hl_state).where(
+                hl_state.c.name.like("discovery_window:%")
+            )
+        )
+    assert count == 0
+
+
+@async_timeout()
+async def test_trade_counters_are_capped_and_inactive_addresses_are_evicted(
+    engine, settings, clock
+):
+    busy = "0x1111111111111111111111111111111111111111"
+    inactive = "0x2222222222222222222222222222222222222222"
+    discovery = TradeDiscovery(
+        settings.hyperliquid,
+        engine=engine,
+        registry=WalletRegistry(engine, clock=clock),
+        monitor=None,
+        rest=None,
+        sink=None,
+        clock=clock,
+    )
+    busy_trades = [
+        _trade(
+            address=busy,
+            time_ms=index,
+            px="1",
+            sz="1",
+            tid=index,
+            trade_hash=f"0x{index:064x}",
+        )
+        for index in range(1_000)
+    ]
+
+    await discovery.handle_message(
+        {
+            "channel": "trades",
+            "data": [
+                _trade(
+                    address=inactive,
+                    time_ms=0,
+                    px="1",
+                    sz="1",
+                    tid=2_000,
+                ),
+                *busy_trades,
+            ],
+        }
+    )
+
+    assert len(discovery._taker_times[busy]) == 301
+    await discovery.flush_due(3_603_000)
+    assert discovery.aggregator._windows == {}
+    assert discovery._taker_times == {}
+
+
+@async_timeout()
+async def test_expired_discovery_state_is_cleaned_without_touching_other_state(
+    engine, settings, clock
+):
+    settings.hyperliquid.frequencies.discovery_state_retention_s = 7_200
+    settings.hyperliquid.frequencies.discovery_cleanup_interval_s = 300
+    discovery = TradeDiscovery(
+        settings.hyperliquid,
+        engine=engine,
+        registry=WalletRegistry(engine, clock=clock),
+        monitor=None,
+        rest=None,
+        sink=None,
+        clock=clock,
+    )
+    rows = [
+        {
+            "name": "discovery_window:old",
+            "cursor": {"processed": True},
+            "updated_at": clock.now - timedelta(hours=2, seconds=1),
+        },
+        {
+            "name": "discovery_window:fresh",
+            "cursor": {"processed": True},
+            "updated_at": clock.now - timedelta(hours=1),
+        },
+        {
+            "name": "discovery_cache:old",
+            "cursor": {"expires_at": (clock.now - timedelta(seconds=1)).isoformat()},
+            "updated_at": clock.now - timedelta(hours=1, seconds=1),
+        },
+        {
+            "name": "discovery_cache:fresh",
+            "cursor": {"expires_at": (clock.now + timedelta(seconds=1)).isoformat()},
+            "updated_at": clock.now - timedelta(minutes=59),
+        },
+        {
+            "name": "monitor_baseline:old",
+            "cursor": {},
+            "updated_at": clock.now - timedelta(days=1),
+        },
+    ]
+    async with engine.begin() as conn:
+        await conn.execute(insert(hl_state), rows)
+
+    deleted = await discovery.cleanup_expired_state()
+
+    async with engine.connect() as conn:
+        names = set((await conn.execute(select(hl_state.c.name))).scalars())
+    assert deleted == 2
+    assert names == {
+        "discovery_window:fresh",
+        "discovery_cache:fresh",
+        "monitor_baseline:old",
+    }
+
+
+@async_timeout()
+async def test_runtime_periodically_cleans_discovery_state(engine, settings, clock):
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        FakeHealth(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+    )
+    cleanups = 0
+    intervals: list[float] = []
+
+    async def cleanup() -> int:
+        nonlocal cleanups
+        cleanups += 1
+        return 0
+
+    async def wait_or_stop(interval: float) -> bool:
+        intervals.append(interval)
+        return cleanups == 2
+
+    runtime.discovery.cleanup_expired_state = cleanup
+    runtime._wait_or_stop = wait_or_stop
+    try:
+        await asyncio.wait_for(runtime.run_discovery_cleanup(), timeout=1)
+    finally:
+        await runtime.close_resources()
+
+    assert cleanups == 2
+    assert intervals == [
+        settings.hyperliquid.frequencies.discovery_cleanup_interval_s,
+        settings.hyperliquid.frequencies.discovery_cleanup_interval_s,
+    ]
 
 
 @async_timeout()
@@ -531,8 +709,14 @@ async def test_processed_window_persists_and_restart_does_not_emit_again(
                 hl_state.c.name.like("discovery_window:%")
             )
         )
+        cursor = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name.like("discovery_window:%")
+            )
+        )
         event_count = await conn.scalar(select(func.count()).select_from(events))
     assert count == 1
+    assert cursor["status"] == "qualified" and cursor["processed"] is True
     assert event_count == 1
 
 
