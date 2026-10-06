@@ -191,6 +191,96 @@ async def test_many_below_threshold_windows_do_not_persist_discovery_state(
 
 
 @async_timeout()
+async def test_discovery_summary_reports_interval_counts_and_resets(
+    engine, settings, clock, caplog
+):
+    settings.hyperliquid.frequencies.discovery_summary_interval_s = 300
+    focus = "0x1111111111111111111111111111111111111111"
+    high_frequency = "0x2222222222222222222222222222222222222222"
+    not_qualified = "0x3333333333333333333333333333333333333333"
+    promoted = "0x4444444444444444444444444444444444444444"
+    below_threshold = "0x5555555555555555555555555555555555555555"
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            assert request_type == "clearinghouseState"
+            account_value = "1000000" if params["user"] == promoted else "999999"
+            return True, {
+                "marginSummary": {"accountValue": account_value, "totalNtlPos": "0"},
+                "assetPositions": [],
+            }
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets),
+            [
+                {
+                    "address": focus,
+                    "tier": "focus",
+                    "source": "manual",
+                    "style": None,
+                },
+                {
+                    "address": high_frequency,
+                    "tier": "candidate",
+                    "source": "leaderboard",
+                    "style": "high_frequency",
+                },
+            ],
+        )
+    discovery = TradeDiscovery(
+        settings.hyperliquid,
+        engine=engine,
+        registry=WalletRegistry(engine, clock=clock),
+        monitor=None,
+        rest=Rest(),
+        sink=None,
+        clock=clock,
+    )
+    trades = [
+        _trade(address=focus, time_ms=1_000, px="100", sz="60000", tid=1),
+        _trade(address=high_frequency, time_ms=1_000, px="100", sz="70000", tid=2),
+        _trade(address=not_qualified, time_ms=1_000, px="100", sz="80000", tid=3),
+        _trade(
+            address=promoted,
+            time_ms=1_000,
+            px="100",
+            sz="90000",
+            coin="SOL",
+            tid=4,
+        ),
+        _trade(address=below_threshold, time_ms=1_000, px="100", sz="40000", tid=5),
+    ]
+    caplog.set_level("INFO", logger="tidewatch.hyperliquid.discovery")
+
+    await discovery.handle_message({"channel": "trades", "data": trades})
+    await discovery.flush_due(3_000)
+    discovery.record_query_limit_deferral()
+    clock.advance(seconds=300)
+    await discovery.flush_due(3_000)
+
+    summaries = [
+        record.message for record in caplog.records if "成交流发现摘要" in record.message
+    ]
+    assert summaries == [
+        "成交流发现摘要：处理成交 5 笔，关闭窗口 5 个，最大窗口名义 "
+        "9000000 美元（SOL，0x4444…4444），≥门槛窗口 4 个，资格查询 2 次，"
+        "达标晋升 1 个，不达标缓存 1 个，高频跳过 1 个，因查询限额顺延 1 次"
+    ]
+
+    clock.advance(seconds=300)
+    await discovery.flush_due(3_000)
+    summaries = [
+        record.message for record in caplog.records if "成交流发现摘要" in record.message
+    ]
+    assert summaries[-1] == (
+        "成交流发现摘要：处理成交 0 笔，关闭窗口 0 个，最大窗口名义 无，"
+        "≥门槛窗口 0 个，资格查询 0 次，达标晋升 0 个，不达标缓存 0 个，"
+        "高频跳过 0 个，因查询限额顺延 0 次"
+    )
+
+
+@async_timeout()
 async def test_trade_counters_are_capped_and_inactive_addresses_are_evicted(
     engine, settings, clock
 ):
@@ -1008,6 +1098,13 @@ async def test_discovery_query_cap_leaves_ready_hot_reconcile_runnable(
 
     runtime.discovery.process_qualification = qualify
     runtime.monitor.reconcile = reconcile
+    deferred = 0
+
+    def record_deferral() -> None:
+        nonlocal deferred
+        deferred += 1
+
+    runtime.discovery.record_query_limit_deferral = record_deferral
     for index in range(4):
         runtime._schedule_discovery_query(
             QualificationRequest(
@@ -1035,3 +1132,4 @@ async def test_discovery_query_cap_leaves_ready_hot_reconcile_runnable(
     assert len(discovery_calls) == settings.hyperliquid.discovery_query_limit_per_min
     assert reconcile_calls == [hot]
     assert len(runtime._pending_discoveries) == 1
+    assert deferred == 1

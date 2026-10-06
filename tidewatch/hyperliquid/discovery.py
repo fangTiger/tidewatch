@@ -81,6 +81,21 @@ class _OpenWindow:
     identities: set[tuple[Any, ...]] = field(default_factory=set)
 
 
+@dataclass
+class _DiscoverySummary:
+    """一个可观测性输出周期内的发现流水统计。"""
+
+    processed_trades: int = 0
+    closed_windows: int = 0
+    max_window: TradeWindow | None = None
+    threshold_windows: int = 0
+    qualification_queries: int = 0
+    promotions: int = 0
+    not_qualified_caches: int = 0
+    high_frequency_skips: int = 0
+    query_limit_deferrals: int = 0
+
+
 class TradeAggregator:
     """按固定时间窗累计成交，并对重复 WS 投递保持幂等。"""
 
@@ -158,10 +173,14 @@ class TradeDiscovery:
         self._taker_times: dict[str, deque[int]] = defaultdict(deque)
         self._processed: dict[str, datetime] = {}
         self._queued: dict[str, datetime] = {}
+        self._summary = _DiscoverySummary()
+        self._summary_started_at = self.clock()
 
     async def handle_message(self, message: Any) -> None:
         """解析一批成交流消息并更新窗口与一小时吃单计数。"""
-        for trade in parse_trade_message(message):
+        trades = parse_trade_message(message)
+        self._summary.processed_trades += len(trades)
+        for trade in trades:
             cutoff = trade.time_ms - 3_600_000
             times = self._taker_times[trade.taker]
             while times and times[0] < cutoff:
@@ -175,9 +194,17 @@ class TradeDiscovery:
         """关闭到期窗口，并按名单、风格、频率与缓存决定后续动作。"""
         self._evict_taker_times(through_ms)
         threshold = Decimal(str(self.cfg.events.discovery_trade_notional_usd))
-        for window in self.aggregator.pop_due(through_ms):
+        windows = self.aggregator.pop_due(through_ms)
+        self._summary.closed_windows += len(windows)
+        for window in windows:
+            if (
+                self._summary.max_window is None
+                or window.notional_usd > self._summary.max_window.notional_usd
+            ):
+                self._summary.max_window = window
             if window.notional_usd < threshold:
                 continue
+            self._summary.threshold_windows += 1
             request = QualificationRequest(**window.__dict__)
             name = self._window_state_name(request)
             if (
@@ -195,6 +222,7 @@ class TradeDiscovery:
                 await self.mark_processed(request, outcome="monitored")
                 continue
             if wallet is not None and wallet["style"] in NON_PROMOTABLE_STYLES:
+                self._summary.high_frequency_skips += 1
                 logger.warning(
                     "跳过已标记做市/高频的钱包 %s…%s 新巨鲸资格查询",
                     window.address[:6],
@@ -203,6 +231,7 @@ class TradeDiscovery:
                 await self.mark_processed(request, outcome="known_high_frequency")
                 continue
             if len(self._taker_times.get(window.address, ())) > 300:
+                self._summary.high_frequency_skips += 1
                 logger.warning(
                     "跳过一小时吃单超过 300 笔的高频陌生钱包 %s…%s",
                     window.address[:6],
@@ -219,6 +248,11 @@ class TradeDiscovery:
                 await _invoke(self.schedule_query, request)
                 self._queued[name] = self.clock()
                 await self._write_window(request, status="queued", processed=False)
+        self._maybe_log_summary()
+
+    def record_query_limit_deferral(self) -> None:
+        """记录一次发现资格查询因每分钟上限而顺延。"""
+        self._summary.query_limit_deferrals += 1
 
     async def cleanup_expired_state(self) -> int:
         """删除过期发现状态，并同步淘汰进程内幂等索引。"""
@@ -306,6 +340,7 @@ class TradeDiscovery:
         """用共享 REST 客户端完成资格查询；预算不足时返回 False 供队列顺延。"""
         if self.rest is None:
             return False
+        self._summary.qualification_queries += 1
         params: dict[str, Any] = {"user": request.address}
         if ":" in request.coin:
             params["dex"] = request.coin.split(":", 1)[0]
@@ -327,6 +362,7 @@ class TradeDiscovery:
         account_threshold = Decimal(str(self.cfg.events.discovery_account_value_usd))
         if position_notional < position_threshold and account_value < account_threshold:
             await self._cache_not_qualified(request.address)
+            self._summary.not_qualified_caches += 1
             await self.mark_processed(request, outcome="not_qualified")
             return True
 
@@ -337,6 +373,7 @@ class TradeDiscovery:
             last_trade_at=occurred_at,
         )
         if promotion.promoted:
+            self._summary.promotions += 1
             dex = request.coin.split(":", 1)[0] if ":" in request.coin else ""
             async with self.engine.begin() as conn:
                 await upsert_position_snapshot(
@@ -450,6 +487,37 @@ class TradeDiscovery:
                 inactive.append(address)
         for address in inactive:
             self._taker_times.pop(address, None)
+
+    def _maybe_log_summary(self) -> None:
+        """到达配置周期时输出发现摘要，并从零开始下一周期。"""
+        now = self.clock()
+        interval = self.cfg.frequencies.discovery_summary_interval_s
+        if (now - self._summary_started_at).total_seconds() < interval:
+            return
+        maximum = self._summary.max_window
+        if maximum is None:
+            maximum_text = "无"
+        else:
+            maximum_text = (
+                f"{maximum.notional_usd} 美元（{maximum.coin}，"
+                f"{maximum.address[:6]}…{maximum.address[-4:]}）"
+            )
+        logger.info(
+            "成交流发现摘要：处理成交 %d 笔，关闭窗口 %d 个，最大窗口名义 %s，"
+            "≥门槛窗口 %d 个，资格查询 %d 次，达标晋升 %d 个，不达标缓存 %d 个，"
+            "高频跳过 %d 个，因查询限额顺延 %d 次",
+            self._summary.processed_trades,
+            self._summary.closed_windows,
+            maximum_text,
+            self._summary.threshold_windows,
+            self._summary.qualification_queries,
+            self._summary.promotions,
+            self._summary.not_qualified_caches,
+            self._summary.high_frequency_skips,
+            self._summary.query_limit_deferrals,
+        )
+        self._summary = _DiscoverySummary()
+        self._summary_started_at = now
 
     async def _write_window(
         self,

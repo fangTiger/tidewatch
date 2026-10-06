@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum, IntEnum
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -25,6 +25,7 @@ from tidewatch.hyperliquid.baseline import (
 )
 from tidewatch.hyperliquid.detect import (
     PositionSnapshot,
+    delete_liquidation_risk_state,
     detect_events_with_state,
     load_liquidation_risk_state,
     save_liquidation_risk_state,
@@ -217,9 +218,19 @@ class HyperliquidMonitor:
         sink: Any,
         clock: Clock = utcnow,
         fill_lookup_timeout_s: float = 5.0,
+        deferred_fill_lookup_timeout_s: float | None = None,
         account_lookup_timeout_s: float = 5.0,
     ) -> None:
-        if fill_lookup_timeout_s <= 0 or account_lookup_timeout_s <= 0:
+        deferred_timeout = (
+            cfg.frequencies.deferred_fill_lookup_timeout_s
+            if deferred_fill_lookup_timeout_s is None
+            else deferred_fill_lookup_timeout_s
+        )
+        if (
+            fill_lookup_timeout_s <= 0
+            or deferred_timeout <= 0
+            or account_lookup_timeout_s <= 0
+        ):
             raise ValueError("成交补查与账户查询超时必须大于 0")
         self.cfg = cfg
         self.engine = engine
@@ -227,6 +238,7 @@ class HyperliquidMonitor:
         self.sink = sink
         self.clock = clock
         self.fill_lookup_timeout_s = fill_lookup_timeout_s
+        self.deferred_fill_lookup_timeout_s = deferred_timeout
         self.account_lookup_timeout_s = account_lookup_timeout_s
         self.mids: dict[str, Decimal] = {}
         self._account_types: dict[str, Any] = {}
@@ -341,8 +353,12 @@ class HyperliquidMonitor:
         changed_coins: set[str],
         *,
         remember: bool = True,
+        timeout_s: float | None = None,
     ) -> _FillLookupResult:
         """补查成交并区分节流、预算顺延与真实网络超时。"""
+        request_timeout_s = (
+            self.fill_lookup_timeout_s if timeout_s is None else timeout_s
+        )
         normalized = normalize_address(address)
         state_name = f"fills:{normalized}"
         async with self.engine.connect() as conn:
@@ -380,7 +396,7 @@ class HyperliquidMonitor:
                     user=normalized,
                     startTime=start_time,
                 ),
-                timeout=self.fill_lookup_timeout_s,
+                timeout=request_timeout_s,
             )
         except asyncio.TimeoutError:
             await self._defer_fill_query(normalized, changed_coins, now + timedelta(seconds=1))
@@ -399,7 +415,7 @@ class HyperliquidMonitor:
             try:
                 available, raw_twap = await asyncio.wait_for(
                     self._try_info("userTwapSliceFills", user=normalized),
-                    timeout=self.fill_lookup_timeout_s,
+                    timeout=request_timeout_s,
                 )
             except asyncio.TimeoutError:
                 await self._defer_fill_query(
@@ -444,7 +460,12 @@ class HyperliquidMonitor:
         ]
         for address, coins in due:
             self._deferred_fills.pop(address, None)
-            result = await self._lookup_fill_evidence(address, set(coins), remember=False)
+            result = await self._lookup_fill_evidence(
+                address,
+                set(coins),
+                remember=False,
+                timeout_s=self.deferred_fill_lookup_timeout_s,
+            )
             if result.status is _FillLookupStatus.TIMEOUT:
                 self._log_fill_timeout(address, deferred=True)
             elif result.status is _FillLookupStatus.DEFERRED:
@@ -655,6 +676,47 @@ class HyperliquidMonitor:
             ).mappings().all()
         return select_hot_wallets(rows, self.mids, self.cfg)
 
+    async def cleanup_liquidation_risk_states(self) -> int:
+        """删除无当前受监控仓位对应关系的强平风险状态。"""
+        async with self.engine.begin() as conn:
+            positions = (
+                await conn.execute(
+                    select(
+                        hl_positions.c.address,
+                        hl_positions.c.dex,
+                        hl_positions.c.coin,
+                    )
+                    .join(
+                        hl_wallets,
+                        hl_wallets.c.address == hl_positions.c.address,
+                    )
+                    .where(
+                        hl_wallets.c.tier.in_(("focus", "core")),
+                        hl_wallets.c.excluded.is_(False),
+                    )
+                )
+            ).all()
+            valid_names = {
+                f"liq_risk:{address}:{dex}:{coin}"
+                for address, dex, coin in positions
+            }
+            existing_names = set(
+                (
+                    await conn.execute(
+                        select(hl_state.c.name).where(
+                            hl_state.c.name.like("liq_risk:%")
+                        )
+                    )
+                ).scalars()
+            )
+            stale_names = existing_names - valid_names
+            if not stale_names:
+                return 0
+            result = await conn.execute(
+                delete(hl_state).where(hl_state.c.name.in_(stale_names))
+            )
+        return result.rowcount or 0
+
     async def _process_states(
         self,
         address: str,
@@ -723,8 +785,10 @@ class HyperliquidMonitor:
         wallet = dict(wallet_row or {})
         events = []
         next_risks: dict[tuple[str, str], str | None] = {}
+        current_snapshots: dict[tuple[str, str], PositionSnapshot] = {}
         used_fill_keys: list[tuple[str, str]] = []
         for old, new in transitions:
+            current_snapshots[(new.dex, new.coin)] = new
             if fill is not None and fill.get("coin") == new.coin:
                 evidence = fill
             else:
@@ -771,7 +835,18 @@ class HyperliquidMonitor:
                     updated_at=now,
                 )
             for (dex, coin), level in next_risks.items():
-                await save_liquidation_risk_state(conn, address, dex, coin, level, now)
+                current = current_snapshots[(dex, coin)]
+                if current.szi == 0 or current.notional_usd <= 0:
+                    await delete_liquidation_risk_state(conn, address, dex, coin)
+                else:
+                    await save_liquidation_risk_state(
+                        conn,
+                        address,
+                        dex,
+                        coin,
+                        level,
+                        now,
+                    )
             dexes = sorted({dex for dex, _ in responses if dex})
             if dexes:
                 await _save_known_dexes(conn, address, dexes, now)
@@ -927,11 +1002,12 @@ class HyperliquidMonitor:
         )
         log = logger.warning if emit_warning else logger.debug
         if deferred:
+            timeout_s = self.deferred_fill_lookup_timeout_s
             log(
                 "钱包 %s…%s 延期成交补查超过 %g 秒，将继续顺延（真实网络超时）",
                 address[:6],
                 address[-4:],
-                self.fill_lookup_timeout_s,
+                timeout_s,
             )
         else:
             log(

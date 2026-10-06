@@ -212,6 +212,7 @@ class HyperliquidRuntime:
             self.settings.proxy,
         )
         await self.registry.sync_configured_core()
+        await self.monitor.cleanup_liquidation_risk_states()
         await self.discovery.cleanup_expired_state()
         await self.discovery.restore_pending()
         self._stop.clear()
@@ -555,6 +556,7 @@ class HyperliquidRuntime:
         if is_discovery:
             next_query_at = await self._reserve_discovery_query(now)
             if next_query_at is not None:
+                self.discovery.record_query_limit_deferral()
                 self.reconcile_queue.defer(task, due_at=next_query_at)
                 return
         try:

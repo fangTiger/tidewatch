@@ -60,6 +60,48 @@ async def test_runtime_logs_proxy_ip_notice_once_on_start(engine, settings, cloc
 
 
 @async_timeout()
+async def test_runtime_cleans_liquidation_risk_orphans_before_starting_tasks(
+    engine, settings, clock
+):
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        _Health(),
+        engine=engine,
+        clock=clock,
+    )
+    cleanup_calls = 0
+
+    async def cleanup_liquidation_risk_states() -> int:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        return 0
+
+    async def idle() -> None:
+        await runtime._stop.wait()
+
+    runtime.monitor.cleanup_liquidation_risk_states = cleanup_liquidation_risk_states
+    for name in (
+        "run_rest",
+        "run_trades_ws",
+        "run_core_ws",
+        "run_trade_messages",
+        "run_discovery_cleanup",
+        "run_core_subscriptions",
+        "run_core_messages",
+        "run_leaderboard",
+        "run_tier_recompute",
+        "run_profile",
+        "run_market_data",
+    ):
+        setattr(runtime, name, idle)
+
+    await asyncio.wait_for(runtime.start(), timeout=1)
+    await asyncio.wait_for(runtime.stop(), timeout=1)
+
+    assert cleanup_calls == 1
+
+
+@async_timeout()
 async def test_empty_registry_imports_immediately_then_recomputes(engine, settings, clock):
     runtime = HyperliquidRuntime(settings.hyperliquid, _Health(), engine=engine, clock=clock)
     imported = asyncio.Event()

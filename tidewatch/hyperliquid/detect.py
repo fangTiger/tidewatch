@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -593,5 +593,19 @@ async def save_liquidation_risk_state(
         stmt.on_conflict_do_update(
             index_elements=["name"],
             set_={"cursor": stmt.excluded.cursor, "updated_at": stmt.excluded.updated_at},
+        )
+    )
+
+
+async def delete_liquidation_risk_state(
+    conn: AsyncConnection,
+    address: str,
+    dex: str,
+    coin: str,
+) -> None:
+    """删除已平仓仓位对应的强平风险滞回状态。"""
+    await conn.execute(
+        delete(hl_state).where(
+            hl_state.c.name == _state_name(address, dex, coin)
         )
     )

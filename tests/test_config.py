@@ -352,7 +352,9 @@ def test_hyperliquid_default_config_is_valid_and_complete(tmp_path):
     assert cfg.frequencies.hot_reconcile_interval_s == 20
     assert cfg.frequencies.focus_reconcile_interval_s == 180
     assert cfg.frequencies.account_type_cache_s == 3600
+    assert cfg.frequencies.deferred_fill_lookup_timeout_s == 15
     assert cfg.frequencies.fill_timeout_warning_interval_s == 1800
+    assert cfg.frequencies.discovery_summary_interval_s == 300
     assert cfg.frequencies.leaderboard_interval_s == 12 * 60 * 60
     assert cfg.tiers.core_limit == 10
     assert cfg.tiers.focus_limit == 200
@@ -417,6 +419,14 @@ def test_hyperliquid_budget_must_be_positive_and_reports_chinese(tmp_path, field
     [
         ("reconcile_concurrency: 0", "reconcile_concurrency"),
         ("frequencies:\n    hot_reconcile_interval_s: 0", "frequencies.hot_reconcile_interval_s"),
+        (
+            "frequencies:\n    deferred_fill_lookup_timeout_s: 0",
+            "frequencies.deferred_fill_lookup_timeout_s",
+        ),
+        (
+            "frequencies:\n    discovery_summary_interval_s: 0",
+            "frequencies.discovery_summary_interval_s",
+        ),
         ("tiers:\n    focus_limit: 0", "tiers.focus_limit"),
         ("events:\n    a_level_notional_usd: 0", "events.a_level_notional_usd"),
         ("health:\n    hl_rest:\n      stale_after_s: 0", "health.hl_rest.stale_after_s"),

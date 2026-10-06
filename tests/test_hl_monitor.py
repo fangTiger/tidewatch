@@ -10,7 +10,7 @@ import httpx
 import respx
 from sqlalchemy import delete, func, insert, select
 
-from fakes import FakeHealth
+from fakes import FakeHealth, async_timeout
 from tidewatch.collectors.base import TokenBucket
 from tidewatch.hyperliquid.client import REST_URL, HyperliquidRestClient
 from tidewatch.hyperliquid.monitor import (
@@ -920,6 +920,8 @@ async def test_fill_lookup_timeout_does_not_hold_snapshot_event(
 async def test_deferred_fill_timeout_is_wallet_rate_limited_and_identifies_real_timeout(
     engine, settings, clock, caplog
 ):
+    settings.hyperliquid.frequencies.deferred_fill_lookup_timeout_s = 0.02
+
     class Rest:
         async def try_info(self, request_type: str, **params):
             if request_type == "userFillsByTime":
@@ -932,7 +934,7 @@ async def test_deferred_fill_timeout_is_wallet_rate_limited_and_identifies_real_
         rest=Rest(),
         sink=None,
         clock=clock,
-        fill_lookup_timeout_s=0.01,
+        fill_lookup_timeout_s=0.005,
     )
     await _seed_baseline(engine, clock)
     await asyncio.wait_for(
@@ -955,6 +957,84 @@ async def test_deferred_fill_timeout_is_wallet_rate_limited_and_identifies_real_
     ]
     assert [record.levelname for record in records] == ["WARNING", "DEBUG", "WARNING"]
     assert all("真实网络超时" in record.message for record in records)
+    assert all("0.02 秒" in record.message for record in records)
+
+
+@async_timeout()
+async def test_liquidation_risk_cleanup_keeps_only_monitored_current_positions(
+    engine, settings, clock
+):
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets),
+            [
+                {"address": ADDRESS, "tier": "focus", "source": "manual"},
+                {"address": OTHER, "tier": "candidate", "source": "leaderboard"},
+            ],
+        )
+        await conn.execute(
+            insert(hl_positions),
+            [
+                {
+                    "address": ADDRESS,
+                    "dex": "",
+                    "coin": "BTC",
+                    "szi": Decimal("1"),
+                    "notional_usd": Decimal("1000000"),
+                    "updated_at": clock.now,
+                },
+                {
+                    "address": OTHER,
+                    "dex": "xyz",
+                    "coin": "xyz:GOLD",
+                    "szi": Decimal("1"),
+                    "notional_usd": Decimal("1000000"),
+                    "updated_at": clock.now,
+                },
+            ],
+        )
+        await conn.execute(
+            insert(hl_state),
+            [
+                {
+                    "name": f"liq_risk:{ADDRESS}::BTC",
+                    "cursor": {"level": "A"},
+                    "updated_at": clock.now,
+                },
+                {
+                    "name": f"liq_risk:{ADDRESS}::ETH",
+                    "cursor": {"level": "B"},
+                    "updated_at": clock.now,
+                },
+                {
+                    "name": f"liq_risk:{OTHER}:xyz:xyz:GOLD",
+                    "cursor": {"level": "S"},
+                    "updated_at": clock.now,
+                },
+            ],
+        )
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=None,
+        sink=None,
+        clock=clock,
+    )
+
+    deleted = await asyncio.wait_for(
+        monitor.cleanup_liquidation_risk_states(), timeout=5
+    )
+
+    async with engine.connect() as conn:
+        names = set(
+            (
+                await conn.execute(
+                    select(hl_state.c.name).where(hl_state.c.name.like("liq_risk:%"))
+                )
+            ).scalars()
+        )
+    assert deleted == 2
+    assert names == {f"liq_risk:{ADDRESS}::BTC"}
 
 
 def test_normal_and_deferred_fill_timeouts_share_wallet_warning_limit(
@@ -1224,6 +1304,13 @@ async def test_known_hip3_dex_remains_reconciled_after_position_closes(engine, s
                 updated_at=clock.now,
             )
         )
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"liq_risk:{ADDRESS}:xyz:xyz:SILVER",
+                cursor={"level": "A"},
+                updated_at=clock.now,
+            )
+        )
     sink = create_event_sink(engine, settings, clock=clock)
     await sink.start()
     monitor = HyperliquidMonitor(settings.hyperliquid, engine=engine, rest=Rest(), sink=sink, clock=clock)
@@ -1240,6 +1327,13 @@ async def test_known_hip3_dex_remains_reconciled_after_position_closes(engine, s
         {"type": "clearinghouseState", "budget": "monitor", "user": ADDRESS},
         {"type": "clearinghouseState", "budget": "monitor", "user": ADDRESS, "dex": "xyz"},
     ]
+    async with engine.connect() as conn:
+        risk = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name == f"liq_risk:{ADDRESS}:xyz:xyz:SILVER"
+            )
+        )
+    assert risk is None
 
 
 async def test_configured_hip3_dex_is_queried_before_wallet_has_local_position(

@@ -178,6 +178,7 @@ class HyperliquidFrequenciesCfg(_Strict):
     focus_reconcile_interval_s: float = Field(default=180, gt=0)
     fill_query_min_interval_s: float = Field(default=60, gt=0)
     account_type_cache_s: float = Field(default=3600, gt=0)
+    deferred_fill_lookup_timeout_s: float = Field(default=15, gt=0)
     fill_timeout_warning_interval_s: float = Field(default=1800, gt=0)
     leaderboard_interval_s: float = Field(default=43200, gt=0)
     tier_recompute_interval_s: float = Field(default=86400, gt=0)
@@ -187,6 +188,7 @@ class HyperliquidFrequenciesCfg(_Strict):
     discovery_cache_s: float = Field(default=3600, gt=0)
     discovery_state_retention_s: float = Field(default=7200, gt=0)
     discovery_cleanup_interval_s: float = Field(default=300, gt=0)
+    discovery_summary_interval_s: float = Field(default=300, gt=0)
 
 
 class HyperliquidTiersCfg(_Strict):

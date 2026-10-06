@@ -54,7 +54,22 @@ async def test_monitor_baseline_is_invalidated_when_wallet_reenters_monitored_ti
         )
     assert baseline is None
 
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"liq_risk:{address}::BTC",
+                cursor={"level": "A"},
+                updated_at=clock.now,
+            )
+        )
     assert await registry.set_excluded(address, True)
+    async with engine.connect() as conn:
+        risk = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name == f"liq_risk:{address}::BTC"
+            )
+        )
+    assert risk is None
     async with engine.begin() as conn:
         await conn.execute(
             insert(hl_state).values(
