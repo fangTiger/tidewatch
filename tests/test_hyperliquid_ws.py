@@ -314,3 +314,105 @@ async def test_ws_short_lived_messages_do_not_reset_reconnect_backoff():
             await _stop(manager, task)
 
     assert [delay for delay in sleeps if delay != 3600][:2] == [1, 2]
+
+
+async def test_ws_dynamic_unsubscribe_sends_protocol_message_and_releases_user_slot():
+    sent: list[dict] = []
+
+    class Socket:
+        async def send(self, message: str) -> None:
+            sent.append(json.loads(message))
+
+    manager = HyperliquidWsManager(proxy_mode="direct")
+    manager.add_connection("core")
+    subscription = {"type": "userFills", "user": "0x0000000000000000000000000000000000000001"}
+    manager.add_subscription("core", subscription)
+    manager._active["core"] = Socket()
+
+    assert await asyncio.wait_for(manager.unsubscribe("core", subscription), timeout=5)
+    assert sent == [{"method": "unsubscribe", "subscription": subscription}]
+    assert manager.subscription_count == 0
+
+
+async def test_ws_dynamic_subscription_state_survives_send_failure_during_disconnect():
+    class BrokenSocket:
+        async def send(self, message: str) -> None:
+            raise ConnectionError("连接正在断开")
+
+    health = FakeHealth()
+    manager = HyperliquidWsManager(proxy_mode="direct", health=health)
+    manager.add_connection("core")
+    manager._active["core"] = BrokenSocket()
+    subscription = {"type": "userFills", "user": "0x0000000000000000000000000000000000000001"}
+
+    assert await asyncio.wait_for(manager.subscribe("core", subscription), timeout=5)
+    assert manager.subscription_count == 1
+    assert await asyncio.wait_for(manager.unsubscribe("core", subscription), timeout=5)
+    assert manager.subscription_count == 0
+    assert len(health.failures) == 2
+
+
+async def test_ws_handler_failure_does_not_report_message_as_healthy():
+    async def server_handler(websocket) -> None:
+        await websocket.send(json.dumps({"channel": "broken"}))
+        await websocket.wait_closed()
+
+    async def handle_message(message) -> None:
+        raise ValueError("消息结构无效")
+
+    async with serve(server_handler, "127.0.0.1", 0) as server:
+        health = FakeHealth()
+        manager = HyperliquidWsManager(
+            url=f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}",
+            proxy_mode="direct",
+            health=health,
+            sleep=lambda seconds: asyncio.sleep(3600),
+        )
+        manager.add_connection("core", handler=handle_message)
+        task = asyncio.create_task(manager.run())
+        try:
+            async def wait_for_failure() -> None:
+                while not health.failures:
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(wait_for_failure(), timeout=5)
+        finally:
+            await _stop(manager, task)
+
+    assert health.successes == []
+
+
+async def test_ws_calls_reconnect_hook_after_each_subscription_restore():
+    connected = 0
+    restored = asyncio.Event()
+
+    async def handler(websocket) -> None:
+        nonlocal connected
+        connected += 1
+        await asyncio.wait_for(websocket.recv(), timeout=5)
+        if connected == 1:
+            await websocket.close()
+        else:
+            await websocket.wait_closed()
+
+    async def on_connect() -> None:
+        if connected == 2:
+            restored.set()
+
+    async with serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        manager = HyperliquidWsManager(
+            url=f"ws://127.0.0.1:{port}",
+            proxy_mode="direct",
+            sleep=lambda seconds: asyncio.sleep(0),
+            ping_interval_s=3600,
+        )
+        manager.add_connection("core", on_connect=on_connect)
+        manager.add_subscription("core", {"type": "allMids"})
+        task = asyncio.create_task(manager.run())
+        try:
+            await asyncio.wait_for(restored.wait(), timeout=5)
+        finally:
+            await _stop(manager, task)
+
+    assert connected == 2

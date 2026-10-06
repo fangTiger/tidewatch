@@ -18,6 +18,14 @@ class RecordingBucket:
         self.weights.append(weight)
 
 
+class DenyingBucket(RecordingBucket):
+    """模拟监控预算耗尽，确保请求不会等待或访问网络。"""
+
+    async def try_acquire(self, weight: float = 1) -> bool:
+        self.weights.append(weight)
+        return False
+
+
 async def _close(client: HyperliquidRestClient) -> None:
     await asyncio.wait_for(client.aclose(), timeout=5)
 
@@ -56,6 +64,42 @@ async def test_info_uses_selected_budget_without_borrowing_from_other_bucket():
 
     assert monitoring.weights == []
     assert batch.weights == [20]
+
+
+@respx.mock
+async def test_try_info_returns_immediately_without_network_when_budget_is_exhausted():
+    monitoring, batch = DenyingBucket(), RecordingBucket()
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json={}))
+    client = HyperliquidRestClient(monitoring, batch, proxy_mode="direct")
+    try:
+        result = await asyncio.wait_for(
+            client.try_info("clearinghouseState", user="0xabc"),
+            timeout=5,
+        )
+    finally:
+        await _close(client)
+
+    assert result == (False, None)
+    assert monitoring.weights == [2]
+    assert not route.called
+
+
+@respx.mock
+async def test_try_info_returns_transient_failure_to_priority_scheduler_without_retrying():
+    monitoring, batch = RecordingBucket(), RecordingBucket()
+    route = respx.post(REST_URL).mock(return_value=httpx.Response(503))
+    client = HyperliquidRestClient(monitoring, batch, proxy_mode="direct")
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await asyncio.wait_for(
+                client.try_info("clearinghouseState", user="0xabc"),
+                timeout=5,
+            )
+    finally:
+        await _close(client)
+
+    assert route.call_count == 1
+    assert monitoring.weights == [2]
 
 
 @respx.mock

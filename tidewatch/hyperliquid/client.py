@@ -65,7 +65,37 @@ class HyperliquidRestClient:
         """发送一条 info 请求；JSON 中的数字字符串保持上游原样。"""
         return await self.request({"type": request_type, **params}, budget=budget)
 
-    async def request(self, payload: Mapping[str, Any], *, budget: Budget = "monitor") -> Any:
+    async def try_info(
+        self,
+        request_type: str,
+        *,
+        budget: Budget = "monitor",
+        **params: Any,
+    ) -> tuple[bool, Any]:
+        """预算足够时立即发送请求；不足时返回 ``(False, None)`` 供优先队列顺延。"""
+        bucket = self._bucket(budget)
+        weight = BASE_WEIGHTS.get(request_type, 2)
+        try_acquire = getattr(bucket, "try_acquire", None)
+        if try_acquire is None:
+            await bucket.acquire(weight)
+        elif not await try_acquire(weight):
+            return False, None
+        data = await self.request(
+            {"type": request_type, **params},
+            budget=budget,
+            initial_weight_acquired=True,
+            retry_transient=False,
+        )
+        return True, data
+
+    async def request(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        budget: Budget = "monitor",
+        initial_weight_acquired: bool = False,
+        retry_transient: bool = True,
+    ) -> Any:
         request_type = payload.get("type")
         if not isinstance(request_type, str) or not request_type:
             raise ValueError("Hyperliquid info 请求必须包含非空 type")
@@ -74,14 +104,19 @@ class HyperliquidRestClient:
         backoff = Backoff()
         limited_since: float | None = None
 
+        first_attempt = True
         while True:
-            await bucket.acquire(base_weight)
+            if not (first_attempt and initial_weight_acquired):
+                await bucket.acquire(base_weight)
+            first_attempt = False
             try:
                 response = await self._client.post(self.url, json=dict(payload))
             except asyncio.CancelledError:
                 raise
             except httpx.RequestError as exc:
                 await self._report_failure(exc)
+                if not retry_transient:
+                    raise
                 delay = backoff.next()
                 logger.warning(
                     "子源 %s 请求 %s（权重 %d）网络失败：%s；%g 秒后重试，代理模式 %s",
@@ -102,6 +137,8 @@ class HyperliquidRestClient:
                     response=response,
                 )
                 await self._report_failure(error)
+                if not retry_transient:
+                    raise error
                 delay = backoff.next()
                 if response.status_code == 429:
                     limited_since = limited_since or self._monotonic()

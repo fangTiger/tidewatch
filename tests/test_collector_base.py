@@ -79,6 +79,26 @@ async def test_hyperliquid_monitoring_and_batch_budgets_are_independent():
     assert batch_sleeps == [pytest.approx(0.2)]
 
 
+async def test_waiting_acquire_does_not_block_immediate_budget_check():
+    sleep_started = asyncio.Event()
+    release_sleep = asyncio.Event()
+
+    async def blocked_sleep(seconds: float) -> None:
+        sleep_started.set()
+        await release_sleep.wait()
+
+    bucket = TokenBucket(1, capacity=2, monotonic=lambda: 0.0, sleep=blocked_sleep)
+    await bucket.acquire(2)
+    waiter = asyncio.create_task(bucket.acquire(1))
+    await asyncio.wait_for(sleep_started.wait(), timeout=5)
+    try:
+        assert not await asyncio.wait_for(bucket.try_acquire(1), timeout=0.1)
+    finally:
+        release_sleep.set()
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
 class DemoPoll(PollCollector):
     name = "demo"
 

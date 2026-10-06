@@ -261,6 +261,7 @@ class HyperliquidCfg(_Strict):
     frequencies: HyperliquidFrequenciesCfg = HyperliquidFrequenciesCfg()
     tiers: HyperliquidTiersCfg = HyperliquidTiersCfg()
     events: HyperliquidEventsCfg = HyperliquidEventsCfg()
+    hip3_dexes: list[str] = []
     top_altcoins: list[str] = []
     ticker_symbols: list[str] = []
     core_wallets: list[str] = []
@@ -281,10 +282,15 @@ class HyperliquidCfg(_Strict):
             raise ValueError("WS 端点必须是 ws:// 或 wss:// 地址")
         return value
 
-    @field_validator("top_altcoins", "ticker_symbols")
+    @field_validator("hip3_dexes", "top_altcoins", "ticker_symbols")
     @classmethod
     def _symbols_not_blank_or_duplicate(cls, value: list[str], info) -> list[str]:
-        label = "头部山寨币" if info.field_name == "top_altcoins" else "行情币种"
+        labels = {
+            "hip3_dexes": "HIP-3 dex",
+            "top_altcoins": "头部山寨币",
+            "ticker_symbols": "行情币种",
+        }
+        label = labels[info.field_name]
         normalized = [symbol.strip() for symbol in value]
         if any(not symbol for symbol in normalized):
             raise ValueError(f"{label}不能为空")

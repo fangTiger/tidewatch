@@ -67,15 +67,31 @@ class TokenBucket:
             raise ValueError("令牌权重必须大于 0")
         if weight > self._capacity:
             raise ValueError("令牌权重不能超过桶容量")
-        async with self._lock:
-            while True:
+        while True:
+            async with self._lock:
                 now = self._monotonic()
                 self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
                 self._last = now
                 if self._tokens >= weight:
                     self._tokens -= weight
                     return
-                await self._sleep((weight - self._tokens) / self._rate)
+                delay = (weight - self._tokens) / self._rate
+            await self._sleep(delay)
+
+    async def try_acquire(self, weight: float = 1) -> bool:
+        """尝试立即原子获取令牌；不足时不等待也不扣减。"""
+        if weight <= 0:
+            raise ValueError("令牌权重必须大于 0")
+        if weight > self._capacity:
+            raise ValueError("令牌权重不能超过桶容量")
+        async with self._lock:
+            now = self._monotonic()
+            self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
+            self._last = now
+            if self._tokens < weight:
+                return False
+            self._tokens -= weight
+            return True
 
 
 class Backoff:

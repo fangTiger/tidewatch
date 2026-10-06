@@ -24,12 +24,14 @@ MAX_USERS = 10
 STABLE_CONNECTION_S = 60.0
 
 Sleep = Callable[[float], Awaitable[None]]
-MessageHandler = Callable[[Any], Awaitable[None] | None]
+MessageHandler = Callable[[Any], Awaitable[bool | None] | bool | None]
+ConnectHandler = Callable[[], Awaitable[None] | None]
 
 
 @dataclass
 class _Connection:
     handler: MessageHandler | None = None
+    on_connect: ConnectHandler | None = None
     health_source: str = "hl_core_ws"
     subscriptions: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -78,6 +80,7 @@ class HyperliquidWsManager:
         handler: MessageHandler | None = None,
         *,
         health_source: str | None = None,
+        on_connect: ConnectHandler | None = None,
     ) -> bool:
         """登记一个逻辑连接；同名登记为幂等操作。"""
         if name in self._connections:
@@ -86,6 +89,7 @@ class HyperliquidWsManager:
             raise ValueError("Hyperliquid WS 每个出口 IP 最多 10 个连接")
         self._connections[name] = _Connection(
             handler=handler,
+            on_connect=on_connect,
             health_source=health_source or self._default_health_source,
         )
         return True
@@ -111,8 +115,40 @@ class HyperliquidWsManager:
         added = self.add_subscription(connection_name, subscription)
         websocket = self._active.get(connection_name)
         if added and websocket is not None:
-            await websocket.send(self._subscribe_message(dict(subscription)))
+            await self._send_dynamic(
+                connection_name,
+                websocket,
+                self._subscribe_message(dict(subscription)),
+            )
         return added
+
+    async def unsubscribe(self, connection_name: str, subscription: Mapping[str, Any]) -> bool:
+        """移除订阅；连接已建立时发送协议退订消息。"""
+        connection = self._connection(connection_name)
+        normalized = dict(subscription)
+        key = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if key not in connection.subscriptions:
+            return False
+        del connection.subscriptions[key]
+        websocket = self._active.get(connection_name)
+        if websocket is not None:
+            await self._send_dynamic(
+                connection_name,
+                websocket,
+                self._unsubscribe_message(normalized),
+            )
+        return True
+
+    async def _send_dynamic(self, name: str, websocket: Any, message: str) -> None:
+        """断线竞态下保留期望订阅集合，等待连接管理循环恢复。"""
+        try:
+            await websocket.send(message)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            connection = self._connection(name)
+            await self._report_failure(connection.health_source, exc)
+            logger.warning("WS 连接 %s 动态订阅发送失败，将在重连后恢复：%s", name, describe(exc))
 
     async def run(self) -> None:
         """运行全部已登记连接；没有连接时保持空闲，直到优雅关闭。"""
@@ -152,18 +188,24 @@ class HyperliquidWsManager:
                     if self._closed.is_set():
                         await websocket.close()
                         return
-                    for subscription in connection.subscriptions.values():
+                    for subscription in list(connection.subscriptions.values()):
                         await websocket.send(self._subscribe_message(subscription))
+                    if connection.on_connect is not None:
+                        result = connection.on_connect()
+                        if inspect.isawaitable(result):
+                            await result
                     heartbeat = asyncio.create_task(self._heartbeat(websocket), name=f"hl-ws-{name}-heartbeat")
                     async for raw_message in websocket:
                         message = json.loads(raw_message)
                         if self._monotonic() - connected_at >= STABLE_CONNECTION_S:
                             backoff.reset()
-                        await self._report_success(connection.health_source)
                         if connection.handler is not None:
                             result = connection.handler(message)
                             if inspect.isawaitable(result):
-                                await result
+                                result = await result
+                            if result is False:
+                                raise ValueError("WebSocket 消息未通过业务校验")
+                        await self._report_success(connection.health_source)
                     if not self._closed.is_set():
                         raise ConnectionError("WebSocket 连接已关闭")
             except asyncio.CancelledError:
@@ -264,6 +306,14 @@ class HyperliquidWsManager:
     def _subscribe_message(subscription: Mapping[str, Any]) -> str:
         return json.dumps(
             {"method": "subscribe", "subscription": dict(subscription)},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _unsubscribe_message(subscription: Mapping[str, Any]) -> str:
+        return json.dumps(
+            {"method": "unsubscribe", "subscription": dict(subscription)},
             ensure_ascii=False,
             separators=(",", ":"),
         )

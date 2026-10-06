@@ -47,6 +47,8 @@ hyperliquid:
     liquidated_a_level_notional_usd: 5000000
     configured_leverage_threshold: 20
     actual_leverage_threshold: 10
+  # 活跃 HIP-3 dex 白名单；M4 元数据来源接入前由本地配置维护。
+  hip3_dexes: []
   top_altcoins: [SOL, XRP, HYPE, DOGE, BNB]
   ticker_symbols: [BTC, ETH, SOL, HYPE]
   core_wallets: []

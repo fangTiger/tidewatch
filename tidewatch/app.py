@@ -65,6 +65,7 @@ class Application:
                 settings.hyperliquid,
                 self.health,
                 engine=self.engine,
+                sink=self.sink,
                 proxy_url=settings.proxy_url,
                 clock=clock,
             )

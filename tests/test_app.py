@@ -608,6 +608,7 @@ async def test_hyperliquid_only_starts_shared_pipeline_without_news_or_web(engin
             )
         )
     app = Application(settings, groups={"hyperliquid"}, dry_run=True)
+    assert app.hyperliquid.monitor.sink is app.sink
     assert app.collectors == []
     assert app.live is None
     assert app._server is None
@@ -619,6 +620,8 @@ async def test_hyperliquid_only_starts_shared_pipeline_without_news_or_web(engin
             "hl-rest",
             "hl-trades-ws",
             "hl-core-ws",
+            "hl-core-subscriptions",
+            "hl-core-messages",
             "hl-leaderboard",
             "hl-tier-recompute",
             "hl-profile",
