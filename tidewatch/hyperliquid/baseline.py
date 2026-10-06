@@ -111,6 +111,7 @@ async def invalidate_monitor_baseline(conn: AsyncConnection, address: str) -> No
                 (
                     baseline_state_name(normalized),
                     f"fills:{normalized}",
+                    f"liquidations:{normalized}",
                 )
             )
             | hl_state.c.name.like(f"liq_risk:{normalized}:%")

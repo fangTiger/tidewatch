@@ -183,7 +183,10 @@ class HyperliquidRuntime:
             failure_ratio_threshold=settings.profile_failure_ratio_threshold,
             wallet_timeout_s=settings.profile_wallet_timeout_s,
         )
-        self.reconcile_queue = PriorityReconcileQueue()
+        self.reconcile_queue = PriorityReconcileQueue(
+            hot_aging_s=settings.frequencies.hot_reconcile_aging_s,
+            normal_aging_s=settings.frequencies.normal_reconcile_aging_s,
+        )
         self._pending_discoveries: dict[str, list[QualificationRequest]] = defaultdict(list)
         self._discovery_query_times: deque[float] = deque()
         self._discovery_query_lock = asyncio.Lock()
@@ -237,6 +240,7 @@ class HyperliquidRuntime:
         )
         await self.registry.sync_configured_core()
         await self.monitor.cleanup_liquidation_risk_states()
+        await self.monitor.process_pending_liquidations()
         await self.discovery.cleanup_expired_state()
         await self.discovery.restore_pending()
         self._stop.clear()
@@ -539,10 +543,12 @@ class HyperliquidRuntime:
 
     def trigger_trade(self, address: str) -> None:
         """供 M4 成交流调用：按配置去抖后安排最高优先级对账。"""
+        now = self.monotonic()
         self.reconcile_queue.schedule(
             address,
             ReconcilePriority.TRADE,
-            due_at=self.monotonic() + self.settings.frequencies.trade_debounce_s,
+            due_at=now + self.settings.frequencies.trade_debounce_s,
+            deadline_at=now + self.settings.frequencies.trade_max_wait_s,
             reason="成交触发",
         )
 

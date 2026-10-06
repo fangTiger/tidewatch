@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum, IntEnum
 from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import String, and_, cast, delete, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -27,13 +27,20 @@ from tidewatch.hyperliquid.detect import (
     PositionSnapshot,
     delete_liquidation_risk_state,
     detect_events_with_state,
+    detect_liquidation_event,
     load_liquidation_risk_state,
     save_liquidation_risk_state,
 )
 from tidewatch.hyperliquid.positions import upsert_position_snapshot
 from tidewatch.hyperliquid.registry import normalize_address
 from tidewatch.models import FetchResult
-from tidewatch.store.tables import hl_fills, hl_positions, hl_state, hl_wallets
+from tidewatch.store.tables import (
+    events as event_rows,
+    hl_fills,
+    hl_positions,
+    hl_state,
+    hl_wallets,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -55,13 +62,24 @@ class ScheduledReconcile:
     priority: ReconcilePriority
     due_at: float
     reason: str
+    deadline_at: float | None = None
+    aging_since: float | None = None
 
 
 class PriorityReconcileQueue:
     """按钱包去重的对账队列；预算不足时任务可原样顺延。"""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        hot_aging_s: float = 30,
+        normal_aging_s: float = 120,
+    ) -> None:
+        if hot_aging_s <= 0 or normal_aging_s <= 0:
+            raise ValueError("对账任务 aging 时间必须大于 0")
         self._tasks: dict[str, ScheduledReconcile] = {}
+        self.hot_aging_s = hot_aging_s
+        self.normal_aging_s = normal_aging_s
 
     def __len__(self) -> int:
         return len(self._tasks)
@@ -82,9 +100,19 @@ class PriorityReconcileQueue:
         *,
         due_at: float,
         reason: str,
+        deadline_at: float | None = None,
     ) -> None:
         normalized = normalize_address(address)
-        incoming = ScheduledReconcile(normalized, priority, due_at, reason)
+        if deadline_at is not None:
+            due_at = min(due_at, deadline_at)
+        incoming = ScheduledReconcile(
+            normalized,
+            priority,
+            due_at,
+            reason,
+            deadline_at,
+            due_at,
+        )
         current = self._tasks.get(normalized)
         if current is None:
             self._tasks[normalized] = incoming
@@ -94,7 +122,20 @@ class PriorityReconcileQueue:
             return
         if priority == current.priority:
             if priority is ReconcilePriority.TRADE:
-                self._tasks[normalized] = incoming
+                first_deadline = current.deadline_at or incoming.deadline_at
+                capped_due = (
+                    min(incoming.due_at, first_deadline)
+                    if first_deadline is not None
+                    else incoming.due_at
+                )
+                self._tasks[normalized] = ScheduledReconcile(
+                    normalized,
+                    priority,
+                    capped_due,
+                    reason,
+                    first_deadline,
+                    current.aging_since,
+                )
             elif due_at < current.due_at:
                 self._tasks[normalized] = incoming
 
@@ -112,12 +153,43 @@ class PriorityReconcileQueue:
         ]
         if not ready:
             return None
-        task = min(ready, key=lambda item: (item.priority, item.due_at, item.address))
+        task = min(ready, key=lambda item: self._sort_key(item, now))
         del self._tasks[task.address]
         return task
 
     def defer(self, task: ScheduledReconcile, *, due_at: float) -> None:
-        self.schedule(task.address, task.priority, due_at=due_at, reason=task.reason)
+        current = self._tasks.get(task.address)
+        if current is not None and current.priority <= task.priority:
+            return
+        self._tasks[task.address] = ScheduledReconcile(
+            task.address,
+            task.priority,
+            due_at,
+            task.reason,
+            aging_since=(
+                task.aging_since
+                if task.aging_since is not None
+                else task.due_at
+            ),
+        )
+
+    def _sort_key(
+        self,
+        task: ScheduledReconcile,
+        now: float,
+    ) -> tuple[int, float, str]:
+        overdue = now - (
+            task.aging_since if task.aging_since is not None else task.due_at
+        )
+        aged = (
+            task.priority is ReconcilePriority.NORMAL
+            and overdue >= self.normal_aging_s
+        ) or (
+            task.priority in {ReconcilePriority.LIQUIDATION, ReconcilePriority.HOT}
+            and overdue >= self.hot_aging_s
+        )
+        effective_priority = ReconcilePriority.TRADE if aged else task.priority
+        return int(effective_priority), task.due_at, task.address
 
 
 @dataclass(frozen=True)
@@ -251,6 +323,7 @@ class HyperliquidMonitor:
         self._recent_fills: dict[tuple[str, str], Mapping[str, Any]] = {}
         self._deferred_fills: dict[str, tuple[datetime, set[str]]] = {}
         self._pending_reconciles: dict[str, _ReconcileProgress] = {}
+        self._liquidation_locks: dict[str, asyncio.Lock] = {}
         self._fill_timeout_warnings: dict[str, datetime] = {}
         self._account_lookup_warnings: dict[tuple[str, str], datetime] = {}
 
@@ -358,6 +431,7 @@ class HyperliquidMonitor:
         *,
         remember: bool = True,
         timeout_s: float | None = None,
+        recover_persisted_on_throttle: bool = False,
     ) -> _FillLookupResult:
         """补查成交并区分节流、预算顺延与真实网络超时。"""
         request_timeout_s = (
@@ -368,6 +442,7 @@ class HyperliquidMonitor:
         async with self.engine.connect() as conn:
             cursor = await conn.scalar(select(hl_state.c.cursor).where(hl_state.c.name == state_name))
             baseline_at = await load_monitor_baseline(conn, normalized)
+            last_observed_at = await load_last_observed_at(conn, normalized)
         if baseline_at is None:
             self._deferred_fills.pop(normalized, None)
             return _FillLookupResult(None, _FillLookupStatus.COMPLETE)
@@ -389,7 +464,18 @@ class HyperliquidMonitor:
                     normalized[-4:],
                     self.cfg.frequencies.fill_query_min_interval_s - elapsed,
                 )
-                return _FillLookupResult(None, _FillLookupStatus.THROTTLED)
+                evidence = None
+                if recover_persisted_on_throttle:
+                    evidence = await self._load_persisted_fill_evidence(
+                        normalized,
+                        changed_coins,
+                        since=last_observed_at or baseline_at,
+                    )
+                if remember and evidence is not None:
+                    coin = evidence.get("coin")
+                    if isinstance(coin, str):
+                        self._recent_fills[(normalized, coin)] = evidence
+                return _FillLookupResult(evidence, _FillLookupStatus.THROTTLED)
 
         baseline_ms = int(baseline_at.timestamp() * 1000)
         start_time = max(int(cursor.get("last_time") or 0), baseline_ms)
@@ -452,6 +538,31 @@ class HyperliquidMonitor:
                     self._recent_fills[(normalized, coin)] = evidence
         evidence = max(matching, key=lambda item: int(item.get("time") or 0), default=None)
         return _FillLookupResult(evidence, _FillLookupStatus.COMPLETE)
+
+    async def _load_persisted_fill_evidence(
+        self,
+        address: str,
+        changed_coins: set[str],
+        *,
+        since: datetime,
+    ) -> Mapping[str, Any] | None:
+        """在补查节流时恢复上一快照之后已提交的最新成交证据。"""
+        if not changed_coins:
+            return None
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    select(hl_fills)
+                    .where(
+                        hl_fills.c.address == address,
+                        hl_fills.c.coin.in_(changed_coins),
+                        hl_fills.c.occurred_at >= since,
+                    )
+                    .order_by(hl_fills.c.occurred_at.desc(), hl_fills.c.tid.desc())
+                    .limit(1)
+                )
+            ).mappings().first()
+        return None if row is None else _fill_from_row(row)
 
     async def run_due_fill_queries(self) -> None:
         """执行到期的合并补查；失败或预算不足时保留任务稍后重试。"""
@@ -582,7 +693,6 @@ class HyperliquidMonitor:
                 coin = fill.get("coin")
                 if isinstance(coin, str):
                     self._recent_fills[(normalized, coin)] = fill
-            await self._emit_liquidations(normalized, current_fills)
             return
         if channel == "allDexsClearinghouseState":
             states = _all_dex_states(data)
@@ -652,6 +762,15 @@ class HyperliquidMonitor:
                 liquidation_risk_state=risk_state,
                 wallet={"tier": row["tier"]},
             )
+            stable_suffix = str(int(row["updated_at"].timestamp() * 1000))
+            for event in result.events:
+                if event.event_type != "hl_liq_risk":
+                    continue
+                level = event.raw.get("liquidation_risk_level")
+                event.dedupe_key = (
+                    f"{event.dedupe_key.rsplit(':', 1)[0]}:"
+                    f"{stable_suffix}:{level}"
+                )
             if result.events and self.sink is not None:
                 await self.sink.ingest(
                     FetchResult(result.events, None),
@@ -774,7 +893,11 @@ class HyperliquidMonitor:
         changed_coins = {new.coin for old, new in transitions if old.szi != new.szi}
         fill = None
         if changed_coins and allow_fill_lookup and not establishing_baseline:
-            result = await self._lookup_fill_evidence(address, changed_coins)
+            result = await self._lookup_fill_evidence(
+                address,
+                changed_coins,
+                recover_persisted_on_throttle=True,
+            )
             fill = result.evidence
             if result.status is _FillLookupStatus.TIMEOUT:
                 self._log_fill_timeout(address)
@@ -815,16 +938,25 @@ class HyperliquidMonitor:
                 wallet=wallet,
             )
             if not establishing_baseline:
+                if evidence is None:
+                    suffix = str(int(old.updated_at.timestamp() * 1000))
+                    for event in result.events:
+                        stable_suffix = (
+                            f"{suffix}:{event.raw.get('liquidation_risk_level')}"
+                            if event.event_type == "hl_liq_risk"
+                            else suffix
+                        )
+                        event.dedupe_key = (
+                            f"{event.dedupe_key.rsplit(':', 1)[0]}:{stable_suffix}"
+                        )
                 if (
                     evidence is None
                     and now - old.updated_at
                     > timedelta(seconds=self.cfg.events.max_push_age_s)
                 ):
-                    suffix = str(int(old.updated_at.timestamp() * 1000))
                     for event in result.events:
                         event.occurred_at = old.updated_at
                         event.raw["backfill"] = True
-                        event.dedupe_key = f"{event.dedupe_key.rsplit(':', 1)[0]}:{suffix}"
                 events.extend(result.events)
             next_risks[(new.dex, new.coin)] = result.liquidation_risk_state
 
@@ -877,39 +1009,145 @@ class HyperliquidMonitor:
         for key in used_fill_keys:
             self._recent_fills.pop(key, None)
 
-    async def _emit_liquidations(self, address: str, fills: list[Mapping[str, Any]]) -> None:
+    async def process_liquidation_fills(self, address: str) -> None:
+        """消费清算游标之后的已入库成交，事件提交后才推进游标。"""
         if self.sink is None:
             return
+        normalized = normalize_address(address)
+        lock = self._liquidation_locks.setdefault(normalized, asyncio.Lock())
+        async with lock:
+            await self._process_liquidation_fills_locked(normalized)
+
+    async def _process_liquidation_fills_locked(self, normalized: str) -> None:
+        """在钱包级单飞锁内完成清算成交到事件及游标的提交边界。"""
+        state_name = f"liquidations:{normalized}"
         async with self.engine.connect() as conn:
-            baseline_at = await load_monitor_baseline(conn, address)
+            baseline_at = await load_monitor_baseline(conn, normalized)
             if baseline_at is None:
                 return
+            cursor = await conn.scalar(
+                select(hl_state.c.cursor).where(hl_state.c.name == state_name)
+            )
+            wallet_row = (
+                await conn.execute(
+                    select(hl_wallets).where(hl_wallets.c.address == normalized)
+                )
+            ).mappings().first()
+        baseline_ms = int(baseline_at.timestamp() * 1000)
+        cursor = dict(cursor) if isinstance(cursor, Mapping) else {}
+        last_time_ms = max(int(cursor.get("last_time") or baseline_ms), baseline_ms)
+        last_tid = int(cursor.get("last_tid") or -1)
+        last_time = datetime.fromtimestamp(last_time_ms / 1000, tz=timezone.utc)
+        liquidation_key = (
+            literal(f"hl:{normalized}:")
+            + hl_fills.c.coin
+            + literal(":hl_liquidated:")
+            + cast(hl_fills.c.tid, String)
+        )
+        event_already_exists = (
+            select(event_rows.c.id)
+            .where(event_rows.c.dedupe_key == liquidation_key)
+            .exists()
+        )
+        async with self.engine.connect() as conn:
             rows = (
-                await conn.execute(select(hl_positions).where(hl_positions.c.address == address))
+                await conn.execute(
+                    select(hl_fills)
+                    .where(
+                        hl_fills.c.address == normalized,
+                        hl_fills.c.occurred_at >= baseline_at,
+                        or_(
+                            hl_fills.c.occurred_at > last_time,
+                            and_(
+                                hl_fills.c.occurred_at == last_time,
+                                hl_fills.c.tid > last_tid,
+                            ),
+                        ),
+                    )
+                    .order_by(hl_fills.c.occurred_at, hl_fills.c.tid)
+                )
+            ).mappings().all()
+            late_liquidations = (
+                await conn.execute(
+                    select(hl_fills)
+                    .where(
+                        hl_fills.c.address == normalized,
+                        hl_fills.c.occurred_at >= baseline_at,
+                        or_(
+                            hl_fills.c.occurred_at < last_time,
+                            and_(
+                                hl_fills.c.occurred_at == last_time,
+                                hl_fills.c.tid <= last_tid,
+                            ),
+                        ),
+                        func.lower(
+                            hl_fills.c.liquidation["liquidatedUser"].as_string()
+                        )
+                        == normalized,
+                        ~event_already_exists,
+                    )
+                    .order_by(hl_fills.c.occurred_at, hl_fills.c.tid)
+                )
             ).mappings().all()
         events = []
-        baseline_ms = int(baseline_at.timestamp() * 1000)
-        for fill in fills:
-            if int(fill.get("time") or 0) < baseline_ms:
-                continue
-            row = next((item for item in rows if item["coin"] == fill.get("coin")), None)
-            if row is None:
-                continue
-            snapshot = _snapshot_from_row(row, updated_at=self.clock())
-            result = detect_events_with_state(
-                snapshot,
-                snapshot,
+        wallet = dict(wallet_row or {})
+        candidates = {
+            int(row["tid"]): row for row in [*late_liquidations, *rows]
+        }
+        for row in sorted(
+            candidates.values(),
+            key=lambda item: (item["occurred_at"], item["tid"]),
+        ):
+            event = detect_liquidation_event(
+                normalized,
+                _fill_from_row(row),
                 cfg=self.cfg,
-                fill=fill,
-                mark_px=self.mids.get(snapshot.coin),
+                wallet=wallet,
             )
-            events.extend(event for event in result.events if event.event_type == "hl_liquidated")
+            if event is not None:
+                events.append(event)
         if events:
             await self.sink.ingest(
                 FetchResult(events, None),
                 collector="hl_monitor",
                 track_collector_state=False,
             )
+        if rows:
+            final = rows[-1]
+            last_time_ms = int(final["occurred_at"].timestamp() * 1000)
+            last_tid = int(final["tid"])
+        cursor = {"last_time": last_time_ms, "last_tid": last_tid}
+        stmt = pg_insert(hl_state).values(
+            name=state_name,
+            cursor=cursor,
+            updated_at=self.clock(),
+        )
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["name"],
+                    set_={
+                        "cursor": stmt.excluded.cursor,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+            )
+
+    async def process_pending_liquidations(self) -> None:
+        """启动时恢复所有受监控钱包尚未完成的清算转换。"""
+        if self.sink is None:
+            return
+        async with self.engine.connect() as conn:
+            addresses = (
+                await conn.execute(
+                    select(hl_wallets.c.address).where(
+                        hl_wallets.c.tier.in_(("focus", "core")),
+                        hl_wallets.c.excluded.is_(False),
+                    )
+                )
+            ).scalars().all()
+        for address in addresses:
+            await self.process_liquidation_fills(address)
 
     async def _store_fills(
         self,
@@ -940,6 +1178,7 @@ class HyperliquidMonitor:
                     set_={"cursor": stmt.excluded.cursor, "updated_at": stmt.excluded.updated_at},
                 )
             )
+        await self.process_liquidation_fills(address)
 
     async def _try_info(self, request_type: str, **params: Any) -> tuple[bool, Any]:
         if self.rest is None:
@@ -1069,6 +1308,23 @@ async def _initialize_fill_cursor(
         stmt.on_conflict_do_update(
             index_elements=["name"],
             set_={"cursor": stmt.excluded.cursor, "updated_at": stmt.excluded.updated_at},
+        )
+    )
+    liquidation_stmt = pg_insert(hl_state).values(
+        name=f"liquidations:{address}",
+        cursor={
+            "last_time": int(baseline_at.timestamp() * 1000),
+            "last_tid": -1,
+        },
+        updated_at=baseline_at,
+    )
+    await conn.execute(
+        liquidation_stmt.on_conflict_do_update(
+            index_elements=["name"],
+            set_={
+                "cursor": liquidation_stmt.excluded.cursor,
+                "updated_at": liquidation_stmt.excluded.updated_at,
+            },
         )
     )
 
@@ -1221,6 +1477,25 @@ def _fill_row(address: str, fill: Mapping[str, Any], *, is_twap: bool) -> dict[s
         "hash": str(fill.get("hash") or ""),
         "is_twap": is_twap,
         "liquidation": dict(fill["liquidation"]) if isinstance(fill.get("liquidation"), Mapping) else None,
+    }
+
+
+def _fill_from_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """把持久化成交还原为事件检测使用的上游字段形状。"""
+    return {
+        "coin": row["coin"],
+        "dir": row["dir"],
+        "side": row.get("side"),
+        "startPosition": row.get("start_position"),
+        "px": row["px"],
+        "sz": row["sz"],
+        "closedPnl": row["closed_pnl"],
+        "fee": row["fee"],
+        "crossed": row["crossed"],
+        "time": int(row["occurred_at"].timestamp() * 1000),
+        "hash": row["hash"],
+        "tid": row["tid"],
+        "liquidation": row.get("liquidation"),
     }
 
 

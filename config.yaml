@@ -26,8 +26,11 @@ hyperliquid:
     ws_ping_interval_s: 50
     core_state_interval_s: 5
     trade_debounce_s: 3
+    trade_max_wait_s: 5
     hot_reconcile_interval_s: 20
     focus_reconcile_interval_s: 180
+    hot_reconcile_aging_s: 30
+    normal_reconcile_aging_s: 120
     fill_query_min_interval_s: 60
     # userAbstraction 按官方通用 20 权重计费，缓存 6 小时以守住监控预算。
     account_type_cache_s: 21600

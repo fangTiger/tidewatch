@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import httpx
+import pytest
 import respx
 from sqlalchemy import delete, func, insert, select
 
@@ -527,6 +528,75 @@ def test_trade_debounce_replaces_existing_periodic_task_without_duplicates():
     task = queue.pop_ready(3)
     assert task is not None
     assert task.priority is ReconcilePriority.TRADE
+
+
+def test_trade_debounce_is_capped_by_first_pending_deadline():
+    queue = PriorityReconcileQueue()
+    queue.schedule(
+        ADDRESS,
+        ReconcilePriority.TRADE,
+        due_at=3,
+        deadline_at=5,
+        reason="成交触发",
+    )
+    for now in (1, 2, 3, 4):
+        queue.schedule(
+            ADDRESS,
+            ReconcilePriority.TRADE,
+            due_at=now + 3,
+            deadline_at=now + 5,
+            reason="成交触发",
+        )
+
+    assert queue.pop_ready(4.99) is None
+    task = queue.pop_ready(5)
+    assert task is not None and task.address == ADDRESS
+
+
+def test_aged_normal_task_runs_under_continuous_trade_load():
+    queue = PriorityReconcileQueue(normal_aging_s=120, hot_aging_s=30)
+    queue.schedule(ADDRESS, ReconcilePriority.NORMAL, due_at=0, reason="普通对账")
+    for index in range(121):
+        trade = f"0x{index + 100:040x}"
+        queue.schedule(trade, ReconcilePriority.TRADE, due_at=index, reason="成交触发")
+        task = queue.pop_ready(float(index))
+        assert task is not None
+        if index < 120:
+            assert task.address == trade
+        else:
+            assert task.address == ADDRESS
+
+
+def test_deferral_keeps_newer_trade_task_for_same_wallet():
+    queue = PriorityReconcileQueue()
+    queue.schedule(ADDRESS, ReconcilePriority.NORMAL, due_at=0, reason="普通对账")
+    normal = queue.pop_ready(0)
+    assert normal is not None
+    queue.schedule(
+        ADDRESS,
+        ReconcilePriority.TRADE,
+        due_at=3,
+        deadline_at=5,
+        reason="成交触发",
+    )
+
+    queue.defer(normal, due_at=10)
+
+    task = queue.pop_ready(3)
+    assert task is not None
+    assert task.priority is ReconcilePriority.TRADE
+
+
+def test_deferred_normal_task_ages_from_original_due_time():
+    queue = PriorityReconcileQueue(normal_aging_s=120)
+    queue.schedule(ADDRESS, ReconcilePriority.NORMAL, due_at=0, reason="普通对账")
+    normal = queue.pop_ready(0)
+    assert normal is not None
+    queue.defer(normal, due_at=120)
+    queue.schedule(OTHER, ReconcilePriority.TRADE, due_at=120, reason="成交触发")
+
+    task = queue.pop_ready(120)
+    assert task is not None and task.address == ADDRESS
 
 
 def test_hot_wallets_sort_by_liquidation_distance_then_notional_and_limit(settings):
@@ -1462,6 +1532,72 @@ async def test_all_mids_uses_local_prices_for_hysteresis_and_a_to_s_upgrade(
     assert pushes == [("A", "event"), ("S", "upgrade")]
 
 
+async def test_all_mids_risk_retry_after_post_ingest_crash_is_exactly_once(
+    engine, settings, clock
+):
+    class CrashAfterIngest:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.crashed = False
+
+        async def ingest(self, *args, **kwargs):
+            result = await self.inner.ingest(*args, **kwargs)
+            if not self.crashed:
+                self.crashed = True
+                raise RuntimeError("故障注入：风险事件已提交但滞回状态尚未写入")
+            return result
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual")
+        )
+        await conn.execute(
+            insert(hl_positions).values(
+                address=ADDRESS,
+                dex="",
+                coin="BTC",
+                szi=Decimal("120"),
+                entry_px=Decimal("100"),
+                liquidation_px=Decimal("95"),
+                leverage=Decimal("20"),
+                notional_usd=Decimal("12000000"),
+                unrealized_pnl=Decimal("0"),
+                updated_at=clock.now,
+            )
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    crashing = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=None,
+        sink=CrashAfterIngest(sink),
+        clock=clock,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="故障注入"):
+            await asyncio.wait_for(crashing.update_mids({"BTC": "100"}), timeout=5)
+        clock.advance(seconds=1)
+        restarted = HyperliquidMonitor(
+            settings.hyperliquid,
+            engine=engine,
+            rest=None,
+            sink=sink,
+            clock=clock,
+        )
+        await asyncio.wait_for(restarted.update_mids({"BTC": "100"}), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        keys = (await conn.execute(select(events.c.dedupe_key))).scalars().all()
+        push_count = await conn.scalar(select(func.count()).select_from(push_log))
+    assert len(keys) == 1
+    assert keys[0].endswith(":hl_liq_risk:1790733600000:A")
+    assert push_count == 1
+
+
 async def test_user_fills_snapshot_is_persisted_but_not_used_as_event_evidence(
     engine, settings, clock
 ):
@@ -1625,3 +1761,563 @@ async def test_core_ws_unified_account_uses_current_spot_usdc(engine, settings, 
     async with engine.connect() as conn:
         raw = await conn.scalar(select(events.c.raw))
     assert raw["actual_leverage"] == str(Decimal("6000000") / Decimal("1100000"))
+
+
+async def test_snapshot_event_retry_after_post_ingest_crash_is_exactly_once(
+    engine, settings, clock
+):
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            if request_type == "clearinghouseState":
+                return True, _state()
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            if request_type in {"userFillsByTime", "userTwapSliceFills"}:
+                return True, []
+            raise AssertionError(request_type)
+
+    class CrashAfterIngest:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.crashed = False
+
+        async def ingest(self, *args, **kwargs):
+            result = await self.inner.ingest(*args, **kwargs)
+            if not self.crashed:
+                self.crashed = True
+                raise RuntimeError("故障注入：事件已提交但快照尚未写入")
+            return result
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual")
+        )
+        await conn.execute(
+            insert(hl_positions).values(
+                address=ADDRESS,
+                dex="",
+                coin="BTC",
+                szi=Decimal("0"),
+                notional_usd=Decimal("0"),
+                updated_at=clock.now,
+            )
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    crashing = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=CrashAfterIngest(sink),
+        clock=clock,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="故障注入"):
+            await asyncio.wait_for(crashing.reconcile(ADDRESS), timeout=5)
+        clock.advance(seconds=1)
+        restarted = HyperliquidMonitor(
+            settings.hyperliquid,
+            engine=engine,
+            rest=Rest(),
+            sink=sink,
+            clock=clock,
+        )
+        assert await asyncio.wait_for(restarted.reconcile(ADDRESS), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        event_count = await conn.scalar(select(func.count()).select_from(events))
+        push_count = await conn.scalar(select(func.count()).select_from(push_log))
+    assert event_count == 1
+    assert push_count == 1
+
+
+async def test_fill_backed_snapshot_retry_recovers_tid_from_persisted_fill(
+    engine, settings, clock
+):
+    now_ms = int(clock.now.timestamp() * 1000)
+    fill = {
+        "coin": "BTC",
+        "px": "100000",
+        "sz": "60",
+        "dir": "Open Long",
+        "closedPnl": "0",
+        "fee": "1",
+        "crossed": True,
+        "time": now_ms,
+        "hash": "0xfill-retry",
+        "tid": 709,
+    }
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            if request_type == "clearinghouseState":
+                return True, _state()
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            if request_type == "userFillsByTime":
+                return True, [fill]
+            raise AssertionError(request_type)
+
+    class CrashAfterIngest:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+
+        async def ingest(self, *args, **kwargs):
+            await self.inner.ingest(*args, **kwargs)
+            raise RuntimeError("故障注入：tid 事件已提交但快照尚未写入")
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual")
+        )
+        await conn.execute(
+            insert(hl_positions).values(
+                address=ADDRESS,
+                dex="",
+                coin="BTC",
+                szi=Decimal("0"),
+                notional_usd=Decimal("0"),
+                updated_at=clock.now,
+            )
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    crashing = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=CrashAfterIngest(sink),
+        clock=clock,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="故障注入"):
+            await asyncio.wait_for(crashing.reconcile(ADDRESS), timeout=5)
+        clock.advance(seconds=1)
+        restarted = HyperliquidMonitor(
+            settings.hyperliquid,
+            engine=engine,
+            rest=Rest(),
+            sink=sink,
+            clock=clock,
+        )
+        assert await asyncio.wait_for(restarted.reconcile(ADDRESS), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        keys = (await conn.execute(select(events.c.dedupe_key))).scalars().all()
+        push_count = await conn.scalar(select(func.count()).select_from(push_log))
+    assert keys == [f"hl:{ADDRESS}:BTC:hl_open:709"]
+    assert push_count == 1
+
+
+def _liquidation_fill(*, tid: int = 700, liquidated_user: str = ADDRESS) -> dict:
+    return {
+        "coin": "BTC",
+        "px": "100000",
+        "sz": "60",
+        "startPosition": "60",
+        "side": "A",
+        "dir": "Liquidated Long",
+        "closedPnl": "-500000",
+        "fee": "1",
+        "crossed": True,
+        "time": 1791252001000,
+        "hash": f"0x{tid:064x}",
+        "tid": tid,
+        "liquidation": {"liquidatedUser": liquidated_user, "method": "market"},
+    }
+
+
+async def test_state_before_liquidation_fill_still_emits_from_persisted_fill(
+    engine, settings, clock
+):
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            raise AssertionError(request_type)
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="core", source="manual")
+        )
+        await conn.execute(
+            insert(hl_positions).values(
+                address=ADDRESS,
+                dex="",
+                coin="BTC",
+                szi=Decimal("60"),
+                entry_px=Decimal("100000"),
+                notional_usd=Decimal("6000000"),
+                updated_at=clock.now,
+            )
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid, engine=engine, rest=Rest(), sink=sink, clock=clock
+    )
+    try:
+        await asyncio.wait_for(
+            monitor.handle_core_message(
+                {
+                    "channel": "allDexsClearinghouseState",
+                    "data": {"user": ADDRESS, "clearinghouseStates": [_empty_state()]},
+                }
+            ),
+            timeout=5,
+        )
+        await asyncio.wait_for(
+            monitor.handle_core_message(
+                {
+                    "channel": "userFills",
+                    "data": {
+                        "user": ADDRESS,
+                        "isSnapshot": False,
+                        "fills": [_liquidation_fill()],
+                    },
+                }
+            ),
+            timeout=5,
+        )
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                select(events.c.event_type, events.c.amount_usd).order_by(events.c.id)
+            )
+        ).all()
+    assert rows == [("hl_close", Decimal("6000000")), ("hl_liquidated", Decimal("6000000"))]
+
+
+async def test_deferred_fill_lookup_emits_late_liquidation(engine, settings, clock):
+    calls = 0
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            nonlocal calls
+            if request_type == "userFillsByTime":
+                calls += 1
+                return (False, None) if calls == 1 else (True, [_liquidation_fill(tid=701)])
+            raise AssertionError(request_type)
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual")
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid, engine=engine, rest=Rest(), sink=sink, clock=clock
+    )
+    try:
+        assert await asyncio.wait_for(
+            monitor.lookup_fill_evidence(ADDRESS, {"BTC"}), timeout=5
+        ) is None
+        clock.advance(seconds=1)
+        await asyncio.wait_for(monitor.run_due_fill_queries(), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        event_type = await conn.scalar(select(events.c.event_type))
+    assert event_type == "hl_liquidated"
+
+
+async def test_liquidation_cursor_recovers_after_event_commit_crash(
+    engine, settings, clock
+):
+    class CrashAfterIngest:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+
+        async def ingest(self, *args, **kwargs):
+            await self.inner.ingest(*args, **kwargs)
+            raise RuntimeError("故障注入：清算事件已提交但游标尚未推进")
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual")
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    crashing = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=None,
+        sink=CrashAfterIngest(sink),
+        clock=clock,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="故障注入"):
+            await asyncio.wait_for(
+                crashing._store_fills(ADDRESS, [(_liquidation_fill(tid=702), False)]),
+                timeout=5,
+            )
+        restarted = HyperliquidMonitor(
+            settings.hyperliquid,
+            engine=engine,
+            rest=None,
+            sink=sink,
+            clock=clock,
+        )
+        await asyncio.wait_for(restarted.process_liquidation_fills(ADDRESS), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        event_count = await conn.scalar(select(func.count()).select_from(events))
+        push_count = await conn.scalar(select(func.count()).select_from(push_log))
+        cursor = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name == f"liquidations:{ADDRESS}"
+            )
+        )
+    assert event_count == 1
+    assert push_count == 1
+    assert cursor["last_tid"] == 702
+
+
+async def test_restart_emits_fill_committed_before_liquidation_generation(
+    engine, settings, clock
+):
+    class CrashBeforeLiquidation(HyperliquidMonitor):
+        async def process_liquidation_fills(self, address: str) -> None:
+            raise RuntimeError("故障注入：成交已提交但清算事件尚未生成")
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual")
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    crashing = CrashBeforeLiquidation(
+        settings.hyperliquid,
+        engine=engine,
+        rest=None,
+        sink=sink,
+        clock=clock,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="故障注入"):
+            await asyncio.wait_for(
+                crashing._store_fills(ADDRESS, [(_liquidation_fill(tid=708), False)]),
+                timeout=5,
+            )
+        async with engine.connect() as conn:
+            assert await conn.scalar(select(func.count()).select_from(hl_fills)) == 1
+            assert await conn.scalar(select(func.count()).select_from(events)) == 0
+
+        restarted = HyperliquidMonitor(
+            settings.hyperliquid,
+            engine=engine,
+            rest=None,
+            sink=sink,
+            clock=clock,
+        )
+        await asyncio.wait_for(restarted.process_pending_liquidations(), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        event_count = await conn.scalar(select(func.count()).select_from(events))
+        push_count = await conn.scalar(select(func.count()).select_from(push_log))
+    assert event_count == 1
+    assert push_count == 1
+
+
+async def test_persisted_counterparty_liquidation_does_not_emit(
+    engine, settings, clock
+):
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual")
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid, engine=engine, rest=None, sink=sink, clock=clock
+    )
+    try:
+        await asyncio.wait_for(
+            monitor._store_fills(
+                ADDRESS,
+                [(_liquidation_fill(tid=703, liquidated_user=OTHER), False)],
+            ),
+            timeout=5,
+        )
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        event_count = await conn.scalar(select(func.count()).select_from(events))
+    assert event_count == 0
+
+
+async def test_late_older_liquidation_is_not_skipped_by_high_water_cursor(
+    engine, settings, clock
+):
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual")
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid, engine=engine, rest=None, sink=sink, clock=clock
+    )
+    newer = {
+        **_liquidation_fill(tid=704, liquidated_user=OTHER),
+        "time": 1791252002000,
+    }
+    older_liquidation = {
+        **_liquidation_fill(tid=705),
+        "time": 1791252001000,
+    }
+    try:
+        await asyncio.wait_for(
+            monitor._store_fills(ADDRESS, [(newer, False)]), timeout=5
+        )
+        await asyncio.wait_for(
+            monitor._store_fills(ADDRESS, [(older_liquidation, False)]), timeout=5
+        )
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        tids = (await conn.execute(select(events.c.raw["tid"].as_integer()))).scalars().all()
+    assert tids == [705]
+
+
+async def test_processed_late_liquidation_is_not_replayed_on_later_fill(
+    engine, settings, clock
+):
+    class CountingSink:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.calls = 0
+
+        async def ingest(self, *args, **kwargs):
+            self.calls += 1
+            return await self.inner.ingest(*args, **kwargs)
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual")
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    counting = CountingSink(sink)
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid, engine=engine, rest=None, sink=counting, clock=clock
+    )
+    try:
+        await asyncio.wait_for(
+            monitor._store_fills(ADDRESS, [(_liquidation_fill(tid=710), False)]),
+            timeout=5,
+        )
+        ordinary_fill = {
+            **_liquidation_fill(tid=711, liquidated_user=OTHER),
+            "time": 1791252002000,
+            "liquidation": None,
+        }
+        await asyncio.wait_for(
+            monitor._store_fills(ADDRESS, [(ordinary_fill, False)]), timeout=5
+        )
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    assert counting.calls == 1
+
+
+async def test_concurrent_liquidation_consumers_do_not_regress_cursor(
+    engine, settings, clock
+):
+    class FirstBlockingSink:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.calls = 0
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.second_finished = asyncio.Event()
+
+        async def ingest(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            result = await self.inner.ingest(*args, **kwargs)
+            if self.calls == 2:
+                self.second_finished.set()
+            return result
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="core", source="manual")
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    blocking = FirstBlockingSink(sink)
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=None,
+        sink=blocking,
+        clock=clock,
+    )
+    first = asyncio.create_task(
+        monitor._store_fills(ADDRESS, [(_liquidation_fill(tid=706), False)])
+    )
+    second: asyncio.Task | None = None
+    try:
+        await asyncio.wait_for(blocking.first_started.wait(), timeout=1)
+        second_fill = {
+            **_liquidation_fill(tid=707),
+            "time": 1791252002000,
+        }
+        second = asyncio.create_task(
+            monitor._store_fills(ADDRESS, [(second_fill, False)])
+        )
+        try:
+            await asyncio.wait_for(blocking.second_finished.wait(), timeout=0.1)
+        except asyncio.TimeoutError:
+            pass
+        blocking.release_first.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=5)
+    finally:
+        blocking.release_first.set()
+        pending = [task for task in (first, second) if task is not None and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        cursor = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name == f"liquidations:{ADDRESS}"
+            )
+        )
+        tids = (
+            await conn.execute(
+                select(events.c.raw["tid"].as_integer()).order_by(events.c.id)
+            )
+        ).scalars().all()
+    assert cursor["last_tid"] == 707
+    assert tids == [706, 707]

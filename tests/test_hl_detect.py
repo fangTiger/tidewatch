@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import tidewatch.hyperliquid.detect as hl_detect
 from tidewatch.hyperliquid.detect import (
     PositionSnapshot,
     detect_events,
@@ -344,6 +345,28 @@ def test_liquidated_requires_matching_normalized_address(settings):
     assert [event.event_type for event in detect_events(previous, current, cfg=settings.hyperliquid, fill=counterparty)] == [
         "hl_close"
     ]
+
+
+def test_liquidated_event_is_derived_from_fill_without_position_snapshot(settings):
+    fill = {
+        "coin": "BTC",
+        "time": 1791252001000,
+        "tid": 90,
+        "px": "100000",
+        "sz": "10",
+        "startPosition": "-60",
+        "dir": "Liquidated Short",
+        "closedPnl": "-500000",
+        "liquidation": {"liquidatedUser": ADDRESS},
+    }
+
+    event = hl_detect.detect_liquidation_event(ADDRESS, fill, cfg=settings.hyperliquid)
+
+    assert event is not None
+    assert event.amount_usd == Decimal("6000000")
+    assert event.raw["direction"] == "short"
+    assert event.raw["quantity"] == "10"
+    assert event.dedupe_key == f"hl:{ADDRESS}:BTC:hl_liquidated:90"
 
 
 async def test_liquidation_risk_state_persists_in_hl_state(engine):

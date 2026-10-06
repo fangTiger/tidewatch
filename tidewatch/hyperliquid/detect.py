@@ -86,6 +86,55 @@ def detect_events(
     ).events
 
 
+def detect_liquidation_event(
+    address: str,
+    fill: Mapping[str, Any],
+    *,
+    cfg: HyperliquidCfg,
+    wallet: Mapping[str, Any] | None = None,
+) -> Event | None:
+    """仅从成交字段派生被清算事件，不依赖当前仓位是否仍存在。"""
+    normalized = normalize_address(address)
+    liquidation = fill.get("liquidation")
+    if not isinstance(liquidation, Mapping) or not _same_address(
+        liquidation.get("liquidatedUser"), normalized
+    ):
+        return None
+    coin = str(fill.get("coin") or "")
+    if not coin:
+        raise ValueError("清算成交币种不能为空")
+    occurred_at = _fill_time(fill)
+    px = _optional_decimal(fill.get("px")) or _ZERO
+    size = abs(_optional_decimal(fill.get("sz")) or _ZERO)
+    start_position = _optional_decimal(fill.get("startPosition"))
+    notional_quantity = (
+        abs(start_position)
+        if start_position is not None and start_position != 0
+        else size
+    )
+    amount = px * notional_quantity
+    direction = _fill_direction(fill, start_position)
+    signed_size = size if direction == "long" else -size
+    snapshot = PositionSnapshot(
+        address=normalized,
+        dex=coin.split(":", 1)[0] if ":" in coin else "",
+        coin=coin,
+        szi=signed_size,
+        notional_usd=amount,
+        updated_at=occurred_at,
+    )
+    return _liquidated_event(
+        snapshot,
+        amount=amount,
+        occurred_at=occurred_at,
+        suffix=str(fill.get("tid") or _millis(occurred_at)),
+        fill=fill,
+        cfg=cfg,
+        wallet=wallet,
+        mark_px=_optional_decimal(liquidation.get("markPx")) or px or None,
+    )
+
+
 def detect_events_with_state(
     previous: PositionSnapshot,
     current: PositionSnapshot,
@@ -522,6 +571,21 @@ def _fill_notional(fill: Mapping[str, Any]) -> Decimal:
     px = _optional_decimal(fill.get("px")) or _ZERO
     size = _optional_decimal(fill.get("sz")) or _ZERO
     return abs(px * size)
+
+
+def _fill_direction(
+    fill: Mapping[str, Any],
+    start_position: Decimal | None,
+) -> str:
+    """从成交前仓位与方向字段确定被清算仓位方向。"""
+    if start_position is not None and start_position != 0:
+        return "long" if start_position > 0 else "short"
+    direction = str(fill.get("dir") or "").casefold()
+    if "short" in direction:
+        return "short"
+    if "long" in direction:
+        return "long"
+    return "long" if str(fill.get("side") or "").upper() == "A" else "short"
 
 
 def _same_address(candidate: Any, address: str) -> bool:

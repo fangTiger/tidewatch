@@ -9,7 +9,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 import httpx
 
@@ -22,6 +22,7 @@ REST_URL = "https://api.hyperliquid.xyz/info"
 
 Budget = Literal["monitor", "batch"]
 Sleep = Callable[[float], Awaitable[None]]
+T = TypeVar("T")
 
 # 系统设计 7.1 明确列出的基础权重；官方未单列的 info 请求按通用权重 20 处理。
 BASE_WEIGHTS: dict[str, int] = {
@@ -155,8 +156,18 @@ class _GlobalRateController:
                 return True
             return False
 
-    async def other_failure(self, permit: _RequestPermit) -> None:
-        await self.cancel(permit)
+    async def other_failure(self, permit: _RequestPermit) -> float:
+        """探测失败时继续指数冷却；普通在途失败不影响共享门。"""
+        if not permit.probe:
+            return 0.0
+        async with self._lock:
+            now = self._monotonic()
+            delay = self._backoff.next()
+            self._cooling = True
+            self._cooldown_until = now + delay
+            self._probe_in_flight = False
+            self._notify_locked()
+            return delay
 
     async def limited(self, permit: _RequestPermit) -> _LimitState:
         async with self._lock:
@@ -281,20 +292,26 @@ class HyperliquidRestClient:
         """预算足够时立即发送请求；不足时返回 ``(False, None)`` 供优先队列顺延。"""
         bucket = self._bucket(budget)
         weight = BASE_WEIGHTS.get(request_type, 20)
-        permit = await self._rate_controller.try_start()
-        if permit is None:
-            return False, None
         try_acquire = getattr(bucket, "try_acquire", None)
         if try_acquire is None:
             await bucket.acquire(weight)
         elif not await try_acquire(weight):
-            await self._rate_controller.cancel(permit)
             return False, None
-        if not await self._rate_controller.validate(permit):
-            refund = getattr(bucket, "refund", None)
-            if refund is not None:
-                await refund(weight)
-            await self._rate_controller.cancel(permit)
+        permit = await self._rate_controller.try_start()
+        if permit is None:
+            await self._refund_weight(bucket, weight)
+            return False, None
+        try:
+            valid = await self._rate_controller.validate(permit)
+        except BaseException:
+            await self._finish_uninterruptibly(
+                self._abandon_permit(bucket, weight, permit)
+            )
+            raise
+        if not valid:
+            await self._finish_uninterruptibly(
+                self._abandon_permit(bucket, weight, permit)
+            )
             return False, None
         try:
             data = await self.request(
@@ -328,31 +345,43 @@ class HyperliquidRestClient:
         while True:
             if first_attempt and initial_permit is not None:
                 permit = initial_permit
-            else:
-                permit = await self._rate_controller.start()
-            if not (first_attempt and initial_weight_acquired):
+            elif not (first_attempt and initial_weight_acquired):
                 try:
                     await bucket.acquire(base_weight)
                 except asyncio.CancelledError:
-                    await self._rate_controller.cancel(permit)
                     raise
-                except Exception:
-                    await self._rate_controller.cancel(permit)
+                permit = None
+                try:
+                    permit = await self._rate_controller.start()
+                except BaseException:
+                    await self._refund_weight(bucket, base_weight)
                     raise
-                if not await self._rate_controller.validate(permit):
-                    refund = getattr(bucket, "refund", None)
-                    if refund is not None:
-                        await refund(base_weight)
-                    await self._rate_controller.cancel(permit)
+                try:
+                    valid = await self._rate_controller.validate(permit)
+                except BaseException:
+                    await self._finish_uninterruptibly(
+                        self._abandon_permit(bucket, base_weight, permit)
+                    )
+                    raise
+                if not valid:
+                    await self._finish_uninterruptibly(
+                        self._abandon_permit(bucket, base_weight, permit)
+                    )
                     continue
+            else:
+                permit = await self._rate_controller.start()
             first_attempt = False
             try:
                 response = await self._client.post(self.url, json=dict(payload))
             except asyncio.CancelledError:
-                await self._rate_controller.other_failure(permit)
+                await self._finish_uninterruptibly(
+                    self._rate_controller.other_failure(permit)
+                )
                 raise
             except httpx.RequestError as exc:
-                await self._rate_controller.other_failure(permit)
+                await self._finish_uninterruptibly(
+                    self._rate_controller.other_failure(permit)
+                )
                 await self._report_failure(exc)
                 if not retry_transient:
                     raise
@@ -375,7 +404,9 @@ class HyperliquidRestClient:
                     request=response.request,
                     response=response,
                 )
-                state = await self._rate_controller.limited(permit)
+                state = await self._finish_uninterruptibly(
+                    self._rate_controller.limited(permit)
+                )
                 if state.first_in_period:
                     await self._report_failure(error)
                     logger.warning(
@@ -406,7 +437,9 @@ class HyperliquidRestClient:
                 continue
 
             if response.status_code >= 500:
-                await self._rate_controller.other_failure(permit)
+                await self._finish_uninterruptibly(
+                    self._rate_controller.other_failure(permit)
+                )
                 error = httpx.HTTPStatusError(
                     f"Hyperliquid HTTP {response.status_code}",
                     request=response.request,
@@ -432,19 +465,26 @@ class HyperliquidRestClient:
             try:
                 response.raise_for_status()
                 data = response.json()
-                extra_weight = self._response_weight(request_type, data)
-                if extra_weight:
-                    await self._acquire_weight(bucket, extra_weight)
             except asyncio.CancelledError:
-                await self._rate_controller.other_failure(permit)
+                await self._finish_uninterruptibly(
+                    self._rate_controller.other_failure(permit)
+                )
                 raise
             except Exception as exc:
-                await self._rate_controller.other_failure(permit)
+                await self._finish_uninterruptibly(
+                    self._rate_controller.other_failure(permit)
+                )
                 await self._report_failure(exc)
                 raise
 
             backoff.reset()
-            if await self._rate_controller.success(permit):
+            recovered = await self._finish_uninterruptibly(
+                self._rate_controller.success(permit)
+            )
+            extra_weight = self._response_weight(request_type, data)
+            if extra_weight:
+                await self._acquire_weight(bucket, extra_weight)
+            if recovered:
                 await self._report_success()
             return data
 
@@ -485,6 +525,35 @@ class HyperliquidRestClient:
             chunk = min(remaining, capacity, MAX_BASE_WEIGHT)
             await bucket.acquire(chunk)
             remaining -= chunk
+
+    @staticmethod
+    async def _refund_weight(bucket: Any, weight: int) -> None:
+        """请求尚未发送时归还已取得的预算；测试桶可不实现归还。"""
+        refund = getattr(bucket, "refund", None)
+        if refund is not None:
+            await refund(weight)
+
+    async def _abandon_permit(
+        self,
+        bucket: Any,
+        weight: int,
+        permit: _RequestPermit,
+    ) -> None:
+        """请求发出前放弃许可，并归还已经预留的预算。"""
+        await self._refund_weight(bucket, weight)
+        await self._rate_controller.cancel(permit)
+
+    @staticmethod
+    async def _finish_uninterruptibly(awaitable: Awaitable[T]) -> T:
+        """即使调用方被取消，也先完成共享限流状态的终态转换。"""
+        task = asyncio.create_task(awaitable)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                raise
 
     def _bucket(self, budget: Budget) -> TokenBucket:
         if budget == "monitor":

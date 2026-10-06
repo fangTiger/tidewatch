@@ -349,8 +349,11 @@ def test_hyperliquid_default_config_is_valid_and_complete(tmp_path):
     assert cfg.aimd_min_budget_per_min == 120
     assert cfg.aimd_recovery_interval_s == 60
     assert cfg.frequencies.ws_ping_interval_s == 50
+    assert cfg.frequencies.trade_max_wait_s == 5
     assert cfg.frequencies.hot_reconcile_interval_s == 20
     assert cfg.frequencies.focus_reconcile_interval_s == 180
+    assert cfg.frequencies.hot_reconcile_aging_s == 30
+    assert cfg.frequencies.normal_reconcile_aging_s == 120
     assert cfg.frequencies.account_type_cache_s == 21600
     assert cfg.frequencies.deferred_fill_lookup_timeout_s == 15
     assert cfg.frequencies.fill_timeout_warning_interval_s == 1800
@@ -419,6 +422,9 @@ def test_hyperliquid_budget_must_be_positive_and_reports_chinese(tmp_path, field
     [
         ("reconcile_concurrency: 0", "reconcile_concurrency"),
         ("frequencies:\n    hot_reconcile_interval_s: 0", "frequencies.hot_reconcile_interval_s"),
+        ("frequencies:\n    trade_max_wait_s: 0", "frequencies.trade_max_wait_s"),
+        ("frequencies:\n    hot_reconcile_aging_s: 0", "frequencies.hot_reconcile_aging_s"),
+        ("frequencies:\n    normal_reconcile_aging_s: 0", "frequencies.normal_reconcile_aging_s"),
         (
             "frequencies:\n    deferred_fill_lookup_timeout_s: 0",
             "frequencies.deferred_fill_lookup_timeout_s",

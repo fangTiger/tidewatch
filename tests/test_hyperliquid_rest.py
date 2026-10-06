@@ -301,7 +301,7 @@ async def test_inflight_success_does_not_clear_health_until_probe_succeeds():
 
 
 @async_timeout()
-async def test_blocking_requests_do_not_reserve_tokens_during_global_cooldown():
+async def test_blocking_requests_reserve_tokens_before_waiting_for_probe():
     clock = {"value": 0.0}
     cooldown_sleeping = asyncio.Event()
     release_sleep = asyncio.Event()
@@ -336,7 +336,7 @@ async def test_blocking_requests_do_not_reserve_tokens_during_global_cooldown():
         await asyncio.wait_for(cooldown_sleeping.wait(), timeout=1)
         await asyncio.sleep(0)
 
-        assert monitoring.weights == [2]
+        assert monitoring.weights == [2, 2, 2, 2]
         assert calls == 1
     finally:
         for task in tasks:
@@ -344,6 +344,302 @@ async def test_blocking_requests_do_not_reserve_tokens_during_global_cooldown():
         release_sleep.set()
         await asyncio.gather(*tasks, return_exceptions=True)
         await _close(client)
+
+
+@pytest.mark.parametrize("failure", ["503", "network", "timeout"])
+@async_timeout()
+async def test_failed_half_open_probe_reenters_shared_exponential_cooldown(failure):
+    clock = ManualClock()
+    monitoring = TokenBucket(10, capacity=100, monotonic=clock, sleep=clock.sleep)
+    batch = TokenBucket(200 / 60, capacity=200 / 6, monotonic=clock, sleep=clock.sleep)
+    requests = 0
+
+    async def server(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return httpx.Response(429, json={"error": "限流"}, request=request)
+        if requests == 2:
+            if failure == "503":
+                return httpx.Response(503, request=request)
+            if failure == "network":
+                raise httpx.ConnectError("网络断开", request=request)
+            raise httpx.ReadTimeout("读取超时", request=request)
+        return httpx.Response(200, json={}, request=request)
+
+    client = HyperliquidRestClient(
+        monitoring,
+        batch,
+        proxy_mode="direct",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(server)),
+        monotonic=clock,
+        sleep=clock.sleep,
+    )
+    try:
+        assert await client.try_info("clearinghouseState", user="0xabc") == (
+            False,
+            None,
+        )
+        clock.advance(1)
+        with pytest.raises(httpx.HTTPError):
+            await client.try_info("clearinghouseState", user="0xdef")
+
+        blocked = await asyncio.wait_for(
+            asyncio.gather(
+                *(client.try_info("clearinghouseState", user=f"0x{i:040x}") for i in range(4))
+            ),
+            timeout=1,
+        )
+        assert blocked == [(False, None)] * 4
+        assert requests == 2
+
+        clock.advance(1.99)
+        assert await client.try_info("clearinghouseState", user="0x123") == (
+            False,
+            None,
+        )
+        clock.advance(0.01)
+        assert await client.try_info("clearinghouseState", user="0x456") == (
+            True,
+            {},
+        )
+    finally:
+        await _close(client)
+
+    assert requests == 3
+
+
+@async_timeout()
+async def test_empty_batch_bucket_cannot_hold_half_open_probe_from_monitor_request():
+    class BlockingBucket:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def acquire(self, weight: float = 1) -> None:
+            self.started.set()
+            await self.release.wait()
+
+    clock = ManualClock()
+    monitoring = RecordingBucket()
+    batch = BlockingBucket()
+    responses = iter([429, 200])
+
+    async def server(request: httpx.Request) -> httpx.Response:
+        status = next(responses)
+        return httpx.Response(status, json={} if status == 200 else {"error": "限流"}, request=request)
+
+    client = HyperliquidRestClient(
+        monitoring,
+        batch,
+        proxy_mode="direct",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(server)),
+        monotonic=clock,
+        sleep=clock.sleep,
+    )
+    batch_task: asyncio.Task | None = None
+    try:
+        assert await client.try_info("clearinghouseState", user="0xabc") == (
+            False,
+            None,
+        )
+        clock.advance(1)
+        batch_task = asyncio.create_task(client.info("portfolio", budget="batch", user="0xbatch"))
+        await asyncio.wait_for(batch.started.wait(), timeout=1)
+
+        assert await asyncio.wait_for(
+            client.try_info("clearinghouseState", user="0xmonitor"), timeout=1
+        ) == (True, {})
+    finally:
+        if batch_task is not None:
+            batch_task.cancel()
+            batch.release.set()
+            await asyncio.gather(batch_task, return_exceptions=True)
+        await _close(client)
+
+
+@async_timeout()
+async def test_successful_probe_releases_gate_before_extra_weight_settlement():
+    class ExtraBlockingBucket:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.extra_started = asyncio.Event()
+            self.release_extra = asyncio.Event()
+
+        async def acquire(self, weight: float = 1) -> None:
+            self.calls += 1
+            if weight == 1:
+                self.extra_started.set()
+                await self.release_extra.wait()
+
+        async def try_acquire(self, weight: float = 1) -> bool:
+            await self.acquire(weight)
+            return True
+
+    clock = ManualClock()
+    monitoring = ExtraBlockingBucket()
+    batch = RecordingBucket()
+    requests = 0
+
+    async def server(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 1:
+            return httpx.Response(429, json={"error": "限流"}, request=request)
+        payload = json.loads(request.content)
+        if payload["type"] == "userFillsByTime":
+            return httpx.Response(200, json=[{"tid": i} for i in range(20)], request=request)
+        return httpx.Response(200, json={}, request=request)
+
+    client = HyperliquidRestClient(
+        monitoring,
+        batch,
+        proxy_mode="direct",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(server)),
+        monotonic=clock,
+        sleep=clock.sleep,
+    )
+    probe: asyncio.Task | None = None
+    try:
+        assert await client.try_info("clearinghouseState", user="0xabc") == (
+            False,
+            None,
+        )
+        clock.advance(1)
+        probe = asyncio.create_task(
+            client.info("userFillsByTime", user="0xdef", startTime=0)
+        )
+        await asyncio.wait_for(monitoring.extra_started.wait(), timeout=1)
+
+        assert await asyncio.wait_for(
+            client.try_info("clearinghouseState", user="0x123"), timeout=1
+        ) == (True, {})
+    finally:
+        monitoring.release_extra.set()
+        if probe is not None:
+            await asyncio.wait_for(probe, timeout=1)
+        await _close(client)
+
+    assert requests == 3
+
+
+@async_timeout()
+async def test_cancel_during_probe_validation_releases_permit_and_refunds_budget():
+    clock = ManualClock()
+    monitoring = TokenBucket(10, capacity=100, monotonic=clock, sleep=clock.sleep)
+    batch = TokenBucket(200 / 60, capacity=200 / 6, monotonic=clock, sleep=clock.sleep)
+    requests = 0
+
+    async def server(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        status = 429 if requests == 1 else 200
+        return httpx.Response(status, json={} if status == 200 else {"error": "限流"}, request=request)
+
+    client = HyperliquidRestClient(
+        monitoring,
+        batch,
+        proxy_mode="direct",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(server)),
+        monotonic=clock,
+        sleep=clock.sleep,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_validate = client._rate_controller.validate
+
+    async def blocking_validate(permit):
+        entered.set()
+        await release.wait()
+        return await original_validate(permit)
+
+    task: asyncio.Task | None = None
+    try:
+        assert await client.try_info("clearinghouseState", user="0xabc") == (
+            False,
+            None,
+        )
+        clock.advance(1)
+        client._rate_controller.validate = blocking_validate
+        task = asyncio.create_task(client.try_info("clearinghouseState", user="0xdef"))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        client._rate_controller.validate = original_validate
+
+        assert await asyncio.wait_for(
+            client.try_info("clearinghouseState", user="0x123"), timeout=1
+        ) == (True, {})
+    finally:
+        release.set()
+        client._rate_controller.validate = original_validate
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await _close(client)
+
+    assert requests == 2
+
+
+@async_timeout()
+async def test_cancel_during_probe_success_transition_does_not_leak_permit():
+    clock = ManualClock()
+    monitoring = TokenBucket(10, capacity=100, monotonic=clock, sleep=clock.sleep)
+    batch = TokenBucket(200 / 60, capacity=200 / 6, monotonic=clock, sleep=clock.sleep)
+    requests = 0
+
+    async def server(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        status = 429 if requests == 1 else 200
+        return httpx.Response(status, json={} if status == 200 else {"error": "限流"}, request=request)
+
+    client = HyperliquidRestClient(
+        monitoring,
+        batch,
+        proxy_mode="direct",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(server)),
+        monotonic=clock,
+        sleep=clock.sleep,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_success = client._rate_controller.success
+
+    async def blocking_success(permit):
+        entered.set()
+        await release.wait()
+        return await original_success(permit)
+
+    task: asyncio.Task | None = None
+    try:
+        assert await client.try_info("clearinghouseState", user="0xabc") == (
+            False,
+            None,
+        )
+        clock.advance(1)
+        client._rate_controller.success = blocking_success
+        task = asyncio.create_task(client.try_info("clearinghouseState", user="0xdef"))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        client._rate_controller.success = original_success
+
+        assert await asyncio.wait_for(
+            client.try_info("clearinghouseState", user="0x123"), timeout=1
+        ) == (True, {})
+    finally:
+        release.set()
+        client._rate_controller.success = original_success
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await _close(client)
+
+    assert requests == 3
 
 
 @async_timeout()
@@ -687,7 +983,7 @@ async def test_info_retries_429_server_and_network_errors_with_exponential_backo
         await _close(client)
 
     assert result["marginSummary"]["accountValue"] == "1000.00"
-    assert clock.sleeps == [1, 1, 2]
+    assert clock.sleeps == [1, 1, 1, 2, 2]
     assert monitoring.weights == [2, 2, 2, 2]
     assert len(health.failures) == 3 and health.successes == ["hl_rest"]
     assert any("hl_rest" in record.message and "clearinghouseState" in record.message for record in caplog.records)

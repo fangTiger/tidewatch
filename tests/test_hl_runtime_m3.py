@@ -539,11 +539,12 @@ async def test_free_reconcile_slot_takes_trade_before_waiting_normal_wallets(
         return True
 
     runtime.monitor.reconcile = reconcile
+    scheduled_at = runtime.monotonic()
     for address in normal_addresses:
         runtime.reconcile_queue.schedule(
             address,
             ReconcilePriority.NORMAL,
-            due_at=0,
+            due_at=scheduled_at,
             reason="普通对账",
         )
     runner = asyncio.create_task(runtime.run_reconcile_workers())
@@ -561,6 +562,42 @@ async def test_free_reconcile_slot_takes_trade_before_waiting_normal_wallets(
         await runtime.close_resources()
 
     assert started[2] == trade_address
+
+
+@async_timeout()
+async def test_continuous_trade_triggers_reconcile_within_maximum_wait(
+    engine, settings, clock
+):
+    now = {"value": 0.0}
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+        monotonic=lambda: now["value"],
+    )
+    calls: list[float] = []
+
+    async def reconcile(address: str) -> bool:
+        calls.append(now["value"])
+        return True
+
+    runtime.monitor.reconcile = reconcile
+    try:
+        for second in range(5):
+            now["value"] = float(second)
+            runtime.trigger_trade(ADDRESS)
+            await runtime.run_reconcile_once(now["value"])
+        assert calls == []
+
+        now["value"] = settings.hyperliquid.frequencies.trade_max_wait_s
+        runtime.trigger_trade(ADDRESS)
+        await runtime.run_reconcile_once(now["value"])
+    finally:
+        await runtime.close_resources()
+
+    assert calls == [settings.hyperliquid.frequencies.trade_max_wait_s]
 
 
 def test_two_hundred_wallet_budget_estimate_stays_below_six_hundred_per_minute(settings):
