@@ -1,10 +1,14 @@
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import DateTime, insert, select
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError
 
-from tidewatch.store.tables import event_clusters, events
+from tidewatch.store.tables import event_clusters, events, metadata
+
+
+HL_TABLES = {"hl_wallets", "hl_positions", "hl_fills", "hl_state"}
 
 
 def _event_row(key: str) -> dict:
@@ -53,3 +57,44 @@ async def test_cluster_defaults(engine):
         row = (await conn.execute(select(event_clusters).where(event_clusters.c.id == cid))).mappings().one()
     assert row["member_count"] == 1 and row["source_count"] == 1
     assert row["committed_level"] is None and row["note_sent"] is False
+
+
+def test_hyperliquid_table_metadata_contract():
+    """二期四表的主键、JSONB 与 UTC 时间字段必须符合存储契约。"""
+    assert HL_TABLES <= set(metadata.tables)
+
+    wallets = metadata.tables["hl_wallets"]
+    positions = metadata.tables["hl_positions"]
+    fills = metadata.tables["hl_fills"]
+    state = metadata.tables["hl_state"]
+
+    assert [column.name for column in wallets.primary_key.columns] == ["address"]
+    assert [column.name for column in positions.primary_key.columns] == ["address", "dex", "coin"]
+    assert [column.name for column in fills.primary_key.columns] == ["address", "tid"]
+    assert [column.name for column in state.primary_key.columns] == ["name"]
+
+    assert isinstance(wallets.c.profile.type, JSONB)
+    assert isinstance(fills.c.liquidation.type, JSONB)
+    assert isinstance(state.c.cursor.type, JSONB)
+
+    utc_columns = (
+        wallets.c.profile_updated_at,
+        wallets.c.last_position_at,
+        positions.c.updated_at,
+        fills.c.occurred_at,
+        state.c.updated_at,
+    )
+    assert all(isinstance(column.type, DateTime) and column.type.timezone for column in utc_columns)
+
+    assert {index.name for index in wallets.indexes} >= {
+        "ix_hl_wallets_tier_excluded",
+        "ix_hl_wallets_last_position_at",
+    }
+    assert {index.name for index in positions.indexes} >= {
+        "ix_hl_positions_coin",
+        "ix_hl_positions_updated_at",
+    }
+    assert {index.name for index in fills.indexes} >= {
+        "ix_hl_fills_address_occurred_at",
+        "ix_hl_fills_coin_occurred_at",
+    }

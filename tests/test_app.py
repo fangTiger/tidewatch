@@ -13,7 +13,7 @@ from sqlalchemy import select
 
 import tidewatch.app as app_module
 from fakes import free_port, wait_until
-from tidewatch.app import Application, parse_args, run
+from tidewatch.app import GROUPS, Application, parse_args, run
 from tidewatch.collectors.binance_ann import BinanceAnnPoll, BinanceAnnStream
 from tidewatch.collectors.jin10 import Jin10Collector
 from tidewatch.collectors.okx_ann import OkxAnnCollector
@@ -34,6 +34,12 @@ def test_parse_args():
         parse_args(["--only", "unknown"])
 
 
+def test_parse_args_accepts_hyperliquid_group():
+    assert "hyperliquid" in GROUPS
+    args = parse_args(["--only", "hyperliquid", "web", "--dry-run"])
+    assert args.only == ["hyperliquid", "web"]
+
+
 async def test_requires_feishu_unless_dry_run(settings):
     with pytest.raises(ConfigError) as exc:
         Application(settings, groups={"news"}, dry_run=False)
@@ -41,6 +47,21 @@ async def test_requires_feishu_unless_dry_run(settings):
     web_only = Application(settings, groups={"web"}, dry_run=False)  # 只开网站不需要飞书
     assert isinstance(web_only.notifier, DryRunNotifier) and web_only.collectors == []
     await web_only.stop()
+
+
+async def test_hyperliquid_is_an_event_group_for_notifier(settings):
+    """Hyperliquid 单组正式运行时不能因没有 news 而退化为演练通知器。"""
+    with pytest.raises(ConfigError) as exc:
+        Application(settings, groups={"hyperliquid"}, dry_run=False)
+    assert "FEISHU_WEBHOOK" in str(exc.value)
+
+    settings.secrets.feishu_webhook = "https://example.com/hook"
+    app = Application(settings, groups={"hyperliquid"}, dry_run=False)
+    try:
+        assert app.notifier.__class__.__name__ == "FeishuNotifier"
+        assert app.collectors == []
+    finally:
+        await app.stop()
 
 
 async def test_collectors_and_binance_mode(settings):
@@ -521,7 +542,7 @@ async def test_normal_stop_does_not_log_web_error(engine, settings, caplog):
     assert [r for r in caplog.records if r.name == "tidewatch.app" and r.levelno >= logging.ERROR] == []
 
 
-# ---------- 按组件组装配：实时更新只在新闻与网站同时运行时才有意义 ----------
+# ---------- 按组件组装配：实时更新随任一事件组与网站组合启用 ----------
 
 
 async def _quiet(app: Application) -> None:
@@ -572,6 +593,69 @@ async def test_news_and_web_wire_live_updates(engine, settings):
         assert "live" in [t.get_name() for t in app._tasks]
     finally:
         await asyncio.wait_for(app.stop(), timeout=5)
+
+
+async def test_hyperliquid_only_starts_shared_pipeline_without_news_or_web(engine, settings):
+    """空核心名单也能离线启动：共用流水线、健康监控和调度器，不创建新闻采集器或网站。"""
+    assert settings.hyperliquid.core_wallets == []
+    app = Application(settings, groups={"hyperliquid"}, dry_run=True)
+    assert app.collectors == []
+    assert app.live is None
+    assert app._server is None
+    await asyncio.wait_for(app.start(), timeout=5)
+    try:
+        names = {task.get_name() for task in app.critical_tasks()}
+        assert {"health", "event-sink", "dispatch-route"} <= names
+        assert {
+            "hl-rest",
+            "hl-trades-ws",
+            "hl-core-ws",
+            "hl-leaderboard",
+            "hl-tier-recompute",
+            "hl-profile",
+            "hl-market-data",
+        } <= names
+        assert app._web_task is None
+        assert {"hl_rest", "hl_trades_ws", "hl_core_ws", "hl_leaderboard", "hl_profile"} <= set(
+            app.health._states
+        )
+        await wait_until(
+            lambda: all(
+                app.health.status(name) == "normal"
+                for name in ("hl_rest", "hl_trades_ws", "hl_core_ws", "hl_leaderboard", "hl_profile")
+            )
+        )
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)
+    assert all(task.done() for task in app.critical_tasks())
+
+
+async def test_hyperliquid_and_web_wire_live_updates_without_news(engine, settings):
+    settings.web.port = free_port()
+    app = Application(settings, groups={"hyperliquid", "web"}, dry_run=True)
+    assert app.collectors == []
+    assert app.live is not None
+    await asyncio.wait_for(app.start(), timeout=5)
+    try:
+        assert app.live.on_ingest in app.sink._ingest_listeners
+        assert app.live.on_health in app.health._listeners
+        assert "live" in {task.get_name() for task in app.critical_tasks()}
+    finally:
+        await asyncio.wait_for(app.stop(), timeout=5)
+
+
+async def test_hyperliquid_critical_task_return_causes_nonzero_exit(engine, settings, monkeypatch, caplog):
+    """Hyperliquid 长期任务正常返回也必须触发进程非零退出。"""
+    from tidewatch.hyperliquid.runtime import HyperliquidRuntime
+
+    async def return_immediately(self) -> None:
+        return None
+
+    monkeypatch.setattr(HyperliquidRuntime, "run_rest", return_immediately)
+    with caplog.at_level(logging.INFO, logger="tidewatch.app"):
+        code = await asyncio.wait_for(run(settings, groups={"hyperliquid"}, dry_run=True), timeout=5)
+    assert code == 1
+    assert any("关键任务 hl-rest 意外结束" in record.getMessage() for record in caplog.records)
 
 
 # ---------- 装配：启动顺序与币安模式 ----------

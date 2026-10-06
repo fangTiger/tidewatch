@@ -1,5 +1,13 @@
 # 复制为 config.local.yaml 后修改（该文件被 .gitignore 排除，不会提交）
 proxy_url: http://127.0.0.1:10808
+hyperliquid:
+  # 默认 global：REST 与 WS 共用上面的代理；可设为 direct 直连。
+  # 限流按出口 IP 计算，切换代理节点会改变出口 IP 和上游限流窗口。
+  proxy: global
+  # 核心钱包可留空，最多 10 个；地址会校验并规范化为小写。
+  core_wallets: []
+  # core_wallets:
+  #   - 0x0123456789abcdef0123456789abcdef01234567
 watchlist:
   assets:
     # 以 symbol 合并：写已有 symbol 会覆盖其别名，写新 symbol 即新增关注资产

@@ -25,6 +25,8 @@ alembic upgrade head
 python -m tidewatch --dry-run        # 演练：不发送飞书，只写日志
 python -m tidewatch                  # 正式运行（需要 FEISHU_WEBHOOK）
 python -m tidewatch --only web       # 只启动网站
+python -m tidewatch --only hyperliquid --dry-run       # 只启动巨鲸监控骨架
+python -m tidewatch --only hyperliquid web --dry-run   # 巨鲸监控与网站实时更新
 ```
 
 网站：http://127.0.0.1:8000（时间线）、http://127.0.0.1:8000/status（采集器状态与当日推送统计）
@@ -44,6 +46,7 @@ deploy/uninstall.sh          # 卸载
 ## 配置要点
 
 - 阈值、关键词、频率：`config.yaml`（可在 `config.local.yaml` 按键覆盖；列表项按 `symbol`/`id` 合并，写 `remove: true` 删除默认项）
+- Hyperliquid 的 REST 与 WS 共用 `hyperliquid.proxy`：`global` 使用全局 `proxy_url`，`direct` 直连。上游按出口 IP 限流，切换代理节点会改变限流出口 IP，并使本地令牌桶与上游当前窗口短暂不同步。
 - 币安公告：`.env` 中配置只读的 `BINANCE_API_KEY` 与 `BINANCE_API_SECRET` 时使用 WebSocket 实时推送，否则每 30 秒轮询（状态页显示「降级」）
 - 日志：`log/tidewatch_YYYY-MM-DD.log`，保留 14 天。`log/launchd.err.log` 只记录启动早期的错误且不会轮转，必要时请手动清理
 

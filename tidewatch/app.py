@@ -20,6 +20,7 @@ from tidewatch.collectors.jin10 import Jin10Collector
 from tidewatch.collectors.okx_ann import OkxAnnCollector
 from tidewatch.config import ConfigError, Settings, load_settings
 from tidewatch.health import HealthMonitor
+from tidewatch.hyperliquid.runtime import HyperliquidRuntime
 from tidewatch.logging_setup import setup_logging
 from tidewatch.notify.base import Notifier
 from tidewatch.notify.dispatcher import Dispatcher
@@ -34,7 +35,8 @@ from tidewatch.web.server import create_app
 
 logger = logging.getLogger(__name__)
 
-GROUPS = ("news", "web")
+GROUPS = ("news", "hyperliquid", "web")
+EVENT_GROUPS = frozenset({"news", "hyperliquid"})
 REPO_ROOT = Path(__file__).resolve().parents[1]
 STOP_TIMEOUT_S = 8
 WEB_START_TIMEOUT_S = 10
@@ -54,10 +56,17 @@ class Application:
         self.dispatcher = Dispatcher(self.engine, self.sink, self.notifier, settings.dispatch, clock=clock)
         self.live = (
             LiveUpdates(self.engine, self.broadcaster, settings)
-            if {"news", "web"}.issubset(self.groups)
+            if "web" in self.groups and bool(EVENT_GROUPS & self.groups)
             else None
         )
         self.collectors: list[Collector] = self._make_collectors() if "news" in self.groups else []
+        self.hyperliquid = (
+            HyperliquidRuntime(settings.hyperliquid, self.health, proxy_url=settings.proxy_url)
+            if "hyperliquid" in self.groups and settings.hyperliquid.enabled
+            else None
+        )
+        if self.hyperliquid is not None:
+            self.hyperliquid.register_health()
         self._tasks: list[asyncio.Task] = []
         self._collector_tasks: list[asyncio.Task] = []
         self._server: EmbeddedServer | None = None
@@ -68,7 +77,7 @@ class Application:
     # ---------- 装配 ----------
 
     def _make_notifier(self) -> Notifier:
-        if self.dry_run or "news" not in self.groups:
+        if self.dry_run or not (EVENT_GROUPS & self.groups):
             return DryRunNotifier()
         webhook = self.settings.secrets.feishu_webhook
         if not webhook:
@@ -115,7 +124,7 @@ class Application:
     # ---------- 生命周期 ----------
 
     async def start(self) -> None:
-        if "news" in self.groups:
+        if EVENT_GROUPS & self.groups:
             if self.live is not None:
                 self.sink.on_ingest(self.live.on_ingest)
                 self.health.on_change(self.live.on_health)
@@ -136,6 +145,8 @@ class Application:
             ]
             for task in self._collector_tasks:
                 task.add_done_callback(_log_collector_exit)
+            if self.hyperliquid is not None:
+                await self.hyperliquid.start()
         if "web" in self.groups:
             web = self.settings.web
             config = uvicorn.Config(
@@ -181,6 +192,8 @@ class Application:
             *self.sink.background_tasks(),
             *self.dispatcher.background_tasks(),
         ]
+        if self.hyperliquid is not None:
+            tasks.extend(self.hyperliquid.background_tasks())
         if self._web_task is not None:
             tasks.append(self._web_task)
         return tuple(dict.fromkeys(tasks))
@@ -206,6 +219,8 @@ class Application:
             for task in self._collector_tasks:
                 task.cancel()
             await asyncio.gather(*self._collector_tasks, return_exceptions=True)
+            if self.hyperliquid is not None:
+                await self._guard("停止 Hyperliquid 子系统", self.hyperliquid.stop())
             await self._guard("停止推送调度器", self.dispatcher.stop())
             await self._guard("停止写入队列", self.sink.stop())
             # 先结束所有 SSE 订阅，让响应正常收尾；否则 sse-starlette 会在 uvicorn 退出时

@@ -40,6 +40,45 @@ async def test_token_bucket_waits_when_empty():
     assert sleeps == [pytest.approx(0.5)]
 
 
+async def test_token_bucket_acquires_weight_atomically():
+    clock = {"t": 0.0}
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    bucket = TokenBucket(2, capacity=4, monotonic=lambda: clock["t"], sleep=fake_sleep)
+    await asyncio.wait_for(bucket.acquire(3), timeout=5)
+    await asyncio.wait_for(bucket.acquire(2), timeout=5)
+
+    assert sleeps == [pytest.approx(0.5)]
+
+
+async def test_hyperliquid_monitoring_and_batch_budgets_are_independent():
+    clock = {"t": 0.0}
+    monitoring_sleeps: list[float] = []
+    batch_sleeps: list[float] = []
+
+    async def monitoring_sleep(seconds: float) -> None:
+        monitoring_sleeps.append(seconds)
+        clock["t"] += seconds
+
+    async def batch_sleep(seconds: float) -> None:
+        batch_sleeps.append(seconds)
+        clock["t"] += seconds
+
+    monitoring = TokenBucket(900 / 60, capacity=900, monotonic=lambda: clock["t"], sleep=monitoring_sleep)
+    batch = TokenBucket(300 / 60, capacity=300, monotonic=lambda: clock["t"], sleep=batch_sleep)
+
+    await asyncio.wait_for(batch.acquire(300), timeout=5)
+    await asyncio.wait_for(monitoring.acquire(900), timeout=5)
+    await asyncio.wait_for(batch.acquire(1), timeout=5)
+
+    assert monitoring_sleeps == []
+    assert batch_sleeps == [pytest.approx(0.2)]
+
+
 class DemoPoll(PollCollector):
     name = "demo"
 

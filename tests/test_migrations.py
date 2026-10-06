@@ -23,11 +23,17 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from conftest import TEST_DB_URL
 from tidewatch.store.tables import metadata
 
-TABLES = {"collector_state", "event_clusters", "events", "push_log"}
+PHASE1_REVISION = "8f3bbaee6ef9"
+PHASE1_TABLES = {"collector_state", "event_clusters", "events", "push_log"}
+HYPERLIQUID_TABLES = {"hl_wallets", "hl_positions", "hl_fills", "hl_state"}
+TABLES = PHASE1_TABLES | HYPERLIQUID_TABLES
 NAMED_INDEXES = {
     "event_clusters": {"ix_event_clusters_category_first_seen"},
     "events": {"ix_events_cluster_id", "ix_events_collected_at", "ix_events_occurred_at"},
     "push_log": {"ix_push_log_cluster_id", "ix_push_log_status"},
+    "hl_wallets": {"ix_hl_wallets_tier_excluded", "ix_hl_wallets_last_position_at"},
+    "hl_positions": {"ix_hl_positions_coin", "ix_hl_positions_updated_at"},
+    "hl_fills": {"ix_hl_fills_address_occurred_at", "ix_hl_fills_coin_occurred_at"},
 }
 
 
@@ -77,14 +83,14 @@ def _run_in_process(target: Callable[..., Any], *args: Any, timeout: float) -> N
         raise RuntimeError(f"子进程异常退出，退出码：{process.exitcode}")
 
 
-def _run_alembic(action: str, database_url: str) -> None:
+def _run_alembic(action: str, revision: str, database_url: str) -> None:
     """在子进程内以编程方式执行 Alembic 命令。"""
     config = Config("alembic.ini")
     config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
     if action == "upgrade":
-        command.upgrade(config, "head")
+        command.upgrade(config, revision)
     elif action == "downgrade":
-        command.downgrade(config, "base")
+        command.downgrade(config, revision)
     else:
         raise ValueError(f"不支持的 Alembic 操作：{action}")
 
@@ -145,9 +151,46 @@ async def _table_names(database_url: str) -> set[str]:
         await engine.dispose()
 
 
+async def _seed_phase1_probe(database_url: str) -> None:
+    """写入一期探针数据，用于证明二期迁移不会破坏一期数据。"""
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO collector_state (name, status, mode, consecutive_failures) "
+                    "VALUES ('migration_probe', 'ok', 'normal', 0)"
+                )
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _phase1_probe_status(database_url: str) -> str | None:
+    """读取一期探针数据。"""
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as conn:
+            return await conn.scalar(
+                text("SELECT status FROM collector_state WHERE name = 'migration_probe'")
+            )
+    finally:
+        await engine.dispose()
+
+
+async def _current_revision(database_url: str) -> str | None:
+    """读取测试临时库当前 Alembic revision。"""
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as conn:
+            return await conn.scalar(text("SELECT version_num FROM alembic_version"))
+    finally:
+        await engine.dispose()
+
+
 @pytest.mark.skipif(TEST_DB_URL is None, reason="未配置测试数据库")
-def test_upgrade_head_matches_metadata_and_downgrade_base_removes_tables():
-    """空库升级后结构与元数据一致，降级后一期四张表全部删除。"""
+def test_phase2_upgrade_downgrade_upgrade_preserves_phase1():
+    """二期迁移可从一期升级、回退到一期并再次升级，且保留一期数据。"""
     application_logger = logging.getLogger("tidewatch.migration_test_probe")
     application_logger.disabled = False
     base_url = make_url(TEST_DB_URL)
@@ -159,7 +202,12 @@ def test_upgrade_head_matches_metadata_and_downgrade_base_removes_tables():
     try:
         _run(_create_database(maintenance_url, database))
         created = True
-        _run_in_process(_run_alembic, "upgrade", database_url, timeout=30)
+        _run_in_process(_run_alembic, "upgrade", PHASE1_REVISION, database_url, timeout=30)
+        assert _run(_table_names(database_url)) >= PHASE1_TABLES
+        assert HYPERLIQUID_TABLES.isdisjoint(_run(_table_names(database_url)))
+        _run(_seed_phase1_probe(database_url))
+
+        _run_in_process(_run_alembic, "upgrade", "head", database_url, timeout=30)
 
         tables, indexes, differences = _run(_inspect_upgraded_database(database_url))
         assert TABLES <= tables
@@ -170,9 +218,22 @@ def test_upgrade_head_matches_metadata_and_downgrade_base_removes_tables():
             for index in indexes["events"]
         )
         assert differences == []
+        assert _run(_phase1_probe_status(database_url)) == "ok"
 
-        _run_in_process(_run_alembic, "downgrade", database_url, timeout=30)
-        assert TABLES.isdisjoint(_run(_table_names(database_url)))
+        _run_in_process(_run_alembic, "downgrade", PHASE1_REVISION, database_url, timeout=30)
+        downgraded_tables = _run(_table_names(database_url))
+        assert downgraded_tables >= PHASE1_TABLES
+        assert HYPERLIQUID_TABLES.isdisjoint(downgraded_tables)
+        assert _run(_phase1_probe_status(database_url)) == "ok"
+        assert _run(_current_revision(database_url)) == PHASE1_REVISION
+
+        _run_in_process(_run_alembic, "upgrade", "head", database_url, timeout=30)
+        tables, indexes, differences = _run(_inspect_upgraded_database(database_url))
+        assert TABLES <= tables
+        for table, expected in NAMED_INDEXES.items():
+            assert expected <= {index["name"] for index in indexes[table]}
+        assert differences == []
+        assert _run(_phase1_probe_status(database_url)) == "ok"
         assert application_logger.disabled is False
     finally:
         if created:

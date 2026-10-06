@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
@@ -167,6 +168,161 @@ class LogCfg(_Strict):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
 
+class HyperliquidFrequenciesCfg(_Strict):
+    """Hyperliquid 调度与协议频率（秒）"""
+
+    ws_ping_interval_s: float = Field(default=50, gt=0)
+    core_state_interval_s: float = Field(default=5, gt=0)
+    trade_debounce_s: float = Field(default=3, gt=0)
+    hot_reconcile_interval_s: float = Field(default=20, gt=0)
+    focus_reconcile_interval_s: float = Field(default=180, gt=0)
+    fill_query_min_interval_s: float = Field(default=60, gt=0)
+    leaderboard_interval_s: float = Field(default=43200, gt=0)
+    tier_recompute_interval_s: float = Field(default=86400, gt=0)
+    profile_interval_s: float = Field(default=86400, gt=0)
+    label_refresh_interval_s: float = Field(default=86400, gt=0)
+    discovery_window_s: float = Field(default=3, gt=0)
+    discovery_cache_s: float = Field(default=3600, gt=0)
+
+
+class HyperliquidTiersCfg(_Strict):
+    """钱包分层及热点集合上限"""
+
+    core_limit: int = Field(default=10, gt=0, le=10)
+    focus_limit: int = Field(default=200, gt=0)
+    candidate_limit: int = Field(default=1000, gt=0)
+    hot_limit: int = Field(default=30, gt=0)
+
+    @model_validator(mode="after")
+    def _hot_not_above_focus(self) -> HyperliquidTiersCfg:
+        if self.hot_limit > self.focus_limit:
+            raise ValueError("热点钱包上限不能大于重点钱包上限")
+        return self
+
+
+class HyperliquidEventsCfg(_Strict):
+    """巨鲸发现、仓位事件与风险分级门槛"""
+
+    s_level_notional_usd: float = Field(default=50_000_000, gt=0)
+    a_level_notional_usd: float = Field(default=5_000_000, gt=0)
+    btc_eth_min_notional_usd: float = Field(default=1_000_000, gt=0)
+    top_alt_min_notional_usd: float = Field(default=500_000, gt=0)
+    other_min_notional_usd: float = Field(default=250_000, gt=0)
+    position_change_ratio: float = Field(default=0.2, gt=0, le=1)
+    discovery_trade_notional_usd: float = Field(default=5_000_000, gt=0)
+    discovery_account_value_usd: float = Field(default=1_000_000, gt=0)
+    hot_position_notional_usd: float = Field(default=10_000_000, gt=0)
+    hot_liquidation_distance_ratio: float = Field(default=0.1, gt=0, le=1)
+    liquidation_risk_ratio: float = Field(default=0.05, gt=0, le=1)
+    liquidation_critical_ratio: float = Field(default=0.02, gt=0, le=1)
+    liquidation_hysteresis_ratio: float = Field(default=0.01, gt=0, le=1)
+    liquidated_a_level_notional_usd: float = Field(default=5_000_000, gt=0)
+    configured_leverage_threshold: float = Field(default=20, gt=0)
+    actual_leverage_threshold: float = Field(default=10, gt=0)
+
+    @model_validator(mode="after")
+    def _threshold_order(self) -> HyperliquidEventsCfg:
+        if self.s_level_notional_usd <= self.a_level_notional_usd:
+            raise ValueError("S 级名义价值门槛必须大于 A 级门槛")
+        if self.liquidation_critical_ratio >= self.liquidation_risk_ratio:
+            raise ValueError("强平风险 S 级距离必须小于 A 级距离")
+        if self.liquidation_hysteresis_ratio >= self.liquidation_risk_ratio:
+            raise ValueError("强平风险滞回必须小于 A 级距离")
+        return self
+
+
+class HyperliquidHealthSourceCfg(_Strict):
+    stale_after_s: float = Field(gt=0)
+
+
+class HyperliquidHealthCfg(_Strict):
+    """Hyperliquid 五个相互独立的健康子源阈值"""
+
+    hl_rest: HyperliquidHealthSourceCfg
+    hl_trades_ws: HyperliquidHealthSourceCfg
+    hl_core_ws: HyperliquidHealthSourceCfg
+    hl_leaderboard: HyperliquidHealthSourceCfg
+    hl_profile: HyperliquidHealthSourceCfg
+
+
+class HyperliquidCfg(_Strict):
+    """Hyperliquid 客户端、调度、规则与健康配置"""
+
+    enabled: bool = True
+    proxy: Literal["global", "direct"] = "global"
+    rest_url: str = "https://api.hyperliquid.xyz/info"
+    ws_url: str = "wss://api.hyperliquid.xyz/ws"
+    monitor_budget_per_min: float = Field(default=900, gt=0)
+    batch_budget_per_min: float = Field(default=300, gt=0)
+    frequencies: HyperliquidFrequenciesCfg = HyperliquidFrequenciesCfg()
+    tiers: HyperliquidTiersCfg = HyperliquidTiersCfg()
+    events: HyperliquidEventsCfg = HyperliquidEventsCfg()
+    top_altcoins: list[str] = []
+    ticker_symbols: list[str] = []
+    core_wallets: list[str] = []
+    health: HyperliquidHealthCfg
+
+    @field_validator("rest_url")
+    @classmethod
+    def _rest_url_scheme(cls, value: str) -> str:
+        if value != value.strip() or not value.startswith(("http://", "https://")):
+            raise ValueError("REST 端点必须是 http:// 或 https:// 地址")
+        return value
+
+    @field_validator("ws_url")
+    @classmethod
+    def _ws_url_scheme(cls, value: str) -> str:
+        if value != value.strip() or not value.startswith(("ws://", "wss://")):
+            raise ValueError("WS 端点必须是 ws:// 或 wss:// 地址")
+        return value
+
+    @field_validator("top_altcoins", "ticker_symbols")
+    @classmethod
+    def _symbols_not_blank_or_duplicate(cls, value: list[str], info) -> list[str]:
+        label = "头部山寨币" if info.field_name == "top_altcoins" else "行情币种"
+        normalized = [symbol.strip() for symbol in value]
+        if any(not symbol for symbol in normalized):
+            raise ValueError(f"{label}不能为空")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(f"{label}不能重复")
+        return normalized
+
+    @field_validator("core_wallets", mode="before")
+    @classmethod
+    def _core_wallets_valid(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return value
+        if len(value) > 10:
+            raise ValueError("核心钱包最多配置 10 个")
+        normalized: list[str] = []
+        for address in value:
+            # YAML 会把未加引号的 0x... 解析成整数；按 160 位地址还原，避免示例配置踩坑。
+            if isinstance(address, int) and not isinstance(address, bool) and 0 <= address < 2**160:
+                normalized.append(f"0x{address:040x}")
+                continue
+            if not isinstance(address, str) or not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+                raise ValueError("核心钱包地址必须是 0x 开头的 40 位十六进制地址")
+            normalized.append(address.lower())
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("核心钱包地址不能重复")
+        return normalized
+
+    @model_validator(mode="after")
+    def _low_frequency_health_exceeds_period(self) -> HyperliquidCfg:
+        checks = (
+            (
+                "hl_leaderboard",
+                self.health.hl_leaderboard.stale_after_s,
+                self.frequencies.leaderboard_interval_s,
+            ),
+            ("hl_profile", self.health.hl_profile.stale_after_s, self.frequencies.profile_interval_s),
+        )
+        for source, stale_after_s, interval_s in checks:
+            if stale_after_s <= interval_s:
+                raise ValueError(f"{source}.stale_after_s 必须大于正常周期")
+        return self
+
+
 class Secrets(_Strict):
     """密钥集合：所有字段都不出现在 repr 中，避免日志或异常回溯泄露"""
 
@@ -192,6 +348,7 @@ class Settings(_Strict):
     pipeline: PipelineCfg = PipelineCfg()
     dispatch: DispatchCfg = DispatchCfg()
     web: WebCfg = WebCfg()
+    hyperliquid: HyperliquidCfg
     ai: AICfg = AICfg()
     log: LogCfg = LogCfg()
     secrets: Secrets = Field(repr=False)

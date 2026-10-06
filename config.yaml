@@ -1,6 +1,58 @@
 # 观潮默认配置（公开提交）。个人配置写在 config.local.yaml，密钥写在 .env
 proxy_url: null  # 在 config.local.yaml 中设置，例如 http://127.0.0.1:10808
 
+hyperliquid:
+  enabled: true
+  proxy: global
+  rest_url: https://api.hyperliquid.xyz/info
+  ws_url: wss://api.hyperliquid.xyz/ws
+  monitor_budget_per_min: 900
+  batch_budget_per_min: 300
+  frequencies:
+    ws_ping_interval_s: 50
+    core_state_interval_s: 5
+    trade_debounce_s: 3
+    hot_reconcile_interval_s: 20
+    focus_reconcile_interval_s: 180
+    fill_query_min_interval_s: 60
+    leaderboard_interval_s: 43200
+    tier_recompute_interval_s: 86400
+    profile_interval_s: 86400
+    label_refresh_interval_s: 86400
+    discovery_window_s: 3
+    discovery_cache_s: 3600
+  tiers:
+    core_limit: 10
+    focus_limit: 200
+    candidate_limit: 1000
+    hot_limit: 30
+  events:
+    s_level_notional_usd: 50000000
+    a_level_notional_usd: 5000000
+    btc_eth_min_notional_usd: 1000000
+    top_alt_min_notional_usd: 500000
+    other_min_notional_usd: 250000
+    position_change_ratio: 0.2
+    discovery_trade_notional_usd: 5000000
+    discovery_account_value_usd: 1000000
+    hot_position_notional_usd: 10000000
+    hot_liquidation_distance_ratio: 0.1
+    liquidation_risk_ratio: 0.05
+    liquidation_critical_ratio: 0.02
+    liquidation_hysteresis_ratio: 0.01
+    liquidated_a_level_notional_usd: 5000000
+    configured_leverage_threshold: 20
+    actual_leverage_threshold: 10
+  top_altcoins: [SOL, XRP, HYPE, DOGE, BNB]
+  ticker_symbols: [BTC, ETH, SOL, HYPE]
+  core_wallets: []
+  health:
+    hl_rest: {stale_after_s: 600}
+    hl_trades_ws: {stale_after_s: 180}
+    hl_core_ws: {stale_after_s: 180}
+    hl_leaderboard: {stale_after_s: 50400}
+    hl_profile: {stale_after_s: 100800}
+
 watchlist:
   assets:
     - {symbol: BTC, aliases: [比特币, Bitcoin]}

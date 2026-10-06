@@ -1,4 +1,4 @@
-"""命令行入口：python -m tidewatch [--only news web] [--dry-run]"""
+"""命令行入口：python -m tidewatch [--only news hyperliquid web] [--dry-run]"""
 
 from tidewatch.app import main
 

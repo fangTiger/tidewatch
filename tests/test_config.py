@@ -329,3 +329,181 @@ def test_secrets_key_in_config_file_rejected(tmp_path, filename):
     with pytest.raises(ConfigError) as exc:
         load_settings(base, environ=ENV)
     assert str(exc.value) == "密钥不能写在配置文件中，请写到 .env"
+
+
+def test_hyperliquid_default_config_is_valid_and_complete(tmp_path):
+    settings = load_settings(_copy_default(tmp_path), environ=ENV)
+    cfg = settings.hyperliquid
+
+    assert cfg.enabled is True
+    assert cfg.proxy == "global"
+    assert cfg.rest_url == "https://api.hyperliquid.xyz/info"
+    assert cfg.ws_url == "wss://api.hyperliquid.xyz/ws"
+    assert cfg.monitor_budget_per_min == 900
+    assert cfg.batch_budget_per_min == 300
+    assert cfg.frequencies.ws_ping_interval_s == 50
+    assert cfg.frequencies.hot_reconcile_interval_s == 20
+    assert cfg.frequencies.focus_reconcile_interval_s == 180
+    assert cfg.frequencies.leaderboard_interval_s == 12 * 60 * 60
+    assert cfg.tiers.core_limit == 10
+    assert cfg.tiers.focus_limit == 200
+    assert cfg.events.s_level_notional_usd == 50_000_000
+    assert cfg.events.a_level_notional_usd == 5_000_000
+    assert cfg.events.btc_eth_min_notional_usd == 1_000_000
+    assert cfg.events.top_alt_min_notional_usd == 500_000
+    assert cfg.events.other_min_notional_usd == 250_000
+    assert cfg.top_altcoins
+    assert cfg.ticker_symbols
+    assert cfg.core_wallets == []
+    assert cfg.health.hl_rest.stale_after_s > 0
+    assert cfg.health.hl_trades_ws.stale_after_s > 0
+    assert cfg.health.hl_core_ws.stale_after_s > 0
+    assert cfg.health.hl_leaderboard.stale_after_s > cfg.frequencies.leaderboard_interval_s
+    assert cfg.health.hl_profile.stale_after_s > cfg.frequencies.profile_interval_s
+
+
+def test_hyperliquid_unknown_key_reports_chinese(tmp_path):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(
+        "hyperliquid:\n  monitor_budegt_per_min: 900\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+
+    message = str(exc.value)
+    assert "hyperliquid.monitor_budegt_per_min" in message
+    assert "未知配置项" in message
+
+
+@pytest.mark.parametrize("field", ["monitor_budget_per_min", "batch_budget_per_min"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_hyperliquid_budget_must_be_positive_and_reports_chinese(tmp_path, field, value):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(
+        f"hyperliquid:\n  {field}: {value}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+
+    message = str(exc.value)
+    assert f"hyperliquid.{field}" in message
+    assert "必须大于 0" in message
+
+
+@pytest.mark.parametrize(
+    "override, field",
+    [
+        ("frequencies:\n    hot_reconcile_interval_s: 0", "frequencies.hot_reconcile_interval_s"),
+        ("tiers:\n    focus_limit: 0", "tiers.focus_limit"),
+        ("events:\n    a_level_notional_usd: 0", "events.a_level_notional_usd"),
+        ("health:\n    hl_rest:\n      stale_after_s: 0", "health.hl_rest.stale_after_s"),
+    ],
+)
+def test_hyperliquid_numeric_settings_must_be_positive(tmp_path, override, field):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(
+        f"hyperliquid:\n  {override}\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+
+    message = str(exc.value)
+    assert f"hyperliquid.{field}" in message
+    assert "必须大于 0" in message
+
+
+def test_hyperliquid_core_wallets_are_normalized_to_lowercase(tmp_path):
+    base = _copy_default(tmp_path)
+    mixed_case = "0xAbCdEf0123456789aBCDef0123456789abCDef01"
+    (base / "config.local.yaml").write_text(
+        f"hyperliquid:\n  core_wallets: [{mixed_case}]\n", encoding="utf-8"
+    )
+
+    settings = load_settings(base, environ=ENV)
+
+    assert settings.hyperliquid.core_wallets == [mixed_case.lower()]
+
+
+@pytest.mark.parametrize(
+    "wallet",
+    [
+        "abcdef0123456789abcdef0123456789abcdef01",
+        "0xabcdef",
+        "0xgggggggggggggggggggggggggggggggggggggggg",
+        " 0xabcdef0123456789abcdef0123456789abcdef01 ",
+    ],
+)
+def test_hyperliquid_invalid_core_wallet_reports_chinese(tmp_path, wallet):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(
+        f'hyperliquid:\n  core_wallets: ["{wallet}"]\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+
+    message = str(exc.value)
+    assert "hyperliquid.core_wallets" in message
+    assert "核心钱包地址必须是 0x 开头的 40 位十六进制地址" in message
+
+
+def test_hyperliquid_duplicate_core_wallet_reports_chinese(tmp_path):
+    base = _copy_default(tmp_path)
+    lower = "0xabcdef0123456789abcdef0123456789abcdef01"
+    upper = "0xABCDEF0123456789ABCDEF0123456789ABCDEF01"
+    (base / "config.local.yaml").write_text(
+        f"hyperliquid:\n  core_wallets: [{lower}, {upper}]\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+
+    message = str(exc.value)
+    assert "hyperliquid.core_wallets" in message
+    assert "核心钱包地址不能重复" in message
+
+
+def test_hyperliquid_more_than_ten_core_wallets_reports_chinese(tmp_path):
+    base = _copy_default(tmp_path)
+    wallets = [f"0x{number:040x}" for number in range(11)]
+    (base / "config.local.yaml").write_text(
+        "hyperliquid:\n  core_wallets:\n" + "".join(f"    - {wallet}\n" for wallet in wallets),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+
+    message = str(exc.value)
+    assert "hyperliquid.core_wallets" in message
+    assert "核心钱包最多配置 10 个" in message
+
+
+@pytest.mark.parametrize(
+    "source, interval_field",
+    [("hl_leaderboard", "leaderboard_interval_s"), ("hl_profile", "profile_interval_s")],
+)
+def test_hyperliquid_low_frequency_health_threshold_exceeds_period(
+    tmp_path, source, interval_field
+):
+    base = _copy_default(tmp_path)
+    (base / "config.local.yaml").write_text(
+        "hyperliquid:\n"
+        "  frequencies:\n"
+        f"    {interval_field}: 100\n"
+        "  health:\n"
+        f"    {source}:\n"
+        "      stale_after_s: 100\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc:
+        load_settings(base, environ=ENV)
+
+    message = str(exc.value)
+    assert "hyperliquid" in message
+    assert source in message
+    assert "必须大于正常周期" in message

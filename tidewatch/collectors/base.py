@@ -43,7 +43,7 @@ def parse_context(what: str) -> Iterator[None]:
 
 
 class TokenBucket:
-    """令牌桶：每秒补充 rate 个令牌，容量 capacity；没有令牌时等待"""
+    """加权令牌桶：每秒补充 rate 个令牌，容量 capacity；令牌不足时等待"""
 
     def __init__(
         self,
@@ -59,16 +59,23 @@ class TokenBucket:
         self._monotonic = monotonic
         self._sleep = sleep
         self._last = monotonic()
+        self._lock = asyncio.Lock()
 
-    async def acquire(self) -> None:
-        while True:
-            now = self._monotonic()
-            self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
-            self._last = now
-            if self._tokens >= 1:
-                self._tokens -= 1
-                return
-            await self._sleep((1 - self._tokens) / self._rate)
+    async def acquire(self, weight: float = 1) -> None:
+        """原子获取指定权重；不传参数时保持一期的单令牌行为。"""
+        if weight <= 0:
+            raise ValueError("令牌权重必须大于 0")
+        if weight > self._capacity:
+            raise ValueError("令牌权重不能超过桶容量")
+        async with self._lock:
+            while True:
+                now = self._monotonic()
+                self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
+                self._last = now
+                if self._tokens >= weight:
+                    self._tokens -= weight
+                    return
+                await self._sleep((weight - self._tokens) / self._rate)
 
 
 class Backoff:
