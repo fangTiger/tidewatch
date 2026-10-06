@@ -10,6 +10,8 @@ hyperliquid:
   aliases_url: https://api.hypurrscan.io/globalAliases
   monitor_budget_per_min: 600
   batch_budget_per_min: 200
+  # 资格查询每次 2 权重；最多 3 次/分钟，为热点与常规对账保留预算。
+  discovery_query_limit_per_min: 3
   reconcile_concurrency: 4
   rest_burst_window_s: 10
   aimd_min_budget_per_min: 120

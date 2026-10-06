@@ -343,6 +343,7 @@ def test_hyperliquid_default_config_is_valid_and_complete(tmp_path):
     assert cfg.ws_url == "wss://api.hyperliquid.xyz/ws"
     assert cfg.monitor_budget_per_min == 600
     assert cfg.batch_budget_per_min == 200
+    assert cfg.discovery_query_limit_per_min == 3
     assert cfg.reconcile_concurrency == 4
     assert cfg.rest_burst_window_s == 10
     assert cfg.aimd_min_budget_per_min == 120
@@ -390,6 +391,7 @@ def test_hyperliquid_unknown_key_reports_chinese(tmp_path):
     [
         "monitor_budget_per_min",
         "batch_budget_per_min",
+        "discovery_query_limit_per_min",
         "rest_burst_window_s",
         "aimd_min_budget_per_min",
         "aimd_recovery_interval_s",

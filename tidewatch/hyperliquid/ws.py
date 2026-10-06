@@ -67,6 +67,7 @@ class HyperliquidWsManager:
         self._default_health_source = health_source
         self._connections: dict[str, _Connection] = {}
         self._active: dict[str, Any] = {}
+        self._connection_changed = asyncio.Event()
         self._closed = asyncio.Event()
         self._running = False
 
@@ -92,6 +93,7 @@ class HyperliquidWsManager:
             on_connect=on_connect,
             health_source=health_source or self._default_health_source,
         )
+        self._connection_changed.set()
         return True
 
     def add_subscription(self, connection_name: str, subscription: Mapping[str, Any]) -> bool:
@@ -151,25 +153,41 @@ class HyperliquidWsManager:
             logger.warning("WS 连接 %s 动态订阅发送失败，将在重连后恢复：%s", name, describe(exc))
 
     async def run(self) -> None:
-        """运行全部已登记连接；没有连接时保持空闲，直到优雅关闭。"""
+        """运行全部逻辑连接，并接纳运行期间新增的连接。"""
         if self._running:
             raise RuntimeError("Hyperliquid WS 管理器已经在运行")
         self._running = True
-        tasks: list[asyncio.Task[None]] = []
+        tasks: dict[str, asyncio.Task[None]] = {}
         try:
-            if not self._connections:
-                await self._closed.wait()
-                return
-            tasks = [
-                asyncio.create_task(self._run_connection(name, connection), name=f"hl-ws-{name}")
-                for name, connection in self._connections.items()
-            ]
-            await asyncio.gather(*tasks)
+            while not self._closed.is_set():
+                for name, connection in self._connections.items():
+                    if name not in tasks:
+                        tasks[name] = asyncio.create_task(
+                            self._run_connection(name, connection),
+                            name=f"hl-ws-{name}",
+                        )
+                self._connection_changed.clear()
+                changed = asyncio.create_task(self._connection_changed.wait())
+                closed = asyncio.create_task(self._closed.wait())
+                done, pending = await asyncio.wait(
+                    (*tasks.values(), changed, closed),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for waiter in (changed, closed):
+                    if waiter not in done:
+                        waiter.cancel()
+                await asyncio.gather(changed, closed, return_exceptions=True)
+                if closed in done:
+                    return
+                for name, task in list(tasks.items()):
+                    if task in done:
+                        await task
+                        tasks.pop(name, None)
         finally:
-            for task in tasks:
+            for task in tasks.values():
                 task.cancel()
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*tasks.values(), return_exceptions=True)
             self._running = False
 
     async def _run_connection(self, name: str, connection: _Connection) -> None:
@@ -182,6 +200,7 @@ class HyperliquidWsManager:
                     self.url,
                     proxy=self._proxy,
                     ping_interval=None,
+                    close_timeout=1,
                 ) as websocket:
                     connected_at = self._monotonic()
                     self._active[name] = websocket
@@ -276,9 +295,6 @@ class HyperliquidWsManager:
                 *(websocket.close() for websocket in active),
                 return_exceptions=True,
             )
-        sockets = list(self._active.values())
-        if sockets:
-            await asyncio.gather(*(socket.close() for socket in sockets), return_exceptions=True)
 
     close = aclose
 

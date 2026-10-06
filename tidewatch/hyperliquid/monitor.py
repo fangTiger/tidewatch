@@ -217,7 +217,7 @@ class HyperliquidMonitor:
         sink: Any,
         clock: Clock = utcnow,
         fill_lookup_timeout_s: float = 5.0,
-        account_lookup_timeout_s: float = 2.0,
+        account_lookup_timeout_s: float = 5.0,
     ) -> None:
         if fill_lookup_timeout_s <= 0 or account_lookup_timeout_s <= 0:
             raise ValueError("成交补查与账户查询超时必须大于 0")
@@ -236,6 +236,7 @@ class HyperliquidMonitor:
         self._deferred_fills: dict[str, tuple[datetime, set[str]]] = {}
         self._pending_reconciles: dict[str, _ReconcileProgress] = {}
         self._fill_timeout_warnings: dict[str, datetime] = {}
+        self._account_lookup_warnings: dict[tuple[str, str], datetime] = {}
 
     @property
     def deferred_fill_count(self) -> int:
@@ -870,11 +871,11 @@ class HyperliquidMonitor:
                     timeout=self.account_lookup_timeout_s,
                 )
             except Exception as exc:
-                logger.warning(
+                self._log_account_lookup_failure(
+                    address,
+                    "account_type",
                     "钱包 %s…%s 账户类型查询失败，暂按普通账户处理：%s",
-                    address[:6],
-                    address[-4:],
-                    describe(exc),
+                    exc,
                 )
             else:
                 if available:
@@ -889,11 +890,11 @@ class HyperliquidMonitor:
                     timeout=self.account_lookup_timeout_s,
                 )
             except Exception as exc:
-                logger.warning(
+                self._log_account_lookup_failure(
+                    address,
+                    "spot",
                     "钱包 %s…%s 现货 USDC 查询失败，使用最近缓存：%s",
-                    address[:6],
-                    address[-4:],
-                    describe(exc),
+                    exc,
                 )
             else:
                 if available and isinstance(value, Mapping):
@@ -941,6 +942,26 @@ class HyperliquidMonitor:
             )
         if emit_warning:
             self._fill_timeout_warnings[address] = now
+
+    def _log_account_lookup_failure(
+        self,
+        address: str,
+        kind: str,
+        message: str,
+        exc: BaseException,
+    ) -> None:
+        """同钱包同类账户补查失败每半小时至多记录一次 WARNING。"""
+        now = self.clock()
+        key = (address, kind)
+        previous = self._account_lookup_warnings.get(key)
+        warning_interval = self.cfg.frequencies.fill_timeout_warning_interval_s
+        emit_warning = (
+            previous is None or (now - previous).total_seconds() >= warning_interval
+        )
+        log = logger.warning if emit_warning else logger.debug
+        log(message, address[:6], address[-4:], describe(exc))
+        if emit_warning:
+            self._account_lookup_warnings[key] = now
 
 
 async def _initialize_fill_cursor(

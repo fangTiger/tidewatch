@@ -70,6 +70,15 @@ class WalletView:
         return self.note or next(iter(self.external_labels), None)
 
 
+@dataclass(frozen=True)
+class PromotionResult:
+    """成交流发现地址尝试进入重点层的结果。"""
+
+    promoted: bool
+    replaced: str | None = None
+    reason: str | None = None
+
+
 class WalletRegistry:
     """封装名单写入、校验和查询，CLI 与网站不得绕过此层。"""
 
@@ -238,6 +247,94 @@ class WalletRegistry:
                 )
             await invalidate_monitor_baseline(conn, normalized)
         return True
+
+    async def promote_discovered(
+        self,
+        address: str,
+        *,
+        total_notional: Decimal,
+        last_trade_at: datetime,
+    ) -> PromotionResult:
+        """按重点层满额替换规则晋升成交流发现的钱包。"""
+        normalized = normalize_address(address)
+        if last_trade_at.tzinfo is None:
+            raise ValueError("发现成交时间必须带时区")
+        async with self.engine.begin() as conn:
+            await self._lock_registry(conn)
+            rows = (await conn.execute(select(hl_wallets).with_for_update())).mappings().all()
+            existing = next((row for row in rows if row["address"] == normalized), None)
+            if existing is not None and existing["excluded"]:
+                return PromotionResult(False, reason="excluded")
+            if existing is not None and existing["tier"] in {"focus", "core"}:
+                return PromotionResult(False, reason="already_monitored")
+            if existing is not None and existing["style"] in {"market_maker", "high_frequency"}:
+                return PromotionResult(False, reason="high_frequency")
+
+            focus_rows = [row for row in rows if row["tier"] == "focus"]
+            replaced = None
+            reason = None
+            if len(focus_rows) >= self.focus_limit:
+                automatic = [
+                    row
+                    for row in focus_rows
+                    if row["source"] != "manual"
+                    and not (row["profile"] or {}).get("manual_focus")
+                ]
+                if automatic:
+                    addresses = [row["address"] for row in automatic]
+                    totals = dict(
+                        (
+                            await conn.execute(
+                                select(
+                                    hl_positions.c.address,
+                                    func.coalesce(
+                                        func.sum(func.abs(hl_positions.c.notional_usd)), 0
+                                    ),
+                                )
+                                .where(hl_positions.c.address.in_(addresses))
+                                .group_by(hl_positions.c.address)
+                            )
+                        ).all()
+                    )
+                    victim = min(
+                        addresses,
+                        key=lambda candidate: (
+                            Decimal(totals.get(candidate, 0)),
+                            candidate,
+                        ),
+                    )
+                    if total_notional > Decimal(totals.get(victim, 0)):
+                        replaced = victim
+                        await conn.execute(
+                            update(hl_wallets)
+                            .where(hl_wallets.c.address == victim)
+                            .values(tier="candidate")
+                        )
+                        await invalidate_monitor_baseline(conn, victim)
+                    else:
+                        reason = "not_above_lowest"
+                else:
+                    reason = "no_replaceable_wallet"
+
+            profile = dict(existing["profile"] or {}) if existing is not None else {}
+            profile["last_trade_at"] = last_trade_at.isoformat()
+            promoted = reason is None
+            values = {
+                "tier": "focus" if promoted else "candidate",
+                "source": "discovered",
+                "excluded": False,
+                "profile": profile,
+                "last_position_at": last_trade_at if total_notional > 0 else None,
+            }
+            if existing is None:
+                await conn.execute(insert(hl_wallets).values(address=normalized, **values))
+            else:
+                await conn.execute(
+                    update(hl_wallets).where(hl_wallets.c.address == normalized).values(**values)
+                )
+            if promoted:
+                await invalidate_monitor_baseline(conn, normalized)
+            return PromotionResult(promoted, replaced=replaced, reason=reason)
 
     async def remove(self, address: str) -> bool:
         """移除手动名单关系；配置核心保持不变。"""

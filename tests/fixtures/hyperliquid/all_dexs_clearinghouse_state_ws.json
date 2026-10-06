@@ -1,0 +1,60 @@
+{
+  "channel": "allDexsClearinghouseState",
+  "data": {
+    "user": "0x7b7f72a28fe109fa703eeed7984f2a8a68fedee2",
+    "clearinghouseStates": [
+      [
+        "",
+        {
+          "marginSummary": {
+            "accountValue": "1986161.6571460001",
+            "totalNtlPos": "647713.881854",
+            "totalRawUsd": "1489576.906892",
+            "totalMarginUsed": "46621.76628"
+          },
+          "assetPositions": [
+            {
+              "type": "oneWay",
+              "position": {
+                "coin": "BTC",
+                "szi": "0.88998",
+                "leverage": {"type": "cross", "value": 20},
+                "entryPx": "85371.4",
+                "positionValue": "75999.8421",
+                "unrealizedPnl": "20.933027",
+                "liquidationPx": null
+              }
+            }
+          ],
+          "time": 1791272111079
+        }
+      ],
+      [
+        "xyz",
+        {
+          "marginSummary": {
+            "accountValue": "718259.03494",
+            "totalNtlPos": "678823.922344",
+            "totalRawUsd": "47885.893416",
+            "totalMarginUsed": "67882.392234"
+          },
+          "assetPositions": [
+            {
+              "type": "oneWay",
+              "position": {
+                "coin": "xyz:GOLD",
+                "szi": "-0.5163",
+                "leverage": {"type": "cross", "value": 10},
+                "entryPx": "4140.5",
+                "positionValue": "2136.29451",
+                "unrealizedPnl": "1.44715",
+                "liquidationPx": "1341980.8256086861"
+              }
+            }
+          ],
+          "time": 1791272111079
+        }
+      ]
+    ]
+  }
+}

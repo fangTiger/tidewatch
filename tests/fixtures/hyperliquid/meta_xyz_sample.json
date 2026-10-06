@@ -1,0 +1,7 @@
+{
+  "universe": [
+    {"name": "xyz:XYZ100", "szDecimals": 4, "maxLeverage": 30},
+    {"name": "xyz:GOLD", "szDecimals": 4, "maxLeverage": 25},
+    {"name": "xyz:URANIUM", "szDecimals": 3, "maxLeverage": 10, "isDelisted": true}
+  ]
+}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -13,12 +14,19 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
 from tidewatch.collectors.base import Backoff, TokenBucket, describe
 from tidewatch.collectors.http import make_client
 from tidewatch.hyperliquid.client import MAX_BASE_WEIGHT, HyperliquidRestClient
+from tidewatch.hyperliquid.discovery import (
+    QualificationRequest,
+    TradeDiscovery,
+    load_trade_coins,
+    parse_trade_message,
+)
 from tidewatch.hyperliquid.importer import AliasCache, LeaderboardImporter
 from tidewatch.hyperliquid.leaderboard import HYPURRSCAN_ALIASES_URL, LEADERBOARD_URL, LeaderboardSource
 from tidewatch.hyperliquid.monitor import (
@@ -29,7 +37,7 @@ from tidewatch.hyperliquid.monitor import (
 )
 from tidewatch.hyperliquid.registry import WalletRegistry, normalize_address
 from tidewatch.hyperliquid.tiers import TierRecalculator
-from tidewatch.hyperliquid.ws import HyperliquidWsManager
+from tidewatch.hyperliquid.ws import MAX_SUBSCRIPTIONS, HyperliquidWsManager
 from tidewatch.store.tables import hl_state
 
 
@@ -152,13 +160,18 @@ class HyperliquidRuntime:
             clock=clock,
         )
         self.reconcile_queue = PriorityReconcileQueue()
+        self._pending_discoveries: dict[str, list[QualificationRequest]] = defaultdict(list)
+        self._discovery_query_times: deque[float] = deque()
+        self._discovery_query_lock = asyncio.Lock()
         self._reconcile_backoffs: dict[str, Backoff] = {}
         self._next_reconcile: dict[str, float] = {}
         self._inflight_reconciles: set[str] = set()
         self._core_addresses: set[str] = set()
-        self._ws_configured = False
+        self._ws_configured = True
         self._ws_config_lock = asyncio.Lock()
         self._market_messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue(maxsize=1)
+        self._trade_messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue(maxsize=10_000)
+        self._trade_coins: set[str] = set()
         self._core_message_queues: tuple[asyncio.Queue[Mapping[str, Any]], ...] = tuple(
             asyncio.Queue(maxsize=100) for _ in range(settings.tiers.core_limit)
         )
@@ -166,6 +179,24 @@ class HyperliquidRuntime:
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         self._resources_closed = False
+        self.discovery = TradeDiscovery(
+            settings,
+            engine=engine,
+            registry=self.registry,
+            monitor=self.monitor,
+            rest=self.rest,
+            sink=sink,
+            clock=clock,
+            schedule_query=self._schedule_discovery_query,
+            trigger_reconcile=self.trigger_trade,
+        )
+        self.ws.add_connection(
+            "core",
+            handler=self._handle_ws_message,
+            on_connect=self._on_core_connected,
+            health_source="hl_core_ws",
+        )
+        self.ws.add_subscription("core", {"type": "allMids"})
 
     def register_health(self) -> None:
         """登记五个互相独立的健康子源。"""
@@ -181,11 +212,13 @@ class HyperliquidRuntime:
             self.settings.proxy,
         )
         await self.registry.sync_configured_core()
+        await self.discovery.restore_pending()
         self._stop.clear()
         specs: tuple[tuple[str, Callable[[], Awaitable[None]]], ...] = (
             ("hl-rest", self.run_rest),
             ("hl-trades-ws", self.run_trades_ws),
             ("hl-core-ws", self.run_core_ws),
+            ("hl-trade-messages", self.run_trade_messages),
             ("hl-core-subscriptions", self.run_core_subscriptions),
             ("hl-core-messages", self.run_core_messages),
             ("hl-leaderboard", self.run_leaderboard),
@@ -266,19 +299,37 @@ class HyperliquidRuntime:
                 self._inflight_reconciles.discard(task.address)
 
     async def run_trades_ws(self) -> None:
-        await self._idle_health("hl_trades_ws")
+        """从官方元数据维护成交流订阅，不伪造空闲健康成功。"""
+        await self._refresh_trade_subscriptions()
+        while not self._stop.is_set():
+            if await self._wait_or_stop(self.settings.frequencies.leaderboard_interval_s):
+                return
+            await self._refresh_trade_subscriptions()
 
     async def run_core_ws(self) -> None:
-        """运行核心钱包与 allMids 共用的真实 WS 连接。"""
+        """运行核心 WS；M4 成交流任务可动态加入第二条独立连接。"""
+        await self.ws.run()
+
+    async def run_trade_messages(self) -> None:
+        """串行消费成交流并定时关闭三秒聚合窗口。"""
         while not self._stop.is_set():
-            await self._ensure_ws_configured()
-            if self._ws_configured:
-                await self.ws.run()
-                return
-            await self._set_health_mode("hl_core_ws", "degraded")
-            await self.health.success("hl_core_ws")
-            if await self._wait_or_stop(min(5, self.settings.frequencies.core_state_interval_s)):
-                return
+            try:
+                message = await asyncio.wait_for(self._trade_messages.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                await self.discovery.flush_due(int(self.clock().timestamp() * 1000))
+                continue
+            await self.discovery.handle_message(message)
+            raw = message.get("data")
+            latest = max(
+                (
+                    int(item.get("time") or 0)
+                    for item in raw
+                    if isinstance(item, Mapping)
+                ),
+                default=0,
+            ) if isinstance(raw, list) else 0
+            if latest:
+                await self.discovery.flush_due(latest)
 
     async def run_core_subscriptions(self) -> None:
         """轮询数据库名单并动态增减核心钱包订阅。"""
@@ -488,8 +539,20 @@ class HyperliquidRuntime:
 
     async def _execute_reconcile(self, task: ScheduledReconcile, now: float) -> None:
         """执行单钱包任务并按结果完成、顺延或退避。"""
+        discovery_requests = self._pending_discoveries.get(task.address)
+        is_discovery = bool(discovery_requests)
+        if is_discovery:
+            next_query_at = await self._reserve_discovery_query(now)
+            if next_query_at is not None:
+                self.reconcile_queue.defer(task, due_at=next_query_at)
+                return
         try:
-            complete = await self.monitor.reconcile(task.address)
+            if discovery_requests:
+                complete = await self.discovery.process_qualification(
+                    discovery_requests[0]
+                )
+            else:
+                complete = await self.monitor.reconcile(task.address)
         except asyncio.CancelledError:
             self.reconcile_queue.defer(task, due_at=now)
             raise
@@ -511,6 +574,23 @@ class HyperliquidRuntime:
                 due_at=max(now + 0.1, self.rest.cooldown_until),
             )
             return
+        if discovery_requests:
+            discovery_requests.pop(0)
+            if discovery_requests:
+                self.reconcile_queue.schedule(
+                    task.address,
+                    ReconcilePriority.TRADE,
+                    due_at=self.monotonic(),
+                    reason="新巨鲸资格查询",
+                )
+            else:
+                self._pending_discoveries.pop(task.address, None)
+                self._next_reconcile[task.address] = (
+                    self.monotonic()
+                    + self.settings.frequencies.focus_reconcile_interval_s
+                )
+            self._reconcile_backoffs.pop(task.address, None)
+            return
         interval = await self._interval_after(task)
         self._reconcile_backoffs.pop(task.address, None)
         self._next_reconcile[task.address] = self.monotonic() + interval
@@ -526,15 +606,25 @@ class HyperliquidRuntime:
             self._core_addresses = desired
             await self._set_health_mode("hl_core_ws", "degraded")
             return
-        for address in sorted(desired - self._core_addresses):
-            await self.ws.subscribe("core", {"type": "userFills", "user": address})
-            await self.ws.subscribe(
+        additions = desired - self._core_addresses
+        removals = self._core_addresses - desired
+        projected = self.ws.subscription_count + 2 * len(additions) - 2 * len(removals)
+        if projected > MAX_SUBSCRIPTIONS:
+            error = ValueError(
+                f"Hyperliquid WS 总订阅最多 1,000 个，当前计划需要 {projected} 个"
+            )
+            await self.health.failure("hl_core_ws", describe(error))
+            logger.error("拒绝新增 Hyperliquid 核心钱包订阅：%s", describe(error))
+            raise error
+        for address in sorted(removals):
+            await self.ws.unsubscribe("core", {"type": "userFills", "user": address})
+            await self.ws.unsubscribe(
                 "core",
                 {"type": "allDexsClearinghouseState", "user": address},
             )
-        for address in sorted(self._core_addresses - desired):
-            await self.ws.unsubscribe("core", {"type": "userFills", "user": address})
-            await self.ws.unsubscribe(
+        for address in sorted(additions):
+            await self.ws.subscribe("core", {"type": "userFills", "user": address})
+            await self.ws.subscribe(
                 "core",
                 {"type": "allDexsClearinghouseState", "user": address},
             )
@@ -567,6 +657,87 @@ class HyperliquidRuntime:
             self._core_addresses = {wallet.address for wallet in core}
             self._ws_configured = True
             await self._set_health_mode("hl_core_ws", "normal" if core else "degraded")
+
+    async def _refresh_trade_subscriptions(self) -> None:
+        """用官方元数据刷新主 dex 与白名单 HIP-3 的全部活跃币种订阅。"""
+        coins = set(await load_trade_coins(self.rest, self.settings.hip3_dexes))
+        projected = self.ws.subscription_count - len(self._trade_coins) + len(coins)
+        if projected > MAX_SUBSCRIPTIONS:
+            error = ValueError(
+                f"Hyperliquid WS 总订阅最多 1,000 个，当前计划需要 {projected} 个"
+            )
+            await self.health.failure("hl_trades_ws", describe(error))
+            logger.error("拒绝刷新 Hyperliquid 成交流订阅：%s", describe(error))
+            raise error
+        if "trades" not in self.ws._connections:
+            self.ws.add_connection(
+                "trades",
+                handler=self._handle_trade_ws_message,
+                health_source="hl_trades_ws",
+            )
+        for coin in sorted(self._trade_coins - coins):
+            await self.ws.unsubscribe("trades", {"type": "trades", "coin": coin})
+        for coin in sorted(coins - self._trade_coins):
+            await self.ws.subscribe("trades", {"type": "trades", "coin": coin})
+        self._trade_coins = coins
+        now = self.clock()
+        stmt = pg_insert(hl_state).values(
+            name="trade_subscriptions",
+            cursor={
+                "coins": sorted(coins),
+                "hip3_dexes": list(self.settings.hip3_dexes),
+                "refreshed_at": now.isoformat(),
+            },
+            updated_at=now,
+        )
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["name"],
+                    set_={
+                        "cursor": stmt.excluded.cursor,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+            )
+
+    def _schedule_discovery_query(self, request: QualificationRequest) -> None:
+        """把发现资格查询放入与热点对账共享的最高优先级队列。"""
+        pending = self._pending_discoveries[request.address]
+        identity = (request.coin, request.end_ms)
+        if not any((item.coin, item.end_ms) == identity for item in pending):
+            pending.append(request)
+        self.reconcile_queue.schedule(
+            request.address,
+            ReconcilePriority.TRADE,
+            due_at=self.monotonic(),
+            reason="新巨鲸资格查询",
+        )
+
+    async def _reserve_discovery_query(self, now: float) -> float | None:
+        """限制发现资格查询权重，避免挤占热点和常规对账预算。"""
+        async with self._discovery_query_lock:
+            cutoff = now - 60
+            while self._discovery_query_times and self._discovery_query_times[0] <= cutoff:
+                self._discovery_query_times.popleft()
+            limit = self.settings.discovery_query_limit_per_min
+            if len(self._discovery_query_times) >= limit:
+                return self._discovery_query_times[0] + 60
+            self._discovery_query_times.append(now)
+            return None
+
+    async def _handle_trade_ws_message(self, message: Any) -> bool:
+        """校验成交流协议消息并交给独立消费队列。"""
+        if not isinstance(message, Mapping):
+            return False
+        channel = message.get("channel")
+        if channel in {"pong", "subscriptionResponse"}:
+            return True
+        if channel != "trades":
+            return False
+        parse_trade_message(message)
+        await self._trade_messages.put(dict(message))
+        return True
 
     async def _handle_ws_message(self, message: Any) -> bool:
         if not isinstance(message, Mapping):

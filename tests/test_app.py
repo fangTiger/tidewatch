@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import json
 import logging
 import os
 import signal
@@ -9,7 +10,9 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+import respx
 from sqlalchemy import select
+from websockets.asyncio.server import serve
 
 import tidewatch.app as app_module
 from fakes import free_port, wait_until
@@ -24,6 +27,27 @@ from tidewatch.pipeline.rules.engine import build_rule_engine
 from tidewatch.store.repo import load_cursor
 from tidewatch.store.tables import collector_state, event_clusters, events, hl_wallets
 from tidewatch.web.embedded import EmbeddedServer
+
+
+async def _hyperliquid_ws_handler(websocket) -> None:
+    """本地回放订阅确认与协议 pong，测试期间禁止访问官方 WS。"""
+    async for raw in websocket:
+        message = json.loads(raw)
+        if message.get("method") == "subscribe":
+            await websocket.send(
+                json.dumps({"channel": "subscriptionResponse", "data": message})
+            )
+        elif message.get("method") == "ping":
+            await websocket.send(json.dumps({"channel": "pong"}))
+
+
+def _hyperliquid_info_response(request: httpx.Request) -> httpx.Response:
+    payload = json.loads(request.content)
+    if payload["type"] == "perpDexs":
+        return httpx.Response(200, json=[None])
+    if payload["type"] == "meta":
+        return httpx.Response(200, json={"universe": [{"name": "BTC"}]})
+    raise AssertionError(payload)
 
 
 def test_parse_args():
@@ -607,54 +631,69 @@ async def test_hyperliquid_only_starts_shared_pipeline_without_news_or_web(engin
                 source="leaderboard",
             )
         )
-    app = Application(settings, groups={"hyperliquid"}, dry_run=True)
-    assert app.hyperliquid.monitor.sink is app.sink
-    assert app.collectors == []
-    assert app.live is None
-    assert app._server is None
-    await asyncio.wait_for(app.start(), timeout=5)
-    try:
-        names = {task.get_name() for task in app.critical_tasks()}
-        assert {"health", "event-sink", "dispatch-route"} <= names
-        assert {
-            "hl-rest",
-            "hl-trades-ws",
-            "hl-core-ws",
-            "hl-core-subscriptions",
-            "hl-core-messages",
-            "hl-leaderboard",
-            "hl-tier-recompute",
-            "hl-profile",
-            "hl-market-data",
-        } <= names
-        assert app._web_task is None
-        assert {"hl_rest", "hl_trades_ws", "hl_core_ws", "hl_leaderboard", "hl_profile"} <= set(
-            app.health._states
-        )
-        await wait_until(
-            lambda: all(
-                app.health.status(name) == "normal"
-                for name in ("hl_rest", "hl_trades_ws", "hl_core_ws", "hl_profile")
+    async with serve(_hyperliquid_ws_handler, "127.0.0.1", 0) as server:
+        settings.hyperliquid.ws_url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+        settings.hyperliquid.proxy = "direct"
+        app = Application(settings, groups={"hyperliquid"}, dry_run=True)
+        assert app.hyperliquid.monitor.sink is app.sink
+        assert app.collectors == []
+        assert app.live is None
+        assert app._server is None
+        with respx.mock:
+            respx.post(settings.hyperliquid.rest_url).mock(
+                side_effect=_hyperliquid_info_response
             )
-        )
-        assert app.health.status("hl_leaderboard") == "unknown"
-    finally:
-        await asyncio.wait_for(app.stop(), timeout=5)
+            await asyncio.wait_for(app.start(), timeout=5)
+            try:
+                names = {task.get_name() for task in app.critical_tasks()}
+                assert {"health", "event-sink", "dispatch-route"} <= names
+                assert {
+                    "hl-rest",
+                    "hl-trades-ws",
+                    "hl-trade-messages",
+                    "hl-core-ws",
+                    "hl-core-subscriptions",
+                    "hl-core-messages",
+                    "hl-leaderboard",
+                    "hl-tier-recompute",
+                    "hl-profile",
+                    "hl-market-data",
+                } <= names
+                assert app._web_task is None
+                assert {"hl_rest", "hl_trades_ws", "hl_core_ws", "hl_leaderboard", "hl_profile"} <= set(
+                    app.health._states
+                )
+                await wait_until(
+                    lambda: all(
+                        app.health.status(name) == "normal"
+                        for name in ("hl_rest", "hl_trades_ws", "hl_core_ws", "hl_profile")
+                    )
+                )
+                assert app.health.status("hl_leaderboard") == "unknown"
+            finally:
+                await asyncio.wait_for(app.stop(), timeout=5)
     assert all(task.done() for task in app.critical_tasks())
 
 
 async def test_hyperliquid_and_web_wire_live_updates_without_news(engine, settings):
     settings.web.port = free_port()
-    app = Application(settings, groups={"hyperliquid", "web"}, dry_run=True)
-    assert app.collectors == []
-    assert app.live is not None
-    await asyncio.wait_for(app.start(), timeout=5)
-    try:
-        assert app.live.on_ingest in app.sink._ingest_listeners
-        assert app.live.on_health in app.health._listeners
-        assert "live" in {task.get_name() for task in app.critical_tasks()}
-    finally:
-        await asyncio.wait_for(app.stop(), timeout=5)
+    async with serve(_hyperliquid_ws_handler, "127.0.0.1", 0) as server:
+        settings.hyperliquid.ws_url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+        settings.hyperliquid.proxy = "direct"
+        app = Application(settings, groups={"hyperliquid", "web"}, dry_run=True)
+        assert app.collectors == []
+        assert app.live is not None
+        with respx.mock:
+            respx.post(settings.hyperliquid.rest_url).mock(
+                side_effect=_hyperliquid_info_response
+            )
+            await asyncio.wait_for(app.start(), timeout=5)
+            try:
+                assert app.live.on_ingest in app.sink._ingest_listeners
+                assert app.live.on_health in app.health._listeners
+                assert "live" in {task.get_name() for task in app.critical_tasks()}
+            finally:
+                await asyncio.wait_for(app.stop(), timeout=5)
 
 
 async def test_hyperliquid_critical_task_return_causes_nonzero_exit(engine, settings, monkeypatch, caplog):
@@ -664,7 +703,12 @@ async def test_hyperliquid_critical_task_return_causes_nonzero_exit(engine, sett
     async def return_immediately(self) -> None:
         return None
 
+    async def wait_until_stopped(self) -> None:
+        await self._stop.wait()
+
     monkeypatch.setattr(HyperliquidRuntime, "run_rest", return_immediately)
+    monkeypatch.setattr(HyperliquidRuntime, "run_trades_ws", wait_until_stopped)
+    monkeypatch.setattr(HyperliquidRuntime, "run_core_ws", wait_until_stopped)
     with caplog.at_level(logging.INFO, logger="tidewatch.app"):
         code = await asyncio.wait_for(run(settings, groups={"hyperliquid"}, dry_run=True), timeout=5)
     assert code == 1

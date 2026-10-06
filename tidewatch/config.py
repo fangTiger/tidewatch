@@ -260,6 +260,7 @@ class HyperliquidCfg(_Strict):
     aliases_url: str = "https://api.hypurrscan.io/globalAliases"
     monitor_budget_per_min: float = Field(default=600, gt=0)
     batch_budget_per_min: float = Field(default=200, gt=0)
+    discovery_query_limit_per_min: int = Field(default=3, gt=0)
     reconcile_concurrency: int = Field(default=4, gt=0)
     rest_burst_window_s: float = Field(default=10, gt=0)
     aimd_min_budget_per_min: float = Field(default=120, gt=0)

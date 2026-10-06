@@ -4,6 +4,7 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import respx
@@ -16,6 +17,7 @@ from tidewatch.hyperliquid.monitor import (
     HyperliquidMonitor,
     PriorityReconcileQueue,
     ReconcilePriority,
+    _all_dex_states,
     combined_account_value,
     select_hot_wallets,
 )
@@ -33,6 +35,7 @@ from tidewatch.store.tables import (
 
 ADDRESS = "0x1234567890abcdef1234567890abcdef12345678"
 OTHER = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+FIXTURES = Path(__file__).parent / "fixtures" / "hyperliquid"
 
 
 def _state(
@@ -66,6 +69,18 @@ def _empty_state() -> dict:
         "marginSummary": {"accountValue": "800000", "totalNtlPos": "0"},
         "assetPositions": [],
     }
+
+
+def test_real_all_dexs_ws_fixture_parses_main_and_hip3_states():
+    message = json.loads(
+        (FIXTURES / "all_dexs_clearinghouse_state_ws.json").read_text(encoding="utf-8")
+    )
+
+    states = _all_dex_states(message["data"])
+
+    assert [dex for dex, _ in states] == ["", "xyz"]
+    assert states[0][1]["assetPositions"][0]["position"]["coin"] == "BTC"
+    assert states[1][1]["assetPositions"][0]["position"]["coin"] == "xyz:GOLD"
 
 
 async def _seed_baseline(engine, clock, address: str = ADDRESS) -> None:
@@ -1058,6 +1073,40 @@ async def test_empty_account_lookup_errors_use_exception_type(
         "现货 USDC 查询失败，使用最近缓存：TimeoutError()" in record.message
         for record in caplog.records
     )
+
+
+async def test_spot_lookup_timeout_uses_rest_compatible_timeout_and_wallet_warning_limit(
+    engine, settings, clock, caplog
+):
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            if request_type == "userAbstraction":
+                return True, "unifiedAccount"
+            if request_type == "spotClearinghouseState":
+                raise asyncio.TimeoutError()
+            raise AssertionError(request_type)
+
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=None,
+        clock=clock,
+    )
+    assert monitor.account_lookup_timeout_s >= monitor.fill_lookup_timeout_s
+    caplog.set_level("DEBUG", logger="tidewatch.hyperliquid.monitor")
+
+    await asyncio.wait_for(monitor._core_account_value(ADDRESS, _empty_state()), timeout=1)
+    await asyncio.wait_for(monitor._core_account_value(ADDRESS, _empty_state()), timeout=1)
+    clock.advance(seconds=settings.hyperliquid.frequencies.fill_timeout_warning_interval_s)
+    await asyncio.wait_for(monitor._core_account_value(ADDRESS, _empty_state()), timeout=1)
+
+    records = [
+        record
+        for record in caplog.records
+        if "现货 USDC 查询失败，使用最近缓存" in record.message
+    ]
+    assert [record.levelname for record in records] == ["WARNING", "DEBUG", "WARNING"]
 
 
 async def test_reconcile_refreshes_known_hip3_dex_without_overwriting_main_dex(
