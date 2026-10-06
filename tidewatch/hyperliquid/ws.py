@@ -67,10 +67,6 @@ class HyperliquidWsManager:
         self._active: dict[str, Any] = {}
         self._closed = asyncio.Event()
         self._running = False
-        logger.info(
-            "Hyperliquid WS 使用 %s 模式；切换代理节点会改变限流出口 IP",
-            proxy_mode,
-        )
 
     @property
     def subscription_count(self) -> int:
@@ -153,6 +149,9 @@ class HyperliquidWsManager:
                 ) as websocket:
                     connected_at = self._monotonic()
                     self._active[name] = websocket
+                    if self._closed.is_set():
+                        await websocket.close()
+                        return
                     for subscription in connection.subscriptions.values():
                         await websocket.send(self._subscribe_message(subscription))
                     heartbeat = asyncio.create_task(self._heartbeat(websocket), name=f"hl-ws-{name}-heartbeat")

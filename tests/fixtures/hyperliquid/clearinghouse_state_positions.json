@@ -1,0 +1,70 @@
+{
+  "marginSummary": {
+    "accountValue": "1986285.558062",
+    "totalNtlPos": "603834.37261",
+    "totalRawUsd": "2423246.2385519999",
+    "totalMarginUsed": "72765.924602"
+  },
+  "assetPositions": [
+    {
+      "type": "oneWay",
+      "position": {
+        "coin": "BTC",
+        "szi": "-0.60139",
+        "leverage": {"type": "cross", "value": 20},
+        "entryPx": "85875.6",
+        "positionValue": "51572.19945",
+        "unrealizedPnl": "72.551119",
+        "liquidationPx": "3321428.8901477014"
+      }
+    },
+    {
+      "type": "oneWay",
+      "position": {
+        "coin": "ETH",
+        "szi": "5.8676",
+        "leverage": {"type": "cross", "value": 20},
+        "entryPx": "2720.43",
+        "positionValue": "15908.82388",
+        "unrealizedPnl": "-53.610058",
+        "liquidationPx": null
+      }
+    },
+    {
+      "type": "oneWay",
+      "position": {
+        "coin": "SOL",
+        "szi": "-3327.63",
+        "leverage": {"type": "cross", "value": 10},
+        "entryPx": "120.9483",
+        "positionValue": "401478.5595",
+        "unrealizedPnl": "992.793091",
+        "liquidationPx": "698.289764507"
+      }
+    },
+    {
+      "type": "oneWay",
+      "position": {
+        "coin": "XRP",
+        "szi": "-44716.0",
+        "leverage": {"type": "cross", "value": 10},
+        "entryPx": "1.501181",
+        "positionValue": "67346.7676",
+        "unrealizedPnl": "-219.93123",
+        "liquidationPx": "44.4923109662"
+      }
+    },
+    {
+      "type": "oneWay",
+      "position": {
+        "coin": "HYPE",
+        "szi": "716.35",
+        "leverage": {"type": "cross", "value": 3},
+        "entryPx": "94.586",
+        "positionValue": "67528.02218",
+        "unrealizedPnl": "-228.705213",
+        "liquidationPx": null
+      }
+    }
+  ]
+}

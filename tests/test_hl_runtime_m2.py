@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,6 +30,33 @@ def test_daily_recompute_targets_0800_asia_shanghai():
     exact = datetime(2026, 10, 7, 0, 0, tzinfo=timezone.utc)  # 上海 08:00
     assert seconds_until_shanghai_8(before) == 90 * 60
     assert seconds_until_shanghai_8(exact) == 0
+
+
+@async_timeout()
+async def test_runtime_logs_proxy_ip_notice_once_on_start(engine, settings, clock, caplog):
+    with caplog.at_level(logging.INFO):
+        runtime = HyperliquidRuntime(settings.hyperliquid, _Health(), engine=engine, clock=clock)
+
+        async def idle():
+            await runtime._stop.wait()
+
+        runtime.run_rest = idle
+        runtime.run_trades_ws = idle
+        runtime.run_core_ws = idle
+        runtime.run_leaderboard = idle
+        runtime.run_tier_recompute = idle
+        runtime.run_profile = idle
+        runtime.run_market_data = idle
+        await asyncio.wait_for(runtime.start(), timeout=1)
+        await asyncio.wait_for(runtime.stop(), timeout=1)
+
+    notices = [
+        record
+        for record in caplog.records
+        if "切换代理节点会改变限流出口 IP" in record.getMessage()
+    ]
+    assert len(notices) == 1
+    assert notices[0].name == "tidewatch.hyperliquid.runtime"
 
 
 @async_timeout()

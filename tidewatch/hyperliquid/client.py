@@ -60,10 +60,6 @@ class HyperliquidRestClient:
         self._sleep = sleep
         self._monotonic = monotonic
         self._client = client or make_client(proxy_mode, proxy_url)
-        logger.info(
-            "Hyperliquid REST 使用 %s 模式；切换代理节点会改变限流出口 IP",
-            proxy_mode,
-        )
 
     async def info(self, request_type: str, *, budget: Budget = "monitor", **params: Any) -> Any:
         """发送一条 info 请求；JSON 中的数字字符串保持上游原样。"""

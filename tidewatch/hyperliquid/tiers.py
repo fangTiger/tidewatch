@@ -13,6 +13,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
+from tidewatch.hyperliquid.positions import upsert_position_snapshot
 from tidewatch.hyperliquid.registry import REGISTRY_LOCK_KEY
 from tidewatch.store.tables import hl_positions, hl_state, hl_wallets
 
@@ -84,7 +85,16 @@ class TierRecalculator:
                 budget="batch",
                 user=address,
             )
-            notionals[address] = self._total_notional(response)
+            notional = self._total_notional(response)
+            async with self.engine.begin() as conn:
+                await upsert_position_snapshot(
+                    conn,
+                    address=address,
+                    dex="",
+                    response=response,
+                    updated_at=self.clock(),
+                )
+            notionals[address] = notional
             await self._write_query_cursor(candidates, index + 1, notionals)
 
         return await self._apply(notionals, queried=len(candidates))

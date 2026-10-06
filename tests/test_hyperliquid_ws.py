@@ -47,7 +47,7 @@ def test_ws_user_subscription_limit_keeps_existing_subscriptions():
 
 async def test_ws_sends_protocol_ping_and_reports_valid_pong():
     received: list[dict] = []
-    pong_sent = asyncio.Event()
+    pong_processed = asyncio.Event()
     sleep_started = asyncio.Event()
     release_ping = asyncio.Event()
     sleep_calls: list[float] = []
@@ -64,8 +64,11 @@ async def test_ws_sends_protocol_ping_and_reports_valid_pong():
         message = json.loads(await asyncio.wait_for(websocket.recv(), timeout=5))
         received.append(message)
         await asyncio.wait_for(websocket.send(json.dumps({"channel": "pong"})), timeout=5)
-        pong_sent.set()
         await asyncio.wait_for(websocket.wait_closed(), timeout=5)
+
+    async def handle_message(message: dict) -> None:
+        if message.get("channel") == "pong":
+            pong_processed.set()
 
     async with serve(handler, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
@@ -76,12 +79,12 @@ async def test_ws_sends_protocol_ping_and_reports_valid_pong():
             health=health,
             sleep=controlled_sleep,
         )
-        manager.add_connection("core")
+        manager.add_connection("core", handler=handle_message)
         task = asyncio.create_task(manager.run())
         try:
             await asyncio.wait_for(sleep_started.wait(), timeout=5)
             release_ping.set()
-            await asyncio.wait_for(pong_sent.wait(), timeout=5)
+            await asyncio.wait_for(pong_processed.wait(), timeout=5)
         finally:
             await _stop(manager, task)
 
@@ -225,10 +228,58 @@ async def test_ws_close_interrupts_reconnect_backoff():
         await asyncio.wait_for(task, timeout=5)
 
 
+async def test_ws_close_during_connect_closes_late_socket():
+    """连接建立途中收到关闭信号时，迟到的 socket 也必须立即关闭。"""
+    entering = asyncio.Event()
+    release_connection = asyncio.Event()
+    socket_closed = asyncio.Event()
+
+    class StubSocket:
+        async def send(self, message: str) -> None:
+            return None
+
+        async def close(self) -> None:
+            socket_closed.set()
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await socket_closed.wait()
+            raise StopAsyncIteration
+
+    class StubContext:
+        async def __aenter__(self):
+            entering.set()
+            await release_connection.wait()
+            return StubSocket()
+
+        async def __aexit__(self, *args):
+            return None
+
+    def connector(*args, **kwargs):
+        return StubContext()
+
+    manager = HyperliquidWsManager(
+        proxy_mode="direct",
+        connect=connector,
+        ping_interval_s=3600,
+    )
+    manager.add_connection("core")
+    task = asyncio.create_task(manager.run())
+    await asyncio.wait_for(entering.wait(), timeout=5)
+    await asyncio.wait_for(manager.aclose(), timeout=5)
+    release_connection.set()
+
+    await asyncio.wait_for(task, timeout=5)
+    assert socket_closed.is_set()
+
+
 async def test_ws_short_lived_messages_do_not_reset_reconnect_backoff():
     """订阅确认后立即断线仍须按 1、2、4 秒递增，而不是永久 1 秒。"""
     connections = 0
-    third_connected = asyncio.Event()
+    processed_messages = 0
+    third_message_processed = asyncio.Event()
     sleeps: list[float] = []
 
     async def handler(websocket) -> None:
@@ -238,8 +289,13 @@ async def test_ws_short_lived_messages_do_not_reset_reconnect_backoff():
         if connections < 3:
             await websocket.close()
         else:
-            third_connected.set()
             await websocket.wait_closed()
+
+    async def handle_message(message: dict) -> None:
+        nonlocal processed_messages
+        processed_messages += 1
+        if processed_messages == 3:
+            third_message_processed.set()
 
     async def fake_sleep(seconds: float) -> None:
         sleeps.append(seconds)
@@ -250,10 +306,10 @@ async def test_ws_short_lived_messages_do_not_reset_reconnect_backoff():
         manager = HyperliquidWsManager(
             url=f"ws://127.0.0.1:{port}", proxy_mode="direct", sleep=fake_sleep, ping_interval_s=3600
         )
-        manager.add_connection("core")
+        manager.add_connection("core", handler=handle_message)
         task = asyncio.create_task(manager.run())
         try:
-            await asyncio.wait_for(third_connected.wait(), timeout=5)
+            await asyncio.wait_for(third_message_processed.wait(), timeout=5)
         finally:
             await _stop(manager, task)
 

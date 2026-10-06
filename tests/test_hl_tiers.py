@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,12 +14,32 @@ from sqlalchemy import insert, select
 from fakes import async_timeout
 from tidewatch.collectors.base import TokenBucket
 from tidewatch.hyperliquid.client import REST_URL, HyperliquidRestClient
+from tidewatch.hyperliquid.registry import WalletRegistry
 from tidewatch.hyperliquid.tiers import TierRecalculator
 from tidewatch.store.tables import hl_positions, hl_state, hl_wallets
 
 
+FIXTURE_DIR = Path(__file__).parent / "fixtures" / "hyperliquid"
+
+
 def _address(number: int) -> str:
     return f"0x{number:040x}"
+
+
+def _clearinghouse_state(notional: str) -> dict:
+    return {
+        "marginSummary": {"totalNtlPos": notional},
+        "assetPositions": [
+            {
+                "type": "oneWay",
+                "position": {
+                    "coin": "BTC",
+                    "szi": "1",
+                    "positionValue": notional,
+                },
+            }
+        ],
+    }
 
 
 async def _insert_wallets(engine, rows):
@@ -176,7 +198,7 @@ async def test_recompute_reloads_wallet_state_after_network_queries(engine, cloc
                     .where(hl_wallets.c.address == address)
                     .values(tier=None, excluded=True)
                 )
-            return {"marginSummary": {"totalNtlPos": "2000000"}}
+            return _clearinghouse_state("2000000")
 
     result = await TierRecalculator(engine, ExcludingRest(), clock=clock).recompute()
     async with engine.connect() as conn:
@@ -208,7 +230,7 @@ async def test_recompute_progress_cursor_resumes_after_failure(engine, clock):
             self.calls.append(kwargs["user"])
             if len(self.calls) == 2:
                 raise RuntimeError("中断")
-            return {"marginSummary": {"totalNtlPos": "1500000"}}
+            return _clearinghouse_state("1500000")
 
     interrupted = InterruptingRest()
     calculator = TierRecalculator(engine, interrupted, clock=clock)
@@ -225,7 +247,7 @@ async def test_recompute_progress_cursor_resumes_after_failure(engine, clock):
 
         async def info(self, request_type: str, **kwargs):
             self.calls.append(kwargs["user"])
-            return {"marginSummary": {"totalNtlPos": "2000000"}}
+            return _clearinghouse_state("2000000")
 
     resumed = ResumedRest()
     result = await TierRecalculator(engine, resumed, clock=clock).recompute()
@@ -234,3 +256,104 @@ async def test_recompute_progress_cursor_resumes_after_failure(engine, clock):
     async with engine.connect() as conn:
         state = (await conn.execute(select(hl_state).where(hl_state.c.name == "tier_recompute"))).one()
     assert state.cursor["phase"] == "complete" and state.cursor["processed"] == 2
+
+
+@async_timeout()
+async def test_recompute_persists_real_clearinghouse_position_snapshots(engine, clock):
+    positioned, emptied = _address(40), _address(41)
+    previous_position_at = clock.now - timedelta(days=1)
+    await _insert_wallets(
+        engine,
+        [
+            {
+                "address": positioned,
+                "tier": "candidate",
+                "source": "leaderboard",
+                "last_position_at": None,
+            },
+            {
+                "address": emptied,
+                "tier": "candidate",
+                "source": "leaderboard",
+                "last_position_at": previous_position_at,
+            },
+        ],
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_positions),
+            [
+                {
+                    "address": positioned,
+                    "dex": "",
+                    "coin": "OLD",
+                    "szi": Decimal("1"),
+                    "notional_usd": Decimal("10"),
+                    "updated_at": previous_position_at,
+                },
+                {
+                    "address": positioned,
+                    "dex": "hip3",
+                    "coin": "KEEP",
+                    "szi": Decimal("2"),
+                    "notional_usd": Decimal("99"),
+                    "updated_at": previous_position_at,
+                },
+                {
+                    "address": emptied,
+                    "dex": "",
+                    "coin": "OLD",
+                    "szi": Decimal("3"),
+                    "notional_usd": Decimal("30"),
+                    "updated_at": previous_position_at,
+                },
+            ],
+        )
+
+    responses = {
+        positioned: json.loads((FIXTURE_DIR / "clearinghouse_state_positions.json").read_text()),
+        emptied: json.loads((FIXTURE_DIR / "clearinghouse_state_empty.json").read_text()),
+    }
+
+    class FixtureRest:
+        async def info(self, request_type: str, **kwargs):
+            return responses[kwargs["user"]]
+
+    await TierRecalculator(engine, FixtureRest(), clock=clock).recompute()
+
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                select(hl_positions).where(hl_positions.c.address.in_((positioned, emptied)))
+            )
+        ).mappings().all()
+        wallet_rows = (
+            await conn.execute(
+                select(hl_wallets.c.address, hl_wallets.c.last_position_at).where(
+                    hl_wallets.c.address.in_((positioned, emptied))
+                )
+            )
+        ).all()
+
+    by_key = {(row["address"], row["dex"], row["coin"]): row for row in rows}
+    assert set(by_key) == {
+        (positioned, "", "BTC"),
+        (positioned, "", "ETH"),
+        (positioned, "", "SOL"),
+        (positioned, "", "XRP"),
+        (positioned, "", "HYPE"),
+        (positioned, "hip3", "KEEP"),
+    }
+    btc = by_key[(positioned, "", "BTC")]
+    assert btc["szi"] == Decimal("-0.60139")
+    assert btc["entry_px"] == Decimal("85875.6")
+    assert btc["liquidation_px"] == Decimal("3321428.8901477014")
+    assert btc["leverage"] == Decimal("20")
+    assert btc["notional_usd"] == Decimal("51572.19945")
+    assert btc["unrealized_pnl"] == Decimal("72.551119")
+    assert btc["updated_at"] == clock.now
+    assert dict(wallet_rows) == {positioned: clock.now, emptied: previous_position_at}
+
+    views = {view.address: view for view in await WalletRegistry(engine).list_wallets()}
+    assert views[positioned].total_notional == Decimal("603933.37261")
+    assert views[emptied].total_notional == Decimal("0")
