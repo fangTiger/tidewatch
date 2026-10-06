@@ -16,6 +16,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import Mapping
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -26,9 +27,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
 from tidewatch.config import DispatchCfg
-from tidewatch.notify.base import EventCard, Notifier, SendResult
+from tidewatch.notify.base import EventCard, Notifier, SendResult, WhaleDetails
 from tidewatch.pipeline.sink import OPEN_STATUSES, EventSink, IngestOutcome
-from tidewatch.store.tables import event_clusters, events, push_log
+from tidewatch.store.tables import event_clusters, events, hl_wallets, push_log
 
 logger = logging.getLogger(__name__)
 
@@ -483,6 +484,9 @@ class Dispatcher:
                 events.c.occurred_at,
                 events.c.url,
                 events.c.assets,
+                events.c.category,
+                events.c.amount_usd,
+                events.c.raw,
                 event_clusters.c.source_count,
             )
             .select_from(
@@ -494,6 +498,19 @@ class Dispatcher:
         )
         async with self._engine.connect() as conn:
             row = (await conn.execute(stmt)).one_or_none()
+            wallet = None
+            if row is not None and row.category == "hyperliquid" and isinstance(row.raw, Mapping):
+                address = row.raw.get("address")
+                if isinstance(address, str):
+                    wallet = (
+                        await conn.execute(
+                            select(
+                                hl_wallets.c.note,
+                                hl_wallets.c.tier,
+                                hl_wallets.c.profile,
+                            ).where(hl_wallets.c.address == address)
+                        )
+                    ).mappings().one_or_none()
         if row is None:
             return None
         card = EventCard(
@@ -508,5 +525,57 @@ class Dispatcher:
             body=row.body,
             source_count=row.source_count,
             upgraded=row.kind == "upgrade",
+            whale=self._whale_details(row, wallet),
         )
         return _Pending(row.id, row.status, row.level, row.retry_until, card)
+
+    @staticmethod
+    def _whale_details(row, wallet: Mapping[str, object] | None) -> WhaleDetails | None:
+        """把巨鲸事件 raw 与钱包名单元数据合并为向后兼容的卡片详情。"""
+        if row.category != "hyperliquid" or not isinstance(row.raw, Mapping):
+            return None
+        raw = row.raw
+        address = raw.get("address")
+        if not isinstance(address, str) or not address:
+            return None
+        profile = wallet.get("profile") if wallet is not None else None
+        profile = profile if isinstance(profile, Mapping) else {}
+        note = wallet.get("note") if wallet is not None else None
+        label = note if isinstance(note, str) and note else raw.get("note")
+        label = label if isinstance(label, str) and label else None
+        tags: list[str] = []
+        raw_tags = raw.get("tags")
+        if isinstance(raw_tags, list):
+            tags.extend(str(tag) for tag in raw_tags if str(tag))
+        for key in ("leaderboard_display_name", "hypurrscan_alias"):
+            value = profile.get(key)
+            if isinstance(value, str) and value and value != label and value not in tags:
+                tags.append(value)
+        tier = wallet.get("tier") if wallet is not None else None
+        if not isinstance(tier, str) or not tier:
+            tier = raw.get("tier")
+        pnl = raw.get("closed_pnl")
+        if pnl is None:
+            pnl = raw.get("unrealized_pnl")
+
+        def text_value(key: str, fallback: object = None) -> str | None:
+            value = raw.get(key, fallback)
+            return None if value is None else str(value)
+
+        return WhaleDetails(
+            address=address,
+            label=label,
+            tags=tags,
+            coin=text_value("coin", next(iter(row.assets), None)),
+            direction=text_value("direction"),
+            quantity=text_value("quantity"),
+            amount_usd=text_value("notional_usd", row.amount_usd),
+            entry_px=text_value("entry_px"),
+            liquidation_px=text_value("liquidation_px"),
+            liquidation_distance=text_value("liquidation_distance"),
+            configured_leverage=text_value("configured_leverage"),
+            actual_leverage=text_value("actual_leverage"),
+            high_leverage=bool(raw.get("high_leverage")),
+            pnl=None if pnl is None else str(pnl),
+            tier=tier if isinstance(tier, str) else None,
+        )

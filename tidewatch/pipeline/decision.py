@@ -23,6 +23,8 @@ def freshness_from_settings(settings) -> FreshnessLookup:
     """从采集器配置生成新鲜度查询；未配置的来源默认 30 分钟"""
 
     def lookup(source: str) -> timedelta | None:
+        if source in {"hl_monitor", "hl_discovery"}:
+            return timedelta(seconds=settings.hyperliquid.events.max_push_age_s)
         cfg = settings.collectors.get(source)
         if cfg is None:
             return _DEFAULT_MAX_AGE

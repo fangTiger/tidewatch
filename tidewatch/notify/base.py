@@ -3,15 +3,42 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
-SOURCE_NAMES = {"jin10": "金十快讯", "binance_ann": "币安公告", "okx_ann": "OKX 公告"}
+SOURCE_NAMES = {
+    "jin10": "金十快讯",
+    "binance_ann": "币安公告",
+    "okx_ann": "OKX 公告",
+    "hl_monitor": "Hyperliquid 巨鲸监控",
+    "hl_discovery": "Hyperliquid 巨鲸发现",
+}
 
 
 def source_name(source: str) -> str:
     """采集器名 → 中文显示名"""
     return SOURCE_NAMES.get(source, source)
+
+
+@dataclass
+class WhaleDetails:
+    """巨鲸事件卡片的可选详情；所有文本均按不可信外部内容处理。"""
+
+    address: str
+    label: str | None = None
+    tags: list[str] = field(default_factory=list)
+    coin: str | None = None
+    direction: str | None = None
+    quantity: str | None = None
+    amount_usd: str | None = None
+    entry_px: str | None = None
+    liquidation_px: str | None = None
+    liquidation_distance: str | None = None
+    configured_leverage: str | None = None
+    actual_leverage: str | None = None
+    high_leverage: bool = False
+    pnl: str | None = None
+    tier: str | None = None
 
 
 @dataclass
@@ -29,6 +56,7 @@ class EventCard:
     body: str
     source_count: int
     upgraded: bool
+    whale: WhaleDetails | None = None
 
 
 @dataclass

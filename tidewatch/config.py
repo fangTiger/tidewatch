@@ -203,6 +203,8 @@ class HyperliquidTiersCfg(_Strict):
 class HyperliquidEventsCfg(_Strict):
     """巨鲸发现、仓位事件与风险分级门槛"""
 
+    cluster_window_s: float = Field(default=1800, gt=0)
+    max_push_age_s: float = Field(default=600, gt=0)
     s_level_notional_usd: float = Field(default=50_000_000, gt=0)
     a_level_notional_usd: float = Field(default=5_000_000, gt=0)
     btc_eth_min_notional_usd: float = Field(default=1_000_000, gt=0)

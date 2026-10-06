@@ -31,7 +31,38 @@ async def _add(conn, clusterer, title, *, now=NOW, category="news", source="jin1
 
 
 def _clusterer(settings) -> Clusterer:
-    return Clusterer(settings.pipeline, settings.rules.exchange)
+    return Clusterer(
+        settings.pipeline,
+        settings.rules.exchange,
+        hyperliquid_window_s=settings.hyperliquid.events.cluster_window_s,
+    )
+
+
+async def _add_hl(
+    conn,
+    clusterer,
+    event_type,
+    *,
+    address="0x1234567890abcdef1234567890abcdef12345678",
+    coin="BTC",
+    now=NOW,
+    level="A",
+):
+    event = Event(
+        source="hl_monitor",
+        category="hyperliquid",
+        event_type=event_type,
+        occurred_at=now,
+        title=event_type,
+        dedupe_key=f"hl:{address}:{coin}:{event_type}:{now.timestamp()}",
+        assets=[coin],
+        raw={"address": address, "coin": coin},
+    )
+    await insert_event(conn, event, now)
+    event.rule_level = event.final_level = level
+    event.ai_status = "skipped"
+    await save_grading(conn, event)
+    return await clusterer.assign(conn, event, now)
 
 
 async def test_similar_news_join_same_cluster(engine, settings):
@@ -166,3 +197,32 @@ async def test_unsaved_event_rejected(engine, settings):
         await _add(conn, clusterer, NFP)
         with pytest.raises(ValueError, match="事件尚未入库"):
             await clusterer.assign(conn, unsaved(NFP), NOW)
+
+
+async def test_hyperliquid_open_and_increase_share_directional_cluster(engine, settings):
+    clusterer = _clusterer(settings)
+    async with engine.begin() as conn:
+        opened = await _add_hl(conn, clusterer, "hl_open")
+        increased = await _add_hl(conn, clusterer, "hl_increase", now=NOW + timedelta(minutes=29))
+        other_coin = await _add_hl(conn, clusterer, "hl_increase", coin="ETH", now=NOW + timedelta(minutes=2))
+    assert opened.id == increased.id
+    assert other_coin.id != opened.id
+    assert increased.member_count == 2
+
+
+async def test_hyperliquid_reverse_close_and_open_use_different_event_families(engine, settings):
+    clusterer = _clusterer(settings)
+    async with engine.begin() as conn:
+        closed = await _add_hl(conn, clusterer, "hl_close")
+        opened = await _add_hl(conn, clusterer, "hl_open")
+    assert closed.id != opened.id
+
+
+async def test_hyperliquid_window_is_thirty_minutes_from_first_seen(engine, settings):
+    clusterer = _clusterer(settings)
+    async with engine.begin() as conn:
+        first = await _add_hl(conn, clusterer, "hl_liq_risk")
+        joined = await _add_hl(conn, clusterer, "hl_liq_risk", now=NOW + timedelta(minutes=30))
+        late = await _add_hl(conn, clusterer, "hl_liq_risk", now=NOW + timedelta(minutes=31))
+    assert first.id == joined.id
+    assert late.id != first.id

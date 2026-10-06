@@ -29,6 +29,8 @@ hyperliquid:
     candidate_limit: 1000
     hot_limit: 30
   events:
+    cluster_window_s: 1800
+    max_push_age_s: 600
     s_level_notional_usd: 50000000
     a_level_notional_usd: 5000000
     btc_eth_min_notional_usd: 1000000

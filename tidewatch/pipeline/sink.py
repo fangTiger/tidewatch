@@ -327,7 +327,11 @@ def create_event_sink(
     return EventSink(
         engine,
         rules=rules or build_rule_engine(settings),
-        clusterer=Clusterer(settings.pipeline, settings.rules.exchange),
+        clusterer=Clusterer(
+            settings.pipeline,
+            settings.rules.exchange,
+            hyperliquid_window_s=settings.hyperliquid.events.cluster_window_s,
+        ),
         decider=PushDecider(freshness_from_settings(settings), timedelta(seconds=settings.dispatch.retry_max_s)),
         matcher=AssetMatcher(settings.watchlist.assets),
         ai_enabled=settings.ai.enabled,

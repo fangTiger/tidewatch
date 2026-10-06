@@ -1,0 +1,41 @@
+[
+  {
+    "coin": "xyz:XYZ100",
+    "px": "31098.6010792943",
+    "sz": "5.0218",
+    "side": "B",
+    "time": 1791227750767,
+    "startPosition": "99.8944",
+    "dir": "Open Long",
+    "closedPnl": "0.0",
+    "hash": "0x77b8584d0ac7e13579320445ea107f0202a90032a5cb00071b81039fc9cbbb20",
+    "oid": 566114055552,
+    "crossed": true,
+    "fee": "7.308796",
+    "tid": 1110576289688107,
+    "feeToken": "USDC",
+    "twapId": null
+  },
+  {
+    "coin": "xyz:SILVER",
+    "px": "61.3447280247",
+    "sz": "5338.94",
+    "side": "B",
+    "time": 1790832411042,
+    "startPosition": "-26694.73",
+    "dir": "Close Short",
+    "closedPnl": "-5698.934178",
+    "hash": "0x9918833db785706c9a92044595ce930201f1002352888f3e3ce12e9076894a57",
+    "oid": 561989272801,
+    "crossed": true,
+    "fee": "15.327737",
+    "tid": 398851033413882,
+    "liquidation": {
+      "liquidatedUser": "0xd1581ae3dc981bfb70cceace6647a1c35df09dab",
+      "markPx": "61.34",
+      "method": "market"
+    },
+    "feeToken": "USDC",
+    "twapId": null
+  }
+]

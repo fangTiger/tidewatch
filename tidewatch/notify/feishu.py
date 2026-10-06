@@ -14,12 +14,13 @@ import hashlib
 import hmac
 import time
 import unicodedata
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 import httpx
 
 from tidewatch.clock import format_local
-from tidewatch.notify.base import EventCard, Notifier, SendResult, source_name
+from tidewatch.notify.base import EventCard, Notifier, SendResult, WhaleDetails, source_name
 from tidewatch.urls import safe_http_url
 
 # 频率限制等可重试的业务错误码
@@ -109,6 +110,69 @@ def _assets_text(assets: list[str]) -> str:
     return text
 
 
+def _short_address(address: str) -> str:
+    """把标准地址缩写为便于辨认的首尾各四位形式。"""
+    return f"{address[:6]}…{address[-4:]}" if len(address) > 12 else address
+
+
+def _number(value: str, *, decimals: int | None = None, signed: bool = False) -> str:
+    """格式化数值字符串；上游异常值原样返回，避免卡片渲染失败。"""
+    try:
+        number = Decimal(value)
+    except (InvalidOperation, ValueError):
+        return value
+    if not number.is_finite():
+        return value
+    if decimals is None:
+        rendered = f"{number:,.8f}".rstrip("0").rstrip(".")
+    else:
+        rendered = f"{number:,.{decimals}f}"
+    if signed and number > 0:
+        return "+" + rendered
+    return rendered
+
+
+def _whale_text(details: WhaleDetails) -> str:
+    """生成巨鲸详情纯文本；缺失字段直接省略。"""
+    identity = [value for value in (details.label, *details.tags, _short_address(details.address)) if value]
+    lines = ["钱包：" + "｜".join(dict.fromkeys(identity))]
+    if details.coin:
+        lines.append(f"币种：{details.coin}")
+    if details.direction:
+        lines.append(f"方向：{ {'long': '多', 'short': '空'}.get(details.direction, details.direction) }")
+    if details.quantity is not None:
+        lines.append(f"数量：{_number(details.quantity)}")
+    if details.amount_usd is not None:
+        lines.append(f"名义价值：${_number(details.amount_usd)}")
+    if details.entry_px is not None:
+        lines.append(f"开仓价：${_number(details.entry_px)}")
+    if details.liquidation_px is not None:
+        lines.append(f"强平价：${_number(details.liquidation_px)}")
+        if details.liquidation_distance is not None:
+            try:
+                percent = str(Decimal(details.liquidation_distance) * 100)
+            except (InvalidOperation, ValueError):
+                percent = details.liquidation_distance
+            lines.append(f"距强平：{_number(percent, decimals=2)}%")
+    leverages = []
+    if details.configured_leverage is not None:
+        leverages.append(f"设置 {_number(details.configured_leverage)}x")
+    if details.actual_leverage is not None:
+        leverages.append(f"实际 {_number(details.actual_leverage)}x")
+    if leverages:
+        marker = " ⚠ 高杠杆" if details.high_leverage else ""
+        lines.append("杠杆：" + " / ".join(leverages) + marker)
+    elif details.high_leverage:
+        lines.append("杠杆：⚠ 高杠杆")
+    if details.pnl is not None:
+        pnl = _number(details.pnl, signed=True)
+        prefix = "+$" if pnl.startswith("+") else "$"
+        lines.append(f"盈亏：{prefix}{pnl.removeprefix('+')}")
+    if details.tier:
+        lines.append(f"层级：{ {'core': '核心', 'focus': '重点', 'candidate': '候选'}.get(details.tier, details.tier) }")
+    return "\n".join(lines)
+
+
 class FeishuNotifier(Notifier):
     """飞书群自定义机器人通知器：把事件、汇总、健康告警渲染为交互卡片并 POST 到 webhook
 
@@ -172,9 +236,12 @@ class FeishuNotifier(Notifier):
         extra = f"（另有 {card.source_count - 1} 个来源）" if card.source_count > 1 else ""
         lines.append(f"**来源**：{_md_safe(source_name(card.source))}{extra}")
         elements: list[dict[str, Any]] = [{"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}}]
-        assets = _assets_text(card.assets)
-        if assets:
-            elements.append(_plain_div(assets))  # 资产代码可能来自公告标题提取，不放进 lark_md
+        if card.whale is not None:
+            elements.append(_plain_div(_whale_text(card.whale)))
+        else:
+            assets = _assets_text(card.assets)
+            if assets:
+                elements.append(_plain_div(assets))  # 资产代码可能来自公告标题提取，不放进 lark_md
         body = _body_text(card.title, card.body)
         if body:
             elements.append(_plain_div(body))

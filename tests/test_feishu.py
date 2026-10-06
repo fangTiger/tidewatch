@@ -7,7 +7,7 @@ import pytest
 import respx
 
 from tidewatch.notify import feishu
-from tidewatch.notify.base import EventCard
+from tidewatch.notify.base import EventCard, WhaleDetails
 from tidewatch.notify.feishu import FeishuNotifier, sign
 
 HOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/test"
@@ -81,6 +81,69 @@ def _has_button(payload: dict[str, Any]) -> bool:
 
 def test_sign_known_vector():
     assert sign("1790700000", "test-secret") == "CX4RIQmjYTknzzq/eNcdTHe+fEBC6qxm8tpM81NnOLM="
+
+
+@respx.mock
+async def test_complete_whale_card_uses_plain_text_and_short_address(make_notifier):
+    route = _ok_route()
+    whale = WhaleDetails(
+        address="0x1234567890abcdef1234567890abcdef12345678",
+        label="我的巨鲸<at id=all></at>",
+        tags=["排行榜标签", "[钓鱼](https://evil.example)"],
+        coin="BTC",
+        direction="long",
+        quantity="12.5",
+        amount_usd="12500000",
+        entry_px="100000",
+        liquidation_px="95000",
+        liquidation_distance="0.05",
+        configured_leverage="20",
+        actual_leverage="12.5",
+        high_leverage=True,
+        pnl="123456.78",
+        tier="core",
+    )
+    card = EventCard(
+        push_id=1,
+        cluster_id=1,
+        level="A",
+        title="BTC 巨鲸减仓",
+        source="hl_monitor",
+        occurred_at=WHEN,
+        url=None,
+        assets=["BTC"],
+        body="",
+        source_count=1,
+        upgraded=True,
+        whale=whale,
+    )
+    await make_notifier().send_event(card, mention_all=False)
+    payload = json.loads(route.calls.last.request.content)
+    plain = "\n".join(_plain_text(payload))
+    assert "【升级】【A】BTC 巨鲸减仓" in plain
+    assert "钱包：我的巨鲸<at id=all></at>｜排行榜标签｜[钓鱼](https://evil.example)｜0x1234…5678" in plain
+    assert "币种：BTC" in plain and "方向：多" in plain and "数量：12.5" in plain
+    assert "名义价值：$12,500,000" in plain and "开仓价：$100,000" in plain
+    assert "强平价：$95,000" in plain and "距强平：5.00%" in plain
+    assert "杠杆：设置 20x / 实际 12.5x ⚠ 高杠杆" in plain
+    assert "盈亏：+$123,456.78" in plain and "层级：核心" in plain
+    assert all("我的巨鲸" not in content and "钓鱼" not in content for content in _lark_md(payload))
+
+
+@respx.mock
+async def test_whale_card_omits_liquidation_fields_when_price_is_missing(make_notifier):
+    route = _ok_route()
+    card = _card(body="", assets=["ETH"])
+    card.source = "hl_monitor"
+    card.whale = WhaleDetails(
+        address="0x1234567890abcdef1234567890abcdef12345678",
+        coin="ETH",
+        liquidation_px=None,
+        liquidation_distance="0.01",
+    )
+    await make_notifier().send_event(card, mention_all=False)
+    plain = "\n".join(_plain_text(json.loads(route.calls.last.request.content)))
+    assert "强平价" not in plain and "距强平" not in plain
 
 
 # ---------- 基本发送与签名 ----------

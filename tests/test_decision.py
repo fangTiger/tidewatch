@@ -168,6 +168,10 @@ async def test_freshness_boundary_is_inclusive(engine):
 def test_freshness_from_settings(settings):
     lookup = freshness_from_settings(settings)
     assert lookup("jin10") == timedelta(seconds=settings.collectors["jin10"].max_push_age_s)
+    assert lookup("hl_monitor") == timedelta(minutes=10)
+    assert lookup("hl_discovery") == timedelta(minutes=10)
+    settings.hyperliquid.events.max_push_age_s = 321
+    assert lookup("hl_monitor") == timedelta(seconds=321)
     assert lookup("unknown_source") == timedelta(minutes=30)  # 未配置的来源默认 30 分钟
     settings.collectors["jin10"].max_push_age_s = None
     assert lookup("jin10") is None  # 显式配置为 None 表示不限

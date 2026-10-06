@@ -45,14 +45,16 @@ class RuleEngine:
 
 
 def build_rule_engine(settings: "Settings") -> RuleEngine:
-    """按配置装配一期规则集（news、exchange）"""
-    # 函数内导入是为了避免 engine.py 与 news.py、exchange.py 之间的循环导入
+    """按配置装配各事件类别的规则集。"""
+    # 函数内导入是为了避免 engine.py 与各规则模块之间的循环导入
     from tidewatch.pipeline.rules.exchange import ExchangeRules
+    from tidewatch.pipeline.rules.hyperliquid import HyperliquidRules
     from tidewatch.pipeline.rules.news import NewsRules
 
     return RuleEngine(
         {
             "news": NewsRules(settings.rules.news),
             "exchange": ExchangeRules(settings.watch_symbols),
+            "hyperliquid": HyperliquidRules(settings.hyperliquid.events),
         }
     )

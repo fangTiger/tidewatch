@@ -1,0 +1,38 @@
+[
+  {
+    "coin": "ETH",
+    "px": "2317.0",
+    "sz": "18.1047",
+    "side": "B",
+    "time": 1776789755536,
+    "startPosition": "347.4015",
+    "dir": "Open Long",
+    "closedPnl": "0.0",
+    "hash": "0x4738a81d0a1612db48b20439aa01c701fe00c002a51931adeb01536fc919ecc5",
+    "oid": 391135976805,
+    "crossed": false,
+    "fee": "-1.258457",
+    "tid": 233075021905372,
+    "cloid": "0x0000000000000000587e8d3e95f811bc",
+    "feeToken": "USDC",
+    "twapId": null
+  },
+  {
+    "coin": "ETH",
+    "px": "2316.8",
+    "sz": "18.1047",
+    "side": "B",
+    "time": 1776789755536,
+    "startPosition": "365.5062",
+    "dir": "Open Long",
+    "closedPnl": "0.0",
+    "hash": "0x4738a81d0a1612db48b20439aa01c701fe00c002a51931adeb01536fc919ecc5",
+    "oid": 391135977940,
+    "crossed": false,
+    "fee": "-1.258349",
+    "tid": 838979171715709,
+    "cloid": "0x0000000000000000587e8d3e95f811ed",
+    "feeToken": "USDC",
+    "twapId": null
+  }
+]

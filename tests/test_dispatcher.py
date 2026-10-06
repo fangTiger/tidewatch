@@ -12,7 +12,7 @@ from tidewatch.notify.dispatcher import Dispatcher
 from tidewatch.notify.dryrun import DryRunNotifier
 from tidewatch.pipeline.decision import PushPlan
 from tidewatch.pipeline.sink import IngestOutcome, create_event_sink
-from tidewatch.store.tables import event_clusters, events, push_log
+from tidewatch.store.tables import event_clusters, events, hl_wallets, push_log
 
 
 class FakeMonotonic:
@@ -554,6 +554,90 @@ async def test_upgrade_kind_marks_card_upgraded(engine, sink, settings, clock, k
     await dispatcher.process_pending()
     card: EventCard = notifier.events[0][0]
     assert card.upgraded is upgraded
+
+
+async def test_load_hyperliquid_card_merges_event_details_and_wallet_labels(engine, sink, settings, clock):
+    address = "0x1234567890abcdef1234567890abcdef12345678"
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=address,
+                note="我的巨鲸",
+                tier="core",
+                source="manual",
+                profile={"leaderboard_display_name": "榜单名", "hypurrscan_alias": "外部别名"},
+            )
+        )
+        cluster_id = (
+            await conn.execute(
+                insert(event_clusters)
+                .values(
+                    category="hyperliquid",
+                    first_seen_at=clock.now,
+                    last_seen_at=clock.now,
+                    max_level="A",
+                    committed_level="A",
+                )
+                .returning(event_clusters.c.id)
+            )
+        ).scalar_one()
+        event_id = (
+            await conn.execute(
+                insert(events)
+                .values(
+                    source="hl_monitor",
+                    category="hyperliquid",
+                    event_type="hl_decrease",
+                    occurred_at=clock.now,
+                    collected_at=clock.now,
+                    title="BTC 巨鲸减仓",
+                    dedupe_key="hl:card:1",
+                    assets=["BTC"],
+                    amount_usd=12_500_000,
+                    final_level="A",
+                    cluster_id=cluster_id,
+                    raw={
+                        "address": address,
+                        "coin": "BTC",
+                        "direction": "long",
+                        "quantity": "12.5",
+                        "notional_usd": "12500000",
+                        "entry_px": "100000",
+                        "liquidation_px": "95000",
+                        "liquidation_distance": "0.05",
+                        "configured_leverage": "20",
+                        "actual_leverage": "12.5",
+                        "high_leverage": True,
+                        "closed_pnl": "123456.78",
+                        "tags": ["核心观察"],
+                    },
+                )
+                .returning(events.c.id)
+            )
+        ).scalar_one()
+        push_id = (
+            await conn.execute(
+                insert(push_log)
+                .values(
+                    cluster_id=cluster_id,
+                    event_id=event_id,
+                    level="A",
+                    kind="upgrade",
+                    status="pending",
+                    retry_until=clock.now + timedelta(minutes=10),
+                    created_at=clock.now,
+                )
+                .returning(push_log.c.id)
+            )
+        ).scalar_one()
+
+    pending = await _dispatcher(engine, sink, settings, clock, FakeNotifier())._load(push_id)
+    assert pending is not None and pending.card.whale is not None
+    whale = pending.card.whale
+    assert whale.label == "我的巨鲸"
+    assert whale.tags == ["核心观察", "榜单名", "外部别名"]
+    assert whale.tier == "core" and whale.pnl == "123456.78"
+    assert whale.amount_usd == "12500000" and whale.high_leverage is True
 
 
 async def test_digest_buffered_a_not_resent_by_orphan_recovery(engine, sink, settings, clock):
