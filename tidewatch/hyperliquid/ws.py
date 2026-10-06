@@ -227,7 +227,14 @@ class HyperliquidWsManager:
             logger.exception("子源 %s 健康失败状态上报失败", source)
 
     async def aclose(self) -> None:
+        """唤醒等待并主动关闭在途连接，使接收循环及时退出。"""
         self._closed.set()
+        active = list(self._active.values())
+        if active:
+            await asyncio.gather(
+                *(websocket.close() for websocket in active),
+                return_exceptions=True,
+            )
         sockets = list(self._active.values())
         if sockets:
             await asyncio.gather(*(socket.close() for socket in sockets), return_exceptions=True)

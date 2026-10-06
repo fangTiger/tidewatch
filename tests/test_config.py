@@ -332,6 +332,8 @@ def test_secrets_key_in_config_file_rejected(tmp_path, filename):
 
 
 def test_hyperliquid_default_config_is_valid_and_complete(tmp_path):
+    from tidewatch.hyperliquid.leaderboard import HLP_ADDRESSES
+
     settings = load_settings(_copy_default(tmp_path), environ=ENV)
     cfg = settings.hyperliquid
 
@@ -355,6 +357,7 @@ def test_hyperliquid_default_config_is_valid_and_complete(tmp_path):
     assert cfg.top_altcoins
     assert cfg.ticker_symbols
     assert cfg.core_wallets == []
+    assert set(cfg.protocol_excluded_addresses) == HLP_ADDRESSES
     assert cfg.health.hl_rest.stale_after_s > 0
     assert cfg.health.hl_trades_ws.stale_after_s > 0
     assert cfg.health.hl_core_ws.stale_after_s > 0

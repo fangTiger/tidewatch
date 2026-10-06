@@ -61,7 +61,13 @@ class Application:
         )
         self.collectors: list[Collector] = self._make_collectors() if "news" in self.groups else []
         self.hyperliquid = (
-            HyperliquidRuntime(settings.hyperliquid, self.health, proxy_url=settings.proxy_url)
+            HyperliquidRuntime(
+                settings.hyperliquid,
+                self.health,
+                engine=self.engine,
+                proxy_url=settings.proxy_url,
+                clock=clock,
+            )
             if "hyperliquid" in self.groups and settings.hyperliquid.enabled
             else None
         )

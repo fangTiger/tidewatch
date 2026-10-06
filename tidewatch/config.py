@@ -252,6 +252,8 @@ class HyperliquidCfg(_Strict):
     proxy: Literal["global", "direct"] = "global"
     rest_url: str = "https://api.hyperliquid.xyz/info"
     ws_url: str = "wss://api.hyperliquid.xyz/ws"
+    leaderboard_url: str = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
+    aliases_url: str = "https://api.hypurrscan.io/globalAliases"
     monitor_budget_per_min: float = Field(default=900, gt=0)
     batch_budget_per_min: float = Field(default=300, gt=0)
     frequencies: HyperliquidFrequenciesCfg = HyperliquidFrequenciesCfg()
@@ -260,9 +262,10 @@ class HyperliquidCfg(_Strict):
     top_altcoins: list[str] = []
     ticker_symbols: list[str] = []
     core_wallets: list[str] = []
+    protocol_excluded_addresses: list[str] = []
     health: HyperliquidHealthCfg
 
-    @field_validator("rest_url")
+    @field_validator("rest_url", "leaderboard_url", "aliases_url")
     @classmethod
     def _rest_url_scheme(cls, value: str) -> str:
         if value != value.strip() or not value.startswith(("http://", "https://")):
@@ -287,12 +290,13 @@ class HyperliquidCfg(_Strict):
             raise ValueError(f"{label}不能重复")
         return normalized
 
-    @field_validator("core_wallets", mode="before")
+    @field_validator("core_wallets", "protocol_excluded_addresses", mode="before")
     @classmethod
-    def _core_wallets_valid(cls, value: Any) -> list[str]:
+    def _wallet_addresses_valid(cls, value: Any, info) -> list[str]:
         if not isinstance(value, list):
             return value
-        if len(value) > 10:
+        label = "核心钱包地址" if info.field_name == "core_wallets" else "协议排除地址"
+        if info.field_name == "core_wallets" and len(value) > 10:
             raise ValueError("核心钱包最多配置 10 个")
         normalized: list[str] = []
         for address in value:
@@ -301,10 +305,10 @@ class HyperliquidCfg(_Strict):
                 normalized.append(f"0x{address:040x}")
                 continue
             if not isinstance(address, str) or not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
-                raise ValueError("核心钱包地址必须是 0x 开头的 40 位十六进制地址")
+                raise ValueError(f"{label}必须是 0x 开头的 40 位十六进制地址")
             normalized.append(address.lower())
         if len(set(normalized)) != len(normalized):
-            raise ValueError("核心钱包地址不能重复")
+            raise ValueError(f"{label}不能重复")
         return normalized
 
     @model_validator(mode="after")

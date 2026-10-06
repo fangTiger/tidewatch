@@ -4,10 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import socket
+from functools import wraps
 from typing import Callable
 
 from tidewatch.models import FetchResult
 from tidewatch.notify.base import EventCard, Notifier, SendResult
+
+
+def async_timeout(seconds: float = 5.0):
+    """为异步测试提供统一硬超时，避免网络或后台任务挂起。"""
+
+    def decorate(function):
+        @wraps(function)
+        async def wrapped(*args, **kwargs):
+            return await asyncio.wait_for(function(*args, **kwargs), timeout=seconds)
+
+        return wrapped
+
+    return decorate
 
 
 class FakeNotifier(Notifier):

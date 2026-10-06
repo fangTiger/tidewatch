@@ -22,7 +22,7 @@ from tidewatch.notify.dryrun import DryRunNotifier
 from tidewatch.models import Event, FetchResult
 from tidewatch.pipeline.rules.engine import build_rule_engine
 from tidewatch.store.repo import load_cursor
-from tidewatch.store.tables import collector_state, event_clusters, events
+from tidewatch.store.tables import collector_state, event_clusters, events, hl_wallets
 from tidewatch.web.embedded import EmbeddedServer
 
 
@@ -598,6 +598,15 @@ async def test_news_and_web_wire_live_updates(engine, settings):
 async def test_hyperliquid_only_starts_shared_pipeline_without_news_or_web(engine, settings):
     """空核心名单也能离线启动：共用流水线、健康监控和调度器，不创建新闻采集器或网站。"""
     assert settings.hyperliquid.core_wallets == []
+    # M2 起有候选时按 12 小时周期等待；避免本测试触发“空名单立即真实导入”。
+    async with engine.begin() as conn:
+        await conn.execute(
+            hl_wallets.insert().values(
+                address="0x0000000000000000000000000000000000000001",
+                tier="candidate",
+                source="leaderboard",
+            )
+        )
     app = Application(settings, groups={"hyperliquid"}, dry_run=True)
     assert app.collectors == []
     assert app.live is None
@@ -622,9 +631,10 @@ async def test_hyperliquid_only_starts_shared_pipeline_without_news_or_web(engin
         await wait_until(
             lambda: all(
                 app.health.status(name) == "normal"
-                for name in ("hl_rest", "hl_trades_ws", "hl_core_ws", "hl_leaderboard", "hl_profile")
+                for name in ("hl_rest", "hl_trades_ws", "hl_core_ws", "hl_profile")
             )
         )
+        assert app.health.status("hl_leaderboard") == "unknown"
     finally:
         await asyncio.wait_for(app.stop(), timeout=5)
     assert all(task.done() for task in app.critical_tasks())

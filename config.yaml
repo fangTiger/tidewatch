@@ -6,6 +6,8 @@ hyperliquid:
   proxy: global
   rest_url: https://api.hyperliquid.xyz/info
   ws_url: wss://api.hyperliquid.xyz/ws
+  leaderboard_url: https://stats-data.hyperliquid.xyz/Mainnet/leaderboard
+  aliases_url: https://api.hypurrscan.io/globalAliases
   monitor_budget_per_min: 900
   batch_budget_per_min: 300
   frequencies:
@@ -46,6 +48,16 @@ hyperliquid:
   top_altcoins: [SOL, XRP, HYPE, DOGE, BNB]
   ticker_symbols: [BTC, ETH, SOL, HYPE]
   core_wallets: []
+  # 官方 vaultDetails 于 2026-10-06 返回的 HLP 父金库及子金库；上游调整时可在本地覆盖。
+  protocol_excluded_addresses:
+    - "0xdfc24b077bc1425ad1dea75bcb6f8158e10df303"
+    - "0x010461c14e146ac35fe42271bdc1134ee31c703a"
+    - "0x2e3d94f0562703b25c83308a05046ddaf9a8dd14"
+    - "0x2ed5c4484ea3ff8b57d5f2fb152a40d9f2b68308"
+    - "0x31ca8395cf837de08b24da3f660e77761dfb974b"
+    - "0x469f690213c467c39a23efacfd2816896009d7d8"
+    - "0x5e177e5e39c0f4e421f5865a6d8beed8d921cb70"
+    - "0xb0a55f13d22f66e6d495ac98113841b2326e9540"
   health:
     hl_rest: {stale_after_s: 600}
     hl_trades_ws: {stale_after_s: 180}
