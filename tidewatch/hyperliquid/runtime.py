@@ -35,6 +35,11 @@ from tidewatch.hyperliquid.monitor import (
     ReconcilePriority,
     ScheduledReconcile,
 )
+from tidewatch.hyperliquid.profile import (
+    ProfileBatchRunner,
+    WalletProfiler,
+    seconds_until_shanghai_midnight,
+)
 from tidewatch.hyperliquid.registry import WalletRegistry, normalize_address
 from tidewatch.hyperliquid.tiers import TierRecalculator
 from tidewatch.hyperliquid.ws import MAX_SUBSCRIPTIONS, HyperliquidWsManager
@@ -159,6 +164,22 @@ class HyperliquidRuntime:
             sink=sink,
             clock=clock,
         )
+        self.profiler = WalletProfiler(
+            engine,
+            self.rest,
+            clock=clock,
+            hip3_dexes=settings.hip3_dexes,
+        )
+        self.profile_batch = ProfileBatchRunner(
+            engine,
+            self.profiler,
+            health=health,
+            clock=clock,
+            retry_limit=settings.profile_retry_limit,
+            candidate_shards=settings.profile_candidate_shards,
+            failure_ratio_threshold=settings.profile_failure_ratio_threshold,
+            wallet_timeout_s=settings.profile_wallet_timeout_s,
+        )
         self.reconcile_queue = PriorityReconcileQueue()
         self._pending_discoveries: dict[str, list[QualificationRequest]] = defaultdict(list)
         self._discovery_query_times: deque[float] = deque()
@@ -233,14 +254,6 @@ class HyperliquidRuntime:
 
     async def _idle(self) -> None:
         await self._stop.wait()
-
-    async def _idle_health(self, source: str) -> None:
-        """尚未交付的 M4/M5 子源继续沿用 M1 空闲存活上报。"""
-        interval = getattr(self.settings.health, source).stale_after_s / 2
-        while not self._stop.is_set():
-            await self.health.success(source)
-            if await self._wait_or_stop(interval):
-                return
 
     async def run_rest(self) -> None:
         """运行重点钱包优先级对账调度。"""
@@ -434,7 +447,34 @@ class HyperliquidRuntime:
         return max(0, self.settings.frequencies.leaderboard_interval_s - max(0, elapsed))
 
     async def run_profile(self) -> None:
-        await self._idle_health("hl_profile")
+        """首次延迟启动，之后每天上海时间 00:00 运行或恢复画像批次。"""
+        delay = await self.profile_batch.initial_delay(
+            self.settings.frequencies.profile_initial_delay_s
+        )
+        if delay > 0 and await self._wait_or_stop(delay):
+            return
+        while not self._stop.is_set():
+            try:
+                result = await self.profile_batch.run_once()
+                logger.info(
+                    "Hyperliquid 画像批次完成：处理 %d，成功 %d，失败 %d",
+                    result.processed,
+                    result.succeeded,
+                    len(result.failed),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("Hyperliquid 画像批次系统性失败")
+                await self.health.failure("hl_profile", describe(exc))
+                if await self._wait_or_stop(min(300, self.settings.frequencies.profile_interval_s)):
+                    return
+                continue
+            delay = seconds_until_shanghai_midnight(self.clock())
+            if delay == 0:
+                delay = self.settings.frequencies.profile_interval_s
+            if await self._wait_or_stop(delay):
+                return
 
     async def run_market_data(self) -> None:
         """消费 allMids 最新消息；满队列时只保留最新价格。"""

@@ -54,6 +54,7 @@ class WalletView:
     excluded: bool
     style: str | None
     profile: Mapping[str, Any]
+    profile_updated_at: datetime | None
     total_notional: Decimal
 
     @property
@@ -578,6 +579,7 @@ class WalletRegistry:
                 excluded=row["excluded"],
                 style=row["style"],
                 profile=dict(row["profile"] or {}),
+                profile_updated_at=row["profile_updated_at"],
                 total_notional=Decimal(row["total_notional"] or 0),
             )
             for row in rows

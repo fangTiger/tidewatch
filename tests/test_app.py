@@ -666,10 +666,12 @@ async def test_hyperliquid_only_starts_shared_pipeline_without_news_or_web(engin
                 await wait_until(
                     lambda: all(
                         app.health.status(name) == "normal"
-                        for name in ("hl_rest", "hl_trades_ws", "hl_core_ws", "hl_profile")
+                        for name in ("hl_rest", "hl_trades_ws", "hl_core_ws")
                     )
                 )
                 assert app.health.status("hl_leaderboard") == "unknown"
+                # M5 不再用空闲心跳伪造画像成功；首次真实批次延迟期间保持未知。
+                assert app.health.status("hl_profile") == "unknown"
             finally:
                 await asyncio.wait_for(app.stop(), timeout=5)
     assert all(task.done() for task in app.critical_tasks())

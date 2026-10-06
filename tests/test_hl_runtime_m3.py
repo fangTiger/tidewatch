@@ -333,7 +333,8 @@ async def test_reconnect_hook_reconciles_hot_wallet_final_state_through_rest(
         with respx.mock:
             respx.post(settings.hyperliquid.rest_url).mock(side_effect=respond)
             await runtime._on_core_connected()
-            now["value"] = 100.4
+            # 空桶需先积累主状态 2 + 账户类型 20 的官方权重。
+            now["value"] = 102.3
             assert await runtime.run_reconcile_once(now["value"])
     finally:
         await runtime.close_resources()
@@ -590,7 +591,7 @@ def test_two_hundred_wallet_budget_estimate_stays_below_six_hundred_per_minute(s
 
     assert total_per_minute < settings.hyperliquid.monitor_budget_per_min
     assert settings.hyperliquid.frequencies.focus_reconcile_interval_s <= 180
-    assert 593 < total_per_minute < 594
+    assert 597 < total_per_minute < 598
 
 
 @async_timeout()
@@ -724,7 +725,8 @@ async def test_focus_position_change_is_detected_on_three_minute_reconcile_cycle
         with respx.mock:
             respx.post(settings.hyperliquid.rest_url).mock(side_effect=respond)
             await runtime.schedule_focus_wallets(now["value"])
-            now["value"] = 100.4
+            # 空桶需先积累主状态 2 + 账户类型 20 的官方权重。
+            now["value"] = 102.3
             assert await runtime.run_reconcile_once(now["value"])
             first_completed_at = now["value"]
             now["value"] = (

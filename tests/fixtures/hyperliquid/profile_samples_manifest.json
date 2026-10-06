@@ -1,0 +1,8 @@
+{
+  "recorded_at": "2026-10-06T16:22:00+08:00",
+  "source": "https://api.hyperliquid.xyz/info",
+  "portfolio": {"address": "0x7b7f72a28fe109fa703eeed7984f2a8a68fedee2", "windows": 8, "trimmed_points_per_window": 2},
+  "high_frequency_short_window": {"address": "0x7b7f72a28fe109fa703eeed7984f2a8a68fedee2", "original_count": 2000, "start_time": 1791202326844, "end_time": 1791208006921, "trimmed": true},
+  "unified_account": {"address": "0xd1581ae3dc981bfb70cceace6647a1c35df09dab", "abstraction": "unifiedAccount"},
+  "empty_history": {"address": "0x85ecf584f25db6f146718b86d493e33c5af72052", "request": "userFillsByTime", "trimmed": false}
+}

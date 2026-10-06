@@ -1196,6 +1196,8 @@ def _fill_row(address: str, fill: Mapping[str, Any], *, is_twap: bool) -> dict[s
         "tid": tid,
         "coin": str(fill["coin"]),
         "dir": str(fill.get("dir") or ""),
+        "side": str(fill.get("side") or "") or None,
+        "start_position": _optional_decimal(fill.get("startPosition")),
         "px": _decimal(fill.get("px") or 0),
         "sz": _decimal(fill.get("sz") or 0),
         "closed_pnl": _decimal(fill.get("closedPnl") or 0),

@@ -6,7 +6,9 @@ import argparse
 import asyncio
 import sys
 from collections.abc import Sequence
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any
 
 from tidewatch.config import ConfigError, load_settings
 from tidewatch.hyperliquid.registry import WalletRegistry, normalize_address
@@ -61,10 +63,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="all",
         help="按排除状态筛选（默认 all）",
     )
+    profile = commands.add_parser("profile", help="立即计算并显示单钱包画像")
+    profile.add_argument("address", type=_address)
     return parser.parse_args(argv)
 
 
-async def execute(args: argparse.Namespace, registry: WalletRegistry) -> str:
+async def execute(
+    args: argparse.Namespace,
+    registry: WalletRegistry,
+    *,
+    profiler: Any = None,
+) -> str:
     """执行已解析命令并返回中文终端输出。"""
     command = args.command
     if command == "add":
@@ -96,12 +105,20 @@ async def execute(args: argparse.Namespace, registry: WalletRegistry) -> str:
         excluded = None if args.excluded == "all" else args.excluded == "yes"
         rows = await registry.list_wallets(tier=args.tier, excluded=excluded)
         return _format_rows(rows)
+    if command == "profile":
+        if profiler is None:
+            raise ValueError("画像服务未初始化")
+        result = await profiler.profile_wallet(args.address)
+        return _format_profile(result)
     raise ValueError(f"未知命令：{command}")
 
 
 def _format_rows(rows) -> str:
-    header = "地址 | 备注/标签 | 来源 | 层级 | 排除 | 风格 | 当前持仓名义"
-    divider = "--- | --- | --- | --- | --- | --- | ---:"
+    header = (
+        "地址 | 备注/标签 | 来源 | 层级 | 排除 | 当前持仓名义 | "
+        "账户价值 | 30 天盈亏 | 胜率 | 风格 | 画像时间"
+    )
+    divider = "--- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | --- | ---"
     lines = [header, divider]
     if not rows:
         lines.append("（无匹配钱包）")
@@ -119,12 +136,113 @@ def _format_rows(rows) -> str:
                     _SOURCE_NAMES.get(row.source, row.source),
                     _TIER_NAMES.get(row.tier, row.tier or "-"),
                     "是" if row.excluded else "否",
-                    _STYLE_NAMES.get(row.style, row.style or "-"),
                     f"${row.total_notional:,.2f}",
+                    _money(row.profile.get("account_value")),
+                    _money(row.profile.get("pnl_30d")),
+                    _percent(row.profile.get("win_rate")),
+                    _STYLE_NAMES.get(row.style, row.style or "-"),
+                    row.profile_updated_at.isoformat() if row.profile_updated_at else "-",
                 )
             )
         )
     return "\n".join(lines)
+
+
+def _format_profile(result: dict[str, Any]) -> str:
+    profile = dict(result.get("profile") or {})
+    style = result.get("style")
+    coverage = profile.get("coverage") if isinstance(profile.get("coverage"), dict) else {}
+    lines = [
+        f"地址：{result.get('address', '-')}",
+        f"风格：{_STYLE_NAMES.get(style, style or '未知')}",
+        f"画像时间：{_time_text(result.get('profile_updated_at') or profile.get('generated_at'))}",
+        f"账户价值：{_money(profile.get('account_value'))}{_sample_suffix(coverage, 'account_value')}",
+        f"总盈亏：{_money(profile.get('total_pnl'))}{_sample_suffix(coverage, 'total_pnl')}",
+        f"30 天盈亏：{_money(profile.get('pnl_30d'))}{_sample_suffix(coverage, 'pnl_30d')}",
+        f"总成交量：{_money(profile.get('volume_total'))}{_sample_suffix(coverage, 'volume_total')}",
+        f"30 天成交量：{_money(profile.get('volume_30d'))}{_sample_suffix(coverage, 'volume_30d')}",
+        f"最大回撤：{_money(profile.get('max_drawdown'))} / {_percent(profile.get('max_drawdown_ratio'))}{_sample_suffix(coverage, 'max_drawdown')}",
+        f"胜率：{_percent(profile.get('win_rate'))}{_sample_suffix(coverage, 'win_rate')}",
+        f"盈亏比：{_number(profile.get('profit_loss_ratio'))}{_sample_suffix(coverage, 'profit_loss_ratio')}",
+        f"平均持仓：{_duration(profile.get('holding_duration_avg_s'))}{_sample_suffix(coverage, 'holding_duration')}",
+        f"中位持仓：{_duration(profile.get('holding_duration_median_s'))}{_sample_suffix(coverage, 'holding_duration')}",
+        f"未平轮次：{profile.get('open_rounds', '-')}",
+        f"偏好币种：{_preferred_coins(profile.get('preferred_coins'))}{_sample_suffix(coverage, 'preferred_coins')}",
+        f"日均成交：{_number(profile.get('daily_fill_count'))} 笔{_sample_suffix(coverage, 'daily_fill_count')}",
+        f"挂单占比：{_percent(profile.get('passive_fill_ratio'))}",
+        f"实际杠杆：{_number(profile.get('actual_leverage'))}x{_sample_suffix(coverage, 'actual_leverage')}",
+        f"设置杠杆：{_configured_leverage(profile.get('configured_leverage'))}{_sample_suffix(coverage, 'configured_leverage')}",
+    ]
+    return "\n".join(lines)
+
+
+def _decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _money(value: Any) -> str:
+    parsed = _decimal(value)
+    return "数据不足" if parsed is None else f"${parsed:,.2f}"
+
+
+def _number(value: Any) -> str:
+    parsed = _decimal(value)
+    return "数据不足" if parsed is None else f"{parsed:,.4f}".rstrip("0").rstrip(".")
+
+
+def _percent(value: Any) -> str:
+    parsed = _decimal(value)
+    return "数据不足" if parsed is None else f"{parsed * 100:.2f}%"
+
+
+def _duration(value: Any) -> str:
+    parsed = _decimal(value)
+    if parsed is None:
+        return "数据不足"
+    hours = parsed / Decimal(3600)
+    return f"{hours:.2f} 小时"
+
+
+def _preferred_coins(value: Any) -> str:
+    if not isinstance(value, list) or not value:
+        return "数据不足"
+    return "、".join(
+        f"{item.get('coin')}（{_money(item.get('notional_usd'))}）"
+        for item in value
+        if isinstance(item, dict)
+    ) or "数据不足"
+
+
+def _configured_leverage(value: Any) -> str:
+    if not isinstance(value, dict) or not value:
+        return "数据不足"
+    return "、".join(f"{coin} {leverage}x" for coin, leverage in sorted(value.items()))
+
+
+def _sample_suffix(coverage: dict[str, Any], key: str) -> str:
+    detail = coverage.get(key)
+    if not isinstance(detail, dict):
+        return ""
+    parts = [f"样本量：{detail.get('sample_size', 0)}"]
+    if detail.get("complete") is False:
+        parts.append("历史不完整")
+    if not detail.get("sufficient", True) and detail.get("reason"):
+        parts.append(str(detail["reason"]))
+    start = detail.get("start_at")
+    end = detail.get("end_at")
+    if start or end:
+        parts.append(f"窗口：{start or '?'} 至 {end or '?'}")
+    return f"（{'；'.join(parts)}）"
+
+
+def _time_text(value: Any) -> str:
+    return value.isoformat() if hasattr(value, "isoformat") else str(value or "-")
 
 
 async def _run(args: argparse.Namespace) -> str:
@@ -136,10 +254,33 @@ async def _run(args: argparse.Namespace) -> str:
         core_limit=settings.hyperliquid.tiers.core_limit,
         focus_limit=settings.hyperliquid.tiers.focus_limit,
     )
+    runtime = None
     try:
+        if args.command == "profile":
+            from tidewatch.hyperliquid.runtime import HyperliquidRuntime
+
+            runtime = HyperliquidRuntime(
+                settings.hyperliquid,
+                _CliHealth(),
+                engine=engine,
+                proxy_url=settings.proxy_url,
+            )
+            return await execute(args, registry, profiler=runtime.profiler)
         return await execute(args, registry)
     finally:
+        if runtime is not None:
+            await runtime.close_resources()
         await engine.dispose()
+
+
+class _CliHealth:
+    """单次画像命令不写健康状态。"""
+
+    async def success(self, name: str) -> None:
+        return None
+
+    async def failure(self, name: str, error: str) -> None:
+        return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -1,0 +1,6 @@
+[
+  {"coin":"xyz:MU","px":"1059.6","sz":"2.413","side":"B","time":1791208502504,"startPosition":"-2.413","dir":"Close Short","closedPnl":"1.867662","hash":"0xa3f00d665f14979aa5690445e5f3740203ad004bfa17b66c47b8b8b91e187185","oid":565862117367,"crossed":false,"fee":"-0.005113","tid":876453760086334,"feeToken":"USDC","twapId":null},
+  {"coin":"xyz:MU","px":"1059.3","sz":"0.314","side":"A","time":1791208829659,"startPosition":"0.0","dir":"Open Short","closedPnl":"0.0","hash":"0x2c6ee35438703e9a2de80445e6051b0203300039d3735d6cd0378ea6f7741884","oid":565867856411,"crossed":true,"fee":"0.012107","tid":19691243237949,"feeToken":"USDC","twapId":null},
+  {"coin":"xyz:MU","px":"1065.4","sz":"1.037","side":"A","time":1791211272218,"startPosition":"1.037","dir":"Close Long","closedPnl":"0.975817","hash":"0xaeb8ec099335eb86b0320445e68a8b020a8c00ef2e390a585281975c5239c571","oid":565913438316,"crossed":false,"fee":"-0.002209","tid":114987262738184,"feeToken":"USDC","twapId":null},
+  {"coin":"xyz:MU","px":"1064.1","sz":"1.11","side":"B","time":1791211341047,"startPosition":"0.0","dir":"Open Long","closedPnl":"0.0","hash":"0x0000000000000000000000000000000000000000000000000000000000000000","oid":565914630684,"crossed":false,"fee":"-0.002362","tid":668483969604866,"feeToken":"USDC","twapId":null}
+]

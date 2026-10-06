@@ -156,6 +156,8 @@ hl_fills = Table(
     Column("tid", BigInteger, primary_key=True),
     Column("coin", Text, nullable=False),
     Column("dir", Text, nullable=False),
+    Column("side", Text),
+    Column("start_position", Numeric),
     Column("px", Numeric, nullable=False),
     Column("sz", Numeric, nullable=False),
     Column("closed_pnl", Numeric, nullable=False),

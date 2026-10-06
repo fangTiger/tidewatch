@@ -22,6 +22,7 @@ def test_parse_args_supports_all_commands_and_normalizes_address(capsys):
     assert parse_args(["label", upper, "测试备注"]).note == "测试备注"
     listed = parse_args(["list", "--tier", "focus", "--excluded", "no"])
     assert listed.tier == "focus" and listed.excluded == "no"
+    assert parse_args(["profile", upper]).address == upper.lower()
 
     with pytest.raises(SystemExit):
         parse_args(["add", "0x1234"])
@@ -41,7 +42,7 @@ async def test_execute_crud_and_chinese_list_output(engine, clock):
             update(hl_wallets).where(hl_wallets.c.address == address).values(style="directional")
         )
     listing = await execute(parse_args(["list", "--tier", "focus"]), registry)
-    assert "地址 | 备注/标签 | 来源 | 层级 | 排除 | 风格 | 当前持仓名义" in listing
+    assert "账户价值 | 30 天盈亏 | 胜率 | 风格 | 画像时间" in listing
     assert address in listing and "测试巨鲸" in listing and "手动" in listing and "重点" in listing
     assert "方向型" in listing and "directional" not in listing
 
@@ -53,3 +54,32 @@ async def test_execute_crud_and_chinese_list_output(engine, clock):
     assert await execute(parse_args(["exclude", address, "--remove"]), registry) == f"已解除排除：{address}"
     assert await execute(parse_args(["remove", address]), registry) == f"已移除手动钱包：{address}"
     assert "（无匹配钱包）" in await execute(parse_args(["list"]), registry)
+
+
+@async_timeout()
+async def test_execute_profile_prints_all_metrics(engine, clock):
+    address = _address(2)
+    registry = WalletRegistry(engine, clock=clock)
+    await registry.add(address)
+
+    class Profiler:
+        async def profile_wallet(self, requested: str):
+            assert requested == address
+            return {
+                "address": address,
+                "style": "swing",
+                "profile": {
+                    "account_value": "2500000",
+                    "pnl_30d": "12345.67",
+                    "win_rate": 0.625,
+                    "coverage": {"win_rate": {"sample_size": 8, "sufficient": True}},
+                },
+            }
+
+    output = await execute(parse_args(["profile", address]), registry, profiler=Profiler())
+    assert address in output
+    assert "账户价值" in output and "$2,500,000.00" in output
+    assert "30 天盈亏" in output and "$12,345.67" in output
+    assert "胜率" in output and "62.50%" in output
+    assert "波段" in output
+    assert "样本量：8" in output

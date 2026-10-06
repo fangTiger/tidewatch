@@ -23,13 +23,14 @@ REST_URL = "https://api.hyperliquid.xyz/info"
 Budget = Literal["monitor", "batch"]
 Sleep = Callable[[float], Awaitable[None]]
 
-# 系统设计 7.1 明确列出的基础权重；其余轻量 info 请求按官方通用权重 2 处理。
+# 系统设计 7.1 明确列出的基础权重；官方未单列的 info 请求按通用权重 20 处理。
 BASE_WEIGHTS: dict[str, int] = {
     "clearinghouseState": 2,
     "spotClearinghouseState": 2,
     "userFills": 20,
     "userFillsByTime": 20,
     "portfolio": 20,
+    "userAbstraction": 20,
     "userTwapSliceFills": 20,
 }
 VOLUME_WEIGHT_TYPES = frozenset({"userFills", "userFillsByTime", "userTwapSliceFills"})
@@ -279,7 +280,7 @@ class HyperliquidRestClient:
     ) -> tuple[bool, Any]:
         """预算足够时立即发送请求；不足时返回 ``(False, None)`` 供优先队列顺延。"""
         bucket = self._bucket(budget)
-        weight = BASE_WEIGHTS.get(request_type, 2)
+        weight = BASE_WEIGHTS.get(request_type, 20)
         permit = await self._rate_controller.try_start()
         if permit is None:
             return False, None
@@ -320,7 +321,7 @@ class HyperliquidRestClient:
         if not isinstance(request_type, str) or not request_type:
             raise ValueError("Hyperliquid info 请求必须包含非空 type")
         bucket = self._bucket(budget)
-        base_weight = BASE_WEIGHTS.get(request_type, 2)
+        base_weight = BASE_WEIGHTS.get(request_type, 20)
         backoff = Backoff()
 
         first_attempt = True

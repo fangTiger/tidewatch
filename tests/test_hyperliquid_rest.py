@@ -603,6 +603,24 @@ async def test_info_uses_selected_budget_without_borrowing_from_other_bucket():
 
 @respx.mock
 @async_timeout()
+async def test_user_abstraction_uses_official_default_info_weight():
+    monitoring, batch = RecordingBucket(), RecordingBucket()
+    respx.post(REST_URL).mock(return_value=httpx.Response(200, json="disabled"))
+    client = HyperliquidRestClient(monitoring, batch, proxy_mode="direct")
+    try:
+        await asyncio.wait_for(
+            client.info("userAbstraction", budget="batch", user="0xabc"),
+            timeout=5,
+        )
+    finally:
+        await _close(client)
+
+    assert monitoring.weights == []
+    assert batch.weights == [20]
+
+
+@respx.mock
+@async_timeout()
 async def test_try_info_returns_immediately_without_network_when_budget_is_exhausted():
     monitoring, batch = DenyingBucket(), RecordingBucket()
     route = respx.post(REST_URL).mock(return_value=httpx.Response(200, json={}))

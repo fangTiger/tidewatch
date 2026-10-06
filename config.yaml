@@ -13,6 +13,12 @@ hyperliquid:
   # 资格查询每次 2 权重；最多 3 次/分钟，为热点与常规对账保留预算。
   discovery_query_limit_per_min: 3
   reconcile_concurrency: 4
+  profile_retry_limit: 3
+  # 200 权重/分钟下全量约 4.5 小时；重点每日全量，候选分两片隔日轮转约 2.6 小时。
+  profile_candidate_shards: 2
+  profile_failure_ratio_threshold: 0.1
+  # 高频地址首次 10,000 条回溯仅成交响应权重即可达 600，需容纳至少 3 分钟令牌等待。
+  profile_wallet_timeout_s: 600
   rest_burst_window_s: 10
   aimd_min_budget_per_min: 120
   aimd_recovery_interval_s: 60
@@ -23,12 +29,14 @@ hyperliquid:
     hot_reconcile_interval_s: 20
     focus_reconcile_interval_s: 180
     fill_query_min_interval_s: 60
-    account_type_cache_s: 3600
+    # userAbstraction 按官方通用 20 权重计费，缓存 6 小时以守住监控预算。
+    account_type_cache_s: 21600
     deferred_fill_lookup_timeout_s: 15
     fill_timeout_warning_interval_s: 1800
     leaderboard_interval_s: 43200
     tier_recompute_interval_s: 86400
     profile_interval_s: 86400
+    profile_initial_delay_s: 600
     label_refresh_interval_s: 86400
     discovery_window_s: 3
     discovery_cache_s: 3600
