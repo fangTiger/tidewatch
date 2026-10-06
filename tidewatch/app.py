@@ -68,6 +68,7 @@ class Application:
                 sink=self.sink,
                 proxy_url=settings.proxy_url,
                 clock=clock,
+                live_updates=self.live,
             )
             if "hyperliquid" in self.groups and settings.hyperliquid.enabled
             else None
@@ -157,7 +158,13 @@ class Application:
         if "web" in self.groups:
             web = self.settings.web
             config = uvicorn.Config(
-                create_app(self.engine, self.broadcaster, self.settings, clock=self.clock),
+                create_app(
+                    self.engine,
+                    self.broadcaster,
+                    self.settings,
+                    clock=self.clock,
+                    hyperliquid=self.hyperliquid,
+                ),
                 host=web.host,
                 port=web.port,
                 log_config=None,

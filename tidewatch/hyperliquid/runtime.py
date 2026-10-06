@@ -77,6 +77,7 @@ class HyperliquidRuntime:
         data_dir: Path | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        live_updates: Any = None,
     ) -> None:
         self.settings = settings
         self.health = health
@@ -163,6 +164,8 @@ class HyperliquidRuntime:
             rest=self.rest,
             sink=sink,
             clock=clock,
+            on_position=live_updates.on_position if live_updates is not None else None,
+            on_market=live_updates.on_market if live_updates is not None else None,
         )
         self.profiler = WalletProfiler(
             engine,

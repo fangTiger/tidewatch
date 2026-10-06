@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from sqlalchemy import case, exists, func, literal_column, select, true
@@ -10,9 +11,18 @@ from sqlalchemy.dialects.postgresql import aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tidewatch.clock import LOCAL_TZ, format_local, utcnow
+from tidewatch.hyperliquid.registry import normalize_address
 from tidewatch.notify.base import source_name
 from tidewatch.pipeline.decision import FreshnessLookup
-from tidewatch.store.tables import collector_state, event_clusters, events, push_log
+from tidewatch.store.tables import (
+    collector_state,
+    event_clusters,
+    events,
+    hl_fills,
+    hl_positions,
+    hl_wallets,
+    push_log,
+)
 from tidewatch.urls import safe_http_url
 
 LEVELS = ("S", "A", "B", "C")
@@ -171,3 +181,280 @@ async def push_stats(engine: AsyncEngine, now: datetime) -> dict[str, int]:
     async with engine.connect() as conn:
         counts = dict((await conn.execute(stmt)).all())
     return {status: int(counts.get(status, 0)) for status in PUSH_STATUSES}
+
+
+def _decimal(value: Any) -> Decimal | None:
+    """把画像里的可选数字安全转换为有限 Decimal。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _decimal_text(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    return format(value, "f")
+
+
+def _wallet_dict(row: Any, total_notional: Decimal) -> dict[str, Any]:
+    profile = dict(row["profile"] or {})
+    labels = [
+        value
+        for key in ("leaderboard_display_name", "hypurrscan_alias")
+        if isinstance((value := profile.get(key)), str) and value
+    ]
+    tags = profile.get("tags")
+    if not isinstance(tags, list):
+        tags = []
+    note = row["note"]
+    account_value = _decimal(profile.get("account_value", profile.get("leaderboard_account_value")))
+    pnl_30d = _decimal(profile.get("pnl_30d"))
+    win_rate = _decimal(profile.get("win_rate"))
+    return {
+        "address": row["address"],
+        "short_address": f"{row['address'][:6]}…{row['address'][-4:]}",
+        "note": note,
+        "labels": labels,
+        "tags": [str(tag) for tag in tags if str(tag)],
+        "display_name": note or next(iter(labels), None),
+        "tier": row["tier"],
+        "source": row["source"],
+        "excluded": bool(row["excluded"]),
+        "style": row["style"],
+        "profile": profile,
+        "profile_updated_at": row["profile_updated_at"],
+        "profile_updated": _local_time(row["profile_updated_at"]),
+        "account_value": _decimal_text(account_value),
+        "account_value_value": account_value,
+        "pnl_30d": _decimal_text(pnl_30d),
+        "pnl_30d_value": pnl_30d,
+        "win_rate": _decimal_text(win_rate),
+        "win_rate_value": win_rate,
+        "total_notional": _decimal_text(total_notional) or "0",
+        "total_notional_value": total_notional,
+        "has_position": total_notional > 0,
+    }
+
+
+async def whale_rows(
+    engine: AsyncEngine,
+    *,
+    account_value_min: Decimal | None = None,
+    pnl_30d_min: Decimal | None = None,
+    win_rate_min: Decimal | None = None,
+    style: str | None = None,
+    tier: str | None = None,
+    has_position: bool | None = None,
+    excluded: bool | None = None,
+    sort_by: str = "account_value",
+    sort_order: str = "desc",
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """巨鲸列表：在有限名单上用 Python 处理 JSON 画像筛选，避免坏画像使整页查询失败。"""
+    totals = (
+        select(
+            hl_positions.c.address,
+            func.coalesce(func.sum(func.abs(hl_positions.c.notional_usd)), 0).label("total_notional"),
+        )
+        .where(hl_positions.c.szi != 0)
+        .group_by(hl_positions.c.address)
+        .subquery()
+    )
+    stmt = select(hl_wallets, totals.c.total_notional).outerjoin(
+        totals, totals.c.address == hl_wallets.c.address
+    )
+    async with engine.connect() as conn:
+        raw_rows = (await conn.execute(stmt)).mappings().all()
+    rows = [_wallet_dict(row, Decimal(row["total_notional"] or 0)) for row in raw_rows]
+    if account_value_min is not None:
+        rows = [row for row in rows if row["account_value_value"] is not None and row["account_value_value"] >= account_value_min]
+    if pnl_30d_min is not None:
+        rows = [row for row in rows if row["pnl_30d_value"] is not None and row["pnl_30d_value"] >= pnl_30d_min]
+    if win_rate_min is not None:
+        rows = [row for row in rows if row["win_rate_value"] is not None and row["win_rate_value"] >= win_rate_min]
+    if style is not None:
+        rows = [row for row in rows if row["style"] == style]
+    if tier is not None:
+        rows = [row for row in rows if row["tier"] == tier]
+    if has_position is not None:
+        rows = [row for row in rows if row["has_position"] is has_position]
+    if excluded is not None:
+        rows = [row for row in rows if row["excluded"] is excluded]
+
+    sort_fields = {
+        "account_value": "account_value_value",
+        "pnl_30d": "pnl_30d_value",
+        "win_rate": "win_rate_value",
+        "style": "style",
+        "tier": "tier",
+        "has_position": "has_position",
+        "total_notional": "total_notional_value",
+    }
+    field = sort_fields.get(sort_by, "account_value_value")
+    present = [row for row in rows if row[field] is not None]
+    missing = [row for row in rows if row[field] is None]
+    reverse = sort_order != "asc"
+    present.sort(key=lambda row: (row[field], row["address"]), reverse=reverse)
+    missing.sort(key=lambda row: row["address"])
+    return (present + missing)[: max(1, min(limit, 200))]
+
+
+def market_tickers(
+    symbols: list[str],
+    mids: dict[str, Decimal],
+    *,
+    enabled: bool,
+    connected: bool,
+) -> list[dict[str, str | None]]:
+    """按配置顺序生成行情条，不把缺价或断线旧价伪装成实时行情。"""
+    rows: list[dict[str, str | None]] = []
+    for symbol in symbols:
+        price = _decimal(mids.get(symbol)) if enabled else None
+        status = "未启用" if not enabled else "缺价" if price is None else "实时" if connected else "断线"
+        rows.append({"symbol": symbol, "price": _decimal_text(price), "status": status})
+    return rows
+
+
+async def whale_net_positions(
+    engine: AsyncEngine,
+    *,
+    mids: dict[str, Decimal],
+    now: datetime,
+    stale_after_s: float,
+) -> list[dict[str, str]]:
+    """按当前 allMids 聚合核心与重点钱包的多、空、净仓位。"""
+    cutoff = now - timedelta(seconds=stale_after_s)
+    stmt = (
+        select(hl_positions)
+        .join(hl_wallets, hl_wallets.c.address == hl_positions.c.address)
+        .where(
+            hl_wallets.c.tier.in_(("focus", "core")),
+            hl_wallets.c.excluded.is_(False),
+            hl_positions.c.updated_at >= cutoff,
+            hl_positions.c.szi != 0,
+        )
+    )
+    async with engine.connect() as conn:
+        positions = (await conn.execute(stmt)).mappings().all()
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in positions:
+        mark = _decimal(mids.get(row["coin"]))
+        size = _decimal(row["szi"])
+        if mark is None or mark <= 0 or size is None or size == 0:
+            continue
+        values = grouped.setdefault(
+            row["coin"],
+            {"long": Decimal(0), "short": Decimal(0), "updated_at": row["updated_at"]},
+        )
+        notional = abs(size) * mark
+        values["long" if size > 0 else "short"] += notional
+        values["updated_at"] = max(values["updated_at"], row["updated_at"])
+    result = []
+    for coin, values in sorted(grouped.items()):
+        net = values["long"] - values["short"]
+        result.append({
+            "coin": coin,
+            "long_usd": _decimal_text(values["long"]) or "0",
+            "short_usd": _decimal_text(values["short"]) or "0",
+            "net_usd": _decimal_text(net) or "0",
+            "direction": "long" if net > 0 else "short" if net < 0 else "flat",
+            "updated_at": values["updated_at"].isoformat(),
+        })
+    return result
+
+
+async def whale_detail(
+    engine: AsyncEngine,
+    address: str,
+    *,
+    mids: dict[str, Decimal],
+    operation_limit: int = 50,
+) -> dict[str, Any] | None:
+    """读取钱包画像、当前仓位以及 Hyperliquid 事件与成交。"""
+    normalized = normalize_address(address)
+    async with engine.connect() as conn:
+        wallet_row = (
+            await conn.execute(select(hl_wallets).where(hl_wallets.c.address == normalized))
+        ).mappings().first()
+        if wallet_row is None:
+            return None
+        position_rows = (
+            await conn.execute(
+                select(hl_positions)
+                .where(hl_positions.c.address == normalized, hl_positions.c.szi != 0)
+                .order_by(hl_positions.c.coin, hl_positions.c.dex)
+            )
+        ).mappings().all()
+        event_rows = (
+            await conn.execute(
+                select(events)
+                .where(events.c.category == "hyperliquid", events.c.raw["address"].astext == normalized)
+                .order_by(events.c.occurred_at.desc(), events.c.id.desc())
+                .limit(operation_limit)
+            )
+        ).mappings().all()
+        fill_rows = (
+            await conn.execute(
+                select(hl_fills)
+                .where(hl_fills.c.address == normalized)
+                .order_by(hl_fills.c.occurred_at.desc(), hl_fills.c.tid.desc())
+                .limit(operation_limit)
+            )
+        ).mappings().all()
+
+    total_notional = sum((abs(Decimal(row["notional_usd"] or 0)) for row in position_rows), Decimal(0))
+    wallet = _wallet_dict(wallet_row, total_notional)
+    profile = wallet["profile"]
+    positions = []
+    for row in position_rows:
+        size = Decimal(row["szi"])
+        mark = _decimal(mids.get(row["coin"]))
+        liquidation = _decimal(row["liquidation_px"])
+        distance = abs(mark - liquidation) / mark if mark and mark > 0 and liquidation is not None else None
+        notional = abs(size) * mark if mark is not None else _decimal(row["notional_usd"])
+        positions.append({
+            "dex": row["dex"] or "主 dex",
+            "coin": row["coin"],
+            "direction": "long" if size > 0 else "short",
+            "quantity": _decimal_text(abs(size)),
+            "notional_usd": _decimal_text(notional),
+            "entry_px": _decimal_text(_decimal(row["entry_px"])),
+            "liquidation_px": _decimal_text(liquidation),
+            "liquidation_distance": _decimal_text(distance),
+            "liquidation_progress": float(max(Decimal(0), min(Decimal(100), (Decimal(1) - (distance or Decimal(1))) * 100))),
+            "leverage": _decimal_text(_decimal(row["leverage"])),
+            "unrealized_pnl": _decimal_text(_decimal(row["unrealized_pnl"])),
+            "updated_at": row["updated_at"].isoformat(),
+        })
+    operations = [
+        {
+            "kind": "event",
+            "occurred_at": row["occurred_at"],
+            "title": row["title"],
+            "coin": (row["raw"] or {}).get("coin"),
+            "amount_usd": _decimal_text(_decimal(row["amount_usd"])),
+        }
+        for row in event_rows
+    ] + [
+        {
+            "kind": "fill",
+            "occurred_at": row["occurred_at"],
+            "title": row["dir"],
+            "coin": row["coin"],
+            "amount_usd": _decimal_text(Decimal(row["px"]) * Decimal(row["sz"])),
+        }
+        for row in fill_rows
+    ]
+    operations.sort(key=lambda item: item["occurred_at"], reverse=True)
+    return {
+        "wallet": wallet,
+        "profile": profile,
+        "coverage": dict(profile.get("coverage") or {}),
+        "pnl_history": list(profile.get("pnl_history") or []),
+        "positions": positions,
+        "operations": operations[:operation_limit],
+    }

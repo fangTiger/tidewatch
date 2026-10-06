@@ -212,7 +212,30 @@ const collectorsBody = new Element("tbody");
 collectors.appendChild(collectorsBody);
 collectorsBody.appendChild(statusRow("jin10"));
 
-global.document = new DocumentStub([live, timeline, collectors]);
+const marketStrip = new Element("section");
+marketStrip.id = "market-strip";
+const btcTicker = new Element("span");
+btcTicker.dataset.symbol = "BTC";
+const btcPrice = new Element("span");
+btcPrice.className = "ticker-price";
+const btcStatus = new Element("small");
+btcStatus.className = "ticker-status";
+btcTicker.appendChild(btcPrice);
+btcTicker.appendChild(btcStatus);
+marketStrip.appendChild(btcTicker);
+
+const netPositions = new Element("div");
+netPositions.id = "net-positions";
+const netUpdated = new Element("small");
+netUpdated.id = "net-updated";
+
+const positions = new Element("table");
+positions.id = "positions";
+positions.dataset.address = "0x1111111111111111111111111111111111111111";
+const positionsBody = new Element("tbody");
+positions.appendChild(positionsBody);
+
+global.document = new DocumentStub([live, timeline, collectors, marketStrip, netPositions, netUpdated, positions]);
 global.EventSource = EventSourceStub;
 global.location = {reload() {}};
 global.setInterval = () => 1;
@@ -295,15 +318,51 @@ async function testStatus() {
       },
     },
   });
+  responses.push({
+    url: "/api/hyperliquid",
+    value: {
+      ok: true,
+      async json() {
+        return {enabled: true, tickers: [{symbol: "BTC", price: "100000", status: "实时"}], net_positions: [], net_updated_at: null};
+      },
+    },
+  });
   await EventSourceStub.instance.emit("health.changed", {name: "jin10", status: "abnormal"});
   const updated = document.getElementById("s-jin10");
   assert.equal(updated.className, "st-abnormal");
   assert.equal(updated.querySelector(".status").textContent, "异常");
 }
 
+async function testHyperliquidUpdates() {
+  await EventSourceStub.instance.emit("market.updated", {
+    enabled: true,
+    tickers: [{symbol: "BTC", price: "101234.5", status: "实时"}],
+  });
+  assert.equal(btcPrice.textContent, "101234.5");
+  assert.equal(btcStatus.textContent, "实时");
+
+  await EventSourceStub.instance.emit("whales.net_position.updated", {
+    net_positions: [{coin: "BTC", long_usd: "30000000", short_usd: "12000000", net_usd: "18000000", direction: "long", updated_at: "2026-10-06T04:00:00Z"}],
+    net_updated_at: "2026-10-06T04:00:00Z",
+  });
+  assert.equal(netPositions.children.length, 1);
+  assert.equal(netPositions.children[0].dataset.coin, "BTC");
+  assert.equal(netPositions.children[0].querySelector(".net-value").textContent, "18000000");
+  assert.equal(netUpdated.textContent, "2026-10-06T04:00:00Z");
+
+  await EventSourceStub.instance.emit("position.updated", {
+    address: positions.dataset.address,
+    positions: [{coin: "BTC", dex: "主 dex", direction: "long", quantity: "2", notional_usd: "200000", entry_px: "90000", liquidation_px: "70000", liquidation_distance: "0.3", liquidation_progress: 70, leverage: "3", unrealized_pnl: "20000"}],
+  });
+  assert.equal(positionsBody.rows.length, 1);
+  assert.equal(positionsBody.rows[0].dataset.coin, "BTC");
+  assert.equal(positionsBody.rows[0].children[1].textContent, "多");
+}
+
 (async () => {
   await testTimeline();
   await testStatus();
+  await testHyperliquidUpdates();
   process.stdout.write("app DOM tests passed\n");
 })().catch((error) => {
   console.error(error);

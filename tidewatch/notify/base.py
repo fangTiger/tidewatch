@@ -12,6 +12,11 @@ SOURCE_NAMES = {
     "okx_ann": "OKX 公告",
     "hl_monitor": "Hyperliquid 巨鲸监控",
     "hl_discovery": "Hyperliquid 巨鲸发现",
+    "hl_rest": "Hyperliquid REST 对账",
+    "hl_trades_ws": "Hyperliquid 成交流",
+    "hl_core_ws": "Hyperliquid 核心流",
+    "hl_leaderboard": "Hyperliquid 排行榜",
+    "hl_profile": "Hyperliquid 画像",
 }
 
 

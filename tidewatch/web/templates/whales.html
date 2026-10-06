@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}巨鲸名单 · 观潮{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div><p class="eyebrow">HYPERLIQUID</p><h1>巨鲸名单</h1><p>最多展示 200 行，名单操作与命令行共用校验规则。</p></div>
+  <form class="add-wallet" method="post" action="/whales/actions">
+    <input type="hidden" name="action" value="add">
+    <label>添加钱包<input name="address" required placeholder="0x…" autocomplete="off"></label>
+    <button type="submit">加入重点</button>
+  </form>
+</div>
+{% if message %}<p class="notice {{ 'error' if message_kind == 'error' else 'success' }}" role="status">{{ message }}</p>{% endif %}
+<form class="filters whale-filters" method="get" action="/whales">
+  <label>账户规模 ≥<input name="account_value_min" inputmode="decimal" value="{{ filters.account_value_min or '' }}"></label>
+  <label>30 天盈亏 ≥<input name="pnl_30d_min" inputmode="decimal" value="{{ filters.pnl_30d_min or '' }}"></label>
+  <label>胜率 ≥<input name="win_rate_min" inputmode="decimal" value="{{ filters.win_rate_min or '' }}" placeholder="0–1"></label>
+  <select name="style"><option value="">全部风格</option>
+    {% for value, label in [('directional','方向型'), ('swing','波段'), ('market_maker','做市'), ('high_frequency','高频'), ('unknown','未知')] %}
+    <option value="{{ value }}" {% if filters.style == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+  </select>
+  <select name="tier"><option value="">全部层级</option>
+    {% for value, label in [('core','核心'), ('focus','重点'), ('candidate','候选')] %}
+    <option value="{{ value }}" {% if filters.tier == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+  </select>
+  <select name="has_position"><option value="">持仓不限</option><option value="1" {% if filters.has_position is sameas true %}selected{% endif %}>有持仓</option><option value="0" {% if filters.has_position is sameas false %}selected{% endif %}>无持仓</option></select>
+  <select name="sort">
+    {% for value, label in [('account_value','账户规模'), ('pnl_30d','30 天盈亏'), ('win_rate','胜率'), ('total_notional','持仓名义'), ('style','风格'), ('tier','层级'), ('has_position','是否持仓')] %}
+    <option value="{{ value }}" {% if filters.sort_by == value %}selected{% endif %}>按{{ label }}排序</option>{% endfor %}
+  </select>
+  <select name="order"><option value="desc" {% if filters.sort_order == 'desc' %}selected{% endif %}>降序</option><option value="asc" {% if filters.sort_order == 'asc' %}selected{% endif %}>升序</option></select>
+  <button type="submit">筛选</button>
+</form>
+<div class="table-scroll">
+<table id="whale-list" class="grid whale-grid">
+  <thead><tr><th>钱包</th><th>层级 / 来源</th><th>风格</th><th>账户价值</th><th>30 天盈亏</th><th>胜率</th><th>当前持仓名义</th><th>画像时间</th><th>操作</th></tr></thead>
+  <tbody>{% for wallet in wallets %}
+    <tr data-address="{{ wallet.address }}">
+      <td><a class="wallet-link" href="/whales/{{ wallet.address }}"><b>{{ wallet.display_name or wallet.short_address }}</b><code>{{ wallet.address }}</code></a>
+        {% if wallet.labels or wallet.tags %}<span class="labels">{{ (wallet.labels + wallet.tags) | join(' · ') }}</span>{% endif %}</td>
+      <td><span class="tier tier-{{ wallet.tier or 'excluded' }}">{{ {'core':'核心','focus':'重点','candidate':'候选'}.get(wallet.tier, '已排除') }}</span><small>{{ wallet.source }}</small></td>
+      <td>{{ {'directional':'方向型','swing':'波段','market_maker':'做市','high_frequency':'高频','unknown':'未知'}.get(wallet.style, wallet.style or '—') }}</td>
+      <td class="number">{{ wallet.account_value or '—' }}</td><td class="number">{{ wallet.pnl_30d or '—' }}</td>
+      <td class="number">{% if wallet.win_rate %}{{ wallet.win_rate }}{% else %}—{% endif %}</td>
+      <td class="number">{{ wallet.total_notional }}</td><td>{{ wallet.profile_updated }}</td>
+      <td class="actions">
+        <form method="post" action="/whales/actions"><input type="hidden" name="address" value="{{ wallet.address }}">
+          {% if wallet.excluded %}<button name="action" value="un_exclude">取消排除</button>
+          {% else %}<button name="action" value="{{ 'un_core' if wallet.tier == 'core' else 'core' }}">{{ '取消核心' if wallet.tier == 'core' else '标记核心' }}</button><button class="danger" name="action" value="exclude">排除</button>{% endif %}
+        </form>
+        <form class="note-form" method="post" action="/whales/actions"><input type="hidden" name="action" value="note"><input type="hidden" name="address" value="{{ wallet.address }}"><input name="note" value="{{ wallet.note or '' }}" placeholder="备注"><button>保存</button></form>
+      </td>
+    </tr>
+  {% else %}<tr class="empty"><td colspan="9">没有符合条件的钱包</td></tr>{% endfor %}</tbody>
+</table>
+</div>
+{% endblock %}

@@ -1,12 +1,15 @@
 import asyncio
 import json
 from datetime import timedelta
+from decimal import Decimal
 
 import pytest
+from sqlalchemy import insert
 
 from fakes import wait_until
 from tidewatch.models import Event, FetchResult
 from tidewatch.pipeline.sink import IngestOutcome, create_event_sink
+from tidewatch.store.tables import hl_positions, hl_wallets
 from tidewatch.web.broadcaster import Broadcaster
 from tidewatch.web.live import LiveUpdates
 
@@ -179,3 +182,58 @@ async def test_run_uses_capped_exponential_backoff_and_resets_after_success(sett
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
         await agen.aclose()
+
+
+async def test_market_updates_are_throttled_to_one_per_two_seconds(settings):
+    now = 0.0
+    sleeps: list[float] = []
+
+    def monotonic() -> float:
+        return now
+
+    async def fake_sleep(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+        await asyncio.sleep(0)
+
+    broadcaster = Broadcaster()
+    live = LiveUpdates(None, broadcaster, settings, sleep=fake_sleep, monotonic=monotonic)
+    agen = broadcaster.subscribe()
+    pending = asyncio.create_task(_next(agen))
+    await wait_until(lambda: broadcaster.subscriber_count == 1, timeout=2)
+    await asyncio.wait_for(live.on_market({"BTC": Decimal("100000"), "OTHER": Decimal("1")}), timeout=2)
+    first = await pending
+    second_pending = asyncio.create_task(_next(agen))
+    await asyncio.wait_for(live.on_market({"BTC": Decimal("100100")}), timeout=2)
+    second = await second_pending
+    assert first["event"] == second["event"] == "market.updated"
+    assert json.loads(first["data"])["tickers"][0] == {"symbol": "BTC", "price": "100000", "status": "实时"}
+    assert json.loads(second["data"])["tickers"][0]["price"] == "100100"
+    assert sleeps == [2.0]
+    await agen.aclose()
+
+
+async def test_position_commit_broadcasts_detail_and_net_position(engine, settings, clock):
+    address = "0x1111111111111111111111111111111111111111"
+    async with engine.begin() as conn:
+        await conn.execute(insert(hl_wallets).values(
+            address=address, tier="focus", source="manual", excluded=False, profile={}
+        ))
+        await conn.execute(insert(hl_positions).values(
+            address=address, dex="", coin="BTC", szi=2, entry_px=90000, liquidation_px=70000,
+            leverage=3, notional_usd=200000, unrealized_pnl=1000, updated_at=clock.now,
+        ))
+    broadcaster = Broadcaster()
+    live = LiveUpdates(engine, broadcaster, settings, clock=clock)
+    agen = broadcaster.subscribe()
+    first = asyncio.create_task(_next(agen))
+    await wait_until(lambda: broadcaster.subscriber_count == 1, timeout=2)
+    await asyncio.wait_for(live.on_position(address, {"BTC": Decimal("100000")}), timeout=2)
+    messages = [await first, await _next(agen)]
+    assert [message["event"] for message in messages] == ["position.updated", "whales.net_position.updated"]
+    detail = json.loads(messages[0]["data"])
+    net = json.loads(messages[1]["data"])
+    assert detail["address"] == address and detail["positions"][0]["coin"] == "BTC"
+    assert net["net_positions"][0]["net_usd"] == "200000"
+    await agen.aclose()

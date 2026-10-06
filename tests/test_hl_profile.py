@@ -179,6 +179,7 @@ def test_metric_example_matches_hand_calculation_and_discloses_every_sample():
     assert profile["account_value"] == "2500"
     assert profile["total_pnl"] == "40"
     assert profile["pnl_30d"] == "30"
+    assert profile["pnl_history"] == [[1, "0"], [2, "100"], [3, "40"]]
     assert profile["volume_total"] == "1000"
     assert profile["volume_30d"] == "300"
     assert profile["max_drawdown"] == "60"

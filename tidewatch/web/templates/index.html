@@ -1,5 +1,17 @@
 {% extends "base.html" %}
 {% block content %}
+<section id="market-strip" class="market-strip" aria-label="Hyperliquid 行情">
+  <span class="section-label">行情</span>
+  {% for ticker in hyperliquid.tickers %}
+  <span class="ticker" data-symbol="{{ ticker.symbol }}" data-status="{{ ticker.status }}">
+    <b>{{ ticker.symbol }}</b>
+    <span class="ticker-price">{{ ticker.price or '—' }}</span>
+    <small class="ticker-status">{{ ticker.status }}</small>
+  </span>
+  {% endfor %}
+</section>
+<div class="dashboard-layout">
+<section class="timeline-panel">
 <form class="filters" method="get" action="/">
   <select name="category">
     <option value="">全部类别</option>
@@ -31,4 +43,23 @@
     {% endfor %}
   </tbody>
 </table>
+</section>
+<aside class="net-panel" aria-labelledby="net-title">
+  <div class="panel-heading">
+    <h2 id="net-title">巨鲸净仓位</h2>
+    <small id="net-updated">{{ hyperliquid.net_updated_at or ('未启用' if not hyperliquid.enabled else '暂无有效快照') }}</small>
+  </div>
+  <div id="net-positions">
+    {% for row in hyperliquid.net_positions %}
+    <article class="net-row" data-coin="{{ row.coin }}">
+      <div><b>{{ row.coin }}</b><span class="net-value {{ row.direction }}">{{ row.net_usd }}</span></div>
+      <dl><dt>多</dt><dd>{{ row.long_usd }}</dd><dt>空</dt><dd>{{ row.short_usd }}</dd></dl>
+    </article>
+    {% else %}
+    <p class="empty-state">{{ '未启用' if not hyperliquid.enabled else '暂无有效仓位' }}</p>
+    {% endfor %}
+  </div>
+  <p class="scope-note">仅统计核心与重点钱包；候选、排除及陈旧快照不计。</p>
+</aside>
+</div>
 {% endblock %}

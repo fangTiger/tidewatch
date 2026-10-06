@@ -275,6 +275,7 @@ def calculate_wallet_profile(
         "account_value": _decimal_text(account_value),
         "total_pnl": _decimal_text(total_pnl),
         "pnl_30d": _decimal_text(pnl_30d),
+        "pnl_history": list(all_time.get("pnlHistory") or []) if isinstance(all_time, Mapping) else [],
         "volume_total": _decimal_text(volume_total),
         "volume_30d": _decimal_text(volume_30d),
         "max_drawdown": _decimal_text(drawdown),

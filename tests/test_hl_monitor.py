@@ -157,6 +157,45 @@ async def test_first_reconcile_with_existing_positions_only_establishes_baseline
     assert [call["type"] for call in calls] == ["clearinghouseState", "userAbstraction"]
 
 
+async def test_web_callbacks_run_after_position_commit_and_market_update(engine, settings, clock):
+    """M6 SSE 回调只能观察到已提交仓位，行情回调收到原子更新后的完整 mids。"""
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            if request_type == "clearinghouseState":
+                return True, _state(szi="2", value="200000")
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            raise AssertionError(request_type)
+
+    async with engine.begin() as conn:
+        await conn.execute(insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual"))
+    committed: list[tuple[str, Decimal]] = []
+    markets: list[dict[str, Decimal]] = []
+
+    async def on_position(address: str, mids) -> None:
+        async with engine.connect() as conn:
+            size = await conn.scalar(select(hl_positions.c.szi).where(hl_positions.c.address == address))
+        committed.append((address, Decimal(size)))
+
+    async def on_market(mids) -> None:
+        markets.append(dict(mids))
+
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=None,
+        clock=clock,
+        on_position=on_position,
+        on_market=on_market,
+    )
+    assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=3)
+    await asyncio.wait_for(monitor.update_mids({"BTC": "100000", "ETH": "4000"}), timeout=3)
+    assert committed == [(ADDRESS, Decimal("2"))]
+    assert markets == [{"BTC": Decimal("100000"), "ETH": Decimal("4000")}]
+
+
 async def test_open_after_baseline_emits_one_event(engine, settings, clock):
     clearing_calls = 0
 

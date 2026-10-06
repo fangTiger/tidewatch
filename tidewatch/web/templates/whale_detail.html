@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}{{ detail.wallet.display_name or detail.wallet.short_address }} · 观潮{% endblock %}
+{% block content %}
+<div class="detail-heading"><a href="/whales">← 返回巨鲸名单</a><p class="eyebrow">钱包画像</p><h1>{{ detail.wallet.display_name or detail.wallet.short_address }}</h1><code>{{ detail.wallet.address }}</code></div>
+<section class="kpi-grid" aria-label="钱包画像指标">
+  {% for key, label in [('account_value','账户价值'),('total_pnl','累计盈亏'),('pnl_30d','30 天盈亏'),('volume_total','累计成交量'),('volume_30d','30 天成交量'),('max_drawdown','最大回撤'),('max_drawdown_ratio','最大回撤率'),('win_rate','胜率'),('profit_loss_ratio','盈亏比'),('holding_duration_avg_s','平均持仓秒数'),('holding_duration_median_s','中位持仓秒数'),('open_rounds','未闭合持仓轮次'),('daily_fill_count','日均成交'),('passive_fill_ratio','挂单占比'),('actual_leverage','实际杠杆')] %}
+  {% set coverage = detail.coverage.get(key) or detail.coverage.get('holding_duration' if key.startswith('holding_duration') else key) %}
+  <article class="kpi"><span>{{ label }}</span><strong>{{ detail.profile.get(key) if detail.profile.get(key) is not none else '—' }}</strong>
+    {% if coverage and (not coverage.sufficient or not coverage.complete) %}<small class="insufficient">{{ coverage.reason or ('历史不完整' if not coverage.complete else '数据不足') }}</small>{% endif %}
+  </article>{% endfor %}
+  <article class="kpi"><span>偏好币种</span><strong>{% for item in detail.profile.get('preferred_coins', []) %}{{ item.coin }}{% if not loop.last %} / {% endif %}{% else %}—{% endfor %}</strong>
+    {% set coverage = detail.coverage.get('preferred_coins') %}{% if coverage and (not coverage.sufficient or not coverage.complete) %}<small class="insufficient">{{ coverage.reason or '历史不完整' }}</small>{% endif %}</article>
+  <article class="kpi"><span>配置杠杆</span><strong>{% for coin, value in detail.profile.get('configured_leverage', {}).items() %}{{ coin }} {{ value }}×{% if not loop.last %} / {% endif %}{% else %}—{% endfor %}</strong>
+    {% set coverage = detail.coverage.get('configured_leverage') %}{% if coverage and (not coverage.sufficient or not coverage.complete) %}<small class="insufficient">{{ coverage.reason or '数据不足' }}</small>{% endif %}</article>
+</section>
+<section class="detail-card chart-card"><div class="panel-heading"><h2>盈亏曲线</h2><small>{{ detail.wallet.profile_updated }}</small></div>
+  {% if detail.pnl_history %}<svg id="pnl-chart" viewBox="0 0 800 220" role="img" aria-label="累计盈亏曲线" data-history='{{ detail.pnl_history | tojson }}'></svg>{% else %}<p class="empty-state">数据不足：暂无 portfolio pnlHistory</p>{% endif %}
+</section>
+<section class="detail-card"><h2>当前仓位</h2><div class="table-scroll"><table id="positions" class="grid" data-address="{{ detail.wallet.address }}"><thead><tr><th>币种 / dex</th><th>方向</th><th>数量</th><th>名义</th><th>开仓价</th><th>强平价</th><th>距强平</th><th>杠杆</th><th>未实现盈亏</th></tr></thead><tbody>
+  {% for position in detail.positions %}<tr data-coin="{{ position.coin }}" data-dex="{{ position.dex }}"><td><b>{{ position.coin }}</b><small>{{ position.dex }}</small></td><td class="{{ position.direction }}">{{ '多' if position.direction == 'long' else '空' }}</td><td>{{ position.quantity }}</td><td>{{ position.notional_usd or '—' }}</td><td>{{ position.entry_px or '—' }}</td><td>{{ position.liquidation_px or '—' }}</td><td><span>{{ position.liquidation_distance or '—' }}</span><progress max="100" value="{{ position.liquidation_progress }}">{{ position.liquidation_progress }}</progress></td><td>{{ position.leverage or '—' }}</td><td>{{ position.unrealized_pnl or '—' }}</td></tr>
+  {% else %}<tr class="empty"><td colspan="9">当前没有仓位</td></tr>{% endfor %}</tbody></table></div>
+</section>
+<section class="detail-card"><h2>最近操作</h2><ol class="operations">{% for item in detail.operations %}<li><time>{{ item.occurred_at }}</time><span>{{ '事件' if item.kind == 'event' else '成交' }}</span><b>{{ item.title }}</b><small>{{ item.coin or '' }} {{ item.amount_usd or '' }}</small></li>{% else %}<li class="empty-state">暂无最近操作</li>{% endfor %}</ol></section>
+{% endblock %}

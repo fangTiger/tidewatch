@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -220,6 +220,8 @@ class HyperliquidMonitor:
         fill_lookup_timeout_s: float = 5.0,
         deferred_fill_lookup_timeout_s: float | None = None,
         account_lookup_timeout_s: float = 5.0,
+        on_position: Callable[[str, Mapping[str, Decimal]], Awaitable[None]] | None = None,
+        on_market: Callable[[Mapping[str, Decimal]], Awaitable[None]] | None = None,
     ) -> None:
         deferred_timeout = (
             cfg.frequencies.deferred_fill_lookup_timeout_s
@@ -240,6 +242,8 @@ class HyperliquidMonitor:
         self.fill_lookup_timeout_s = fill_lookup_timeout_s
         self.deferred_fill_lookup_timeout_s = deferred_timeout
         self.account_lookup_timeout_s = account_lookup_timeout_s
+        self.on_position = on_position
+        self.on_market = on_market
         self.mids: dict[str, Decimal] = {}
         self._account_types: dict[str, Any] = {}
         self._account_type_cached_at: dict[str, datetime] = {}
@@ -663,6 +667,11 @@ class HyperliquidMonitor:
                     result.liquidation_risk_state,
                     self.clock(),
                 )
+        if self.on_market is not None:
+            try:
+                await self.on_market(dict(self.mids))
+            except Exception:
+                logger.exception("广播 Hyperliquid 行情更新失败")
 
     async def hot_wallets(self) -> list[HotWallet]:
         """读取重点钱包当前仓位并计算热点集合。"""
@@ -856,6 +865,11 @@ class HyperliquidMonitor:
             else:
                 assert baseline_at is not None
                 await save_last_observed_at(conn, address, baseline_at, now)
+        if self.on_position is not None:
+            try:
+                await self.on_position(address, dict(self.mids))
+            except Exception:
+                logger.exception("广播钱包 %s…%s 仓位更新失败", address[:6], address[-4:])
         if establishing_baseline:
             for key in [key for key in self._recent_fills if key[0] == address]:
                 self._recent_fills.pop(key, None)
