@@ -126,6 +126,50 @@ def test_close_and_reverse_use_original_and_new_position_notionals(settings):
     assert reversed_events[0].dedupe_key != reversed_events[1].dedupe_key
 
 
+@pytest.mark.parametrize(
+    ("coin", "notional"),
+    [
+        ("CHIP", "16"),
+        ("CRV", "25"),
+        ("PAXG", "32"),
+        ("RENDER", "62"),
+        ("SAGA", "116"),
+        ("WLD", "116"),
+    ],
+)
+def test_real_small_closes_below_tier_threshold_are_suppressed(
+    settings, coin, notional
+):
+    previous = _position(coin, "1", notional)
+
+    assert detect_events(previous, _zero(coin), cfg=settings.hyperliquid) == []
+
+
+@pytest.mark.parametrize(
+    ("coin", "old_notional", "new_notional", "expected_types"),
+    [
+        ("WLD", "250000", "304", ["hl_close"]),
+        ("UMA", "1397", "2083", []),
+        ("UMA", "1397", "250000", ["hl_open"]),
+    ],
+)
+def test_reverse_applies_tier_threshold_to_each_side_independently(
+    settings, coin, old_notional, new_notional, expected_types
+):
+    previous = _position(coin, "1", old_notional)
+    current = _position(
+        coin,
+        "-1",
+        new_notional,
+        at=NOW + timedelta(seconds=1),
+    )
+
+    assert [
+        event.event_type
+        for event in detect_events(previous, current, cfg=settings.hyperliquid)
+    ] == expected_types
+
+
 def test_snapshot_dedupe_key_and_occurred_at_are_stable_across_retries(settings):
     current = _position("BTC", "10", "1000000", at=NOW + timedelta(milliseconds=123))
     first = detect_events(_zero("BTC"), current, cfg=settings.hyperliquid)

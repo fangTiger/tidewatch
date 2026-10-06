@@ -127,23 +127,8 @@ def detect_events_with_state(
                 )
             )
     elif old_szi != 0 and new_szi == 0:
-        events.append(
-            _position_event(
-                "hl_close",
-                previous,
-                amount=previous.notional_usd,
-                quantity=old_abs,
-                occurred_at=timestamp,
-                suffix=suffix,
-                cfg=cfg,
-                fill=evidence,
-                mark_px=mark_px,
-                wallet=wallet,
-            )
-        )
-    elif old_szi * new_szi < 0:
-        events.extend(
-            (
+        if previous.notional_usd >= threshold:
+            events.append(
                 _position_event(
                     "hl_close",
                     previous,
@@ -155,7 +140,26 @@ def detect_events_with_state(
                     fill=evidence,
                     mark_px=mark_px,
                     wallet=wallet,
-                ),
+                )
+            )
+    elif old_szi * new_szi < 0:
+        if previous.notional_usd >= threshold:
+            events.append(
+                _position_event(
+                    "hl_close",
+                    previous,
+                    amount=previous.notional_usd,
+                    quantity=old_abs,
+                    occurred_at=timestamp,
+                    suffix=suffix,
+                    cfg=cfg,
+                    fill=evidence,
+                    mark_px=mark_px,
+                    wallet=wallet,
+                )
+            )
+        if current.notional_usd >= threshold:
+            events.append(
                 _position_event(
                     "hl_open",
                     current,
@@ -167,9 +171,8 @@ def detect_events_with_state(
                     fill=evidence,
                     mark_px=mark_px,
                     wallet=wallet,
-                ),
+                )
             )
-        )
     elif same_side and old_abs != new_abs:
         quantity = abs(new_abs - old_abs)
         ratio = quantity / old_abs

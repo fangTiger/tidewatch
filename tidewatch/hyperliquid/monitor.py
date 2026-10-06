@@ -446,6 +446,12 @@ class HyperliquidMonitor:
             result = await self._lookup_fill_evidence(address, set(coins), remember=False)
             if result.status is _FillLookupStatus.TIMEOUT:
                 self._log_fill_timeout(address, deferred=True)
+            elif result.status is _FillLookupStatus.DEFERRED:
+                logger.debug(
+                    "钱包 %s…%s 延期成交补查因 REST 预算不足，将继续顺延",
+                    address[:6],
+                    address[-4:],
+                )
 
     async def _defer_fill_query(
         self,
@@ -921,7 +927,7 @@ class HyperliquidMonitor:
         log = logger.warning if emit_warning else logger.debug
         if deferred:
             log(
-                "钱包 %s…%s 延期成交补查超过 %g 秒，将继续顺延",
+                "钱包 %s…%s 延期成交补查超过 %g 秒，将继续顺延（真实网络超时）",
                 address[:6],
                 address[-4:],
                 self.fill_lookup_timeout_s,

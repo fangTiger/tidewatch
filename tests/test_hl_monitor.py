@@ -35,14 +35,20 @@ ADDRESS = "0x1234567890abcdef1234567890abcdef12345678"
 OTHER = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
 
 
-def _state(*, szi: str = "60", value: str = "6000000", liquidation_px: str = "95") -> dict:
+def _state(
+    *,
+    coin: str = "BTC",
+    szi: str = "60",
+    value: str = "6000000",
+    liquidation_px: str | None = "95",
+) -> dict:
     return {
         "marginSummary": {"accountValue": "800000", "totalNtlPos": value},
         "assetPositions": [
             {
                 "type": "oneWay",
                 "position": {
-                    "coin": "BTC",
+                    "coin": coin,
                     "szi": szi,
                     "leverage": {"type": "cross", "value": 20},
                     "entryPx": "100000",
@@ -219,6 +225,120 @@ async def test_stale_snapshot_change_without_fill_is_backfill_and_not_pushed(
     assert row.occurred_at == baseline_at
     assert row.raw["backfill"] is True
     assert push_count == 0
+
+
+async def test_backfill_path_does_not_persist_real_small_close(
+    engine, settings, clock
+):
+    clearing_calls = 0
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            nonlocal clearing_calls
+            if request_type == "clearinghouseState":
+                clearing_calls += 1
+                state = (
+                    _state(
+                        coin="WLD",
+                        szi="1",
+                        value="116",
+                        liquidation_px=None,
+                    )
+                    if clearing_calls == 1
+                    else _empty_state()
+                )
+                return True, state
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            if request_type in {"userFillsByTime", "userTwapSliceFills"}:
+                return True, []
+            raise AssertionError(request_type)
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual")
+        )
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=sink,
+        clock=clock,
+    )
+    try:
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
+        clock.advance(minutes=30)
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        event_count = await conn.scalar(select(func.count()).select_from(events))
+    assert event_count == 0
+
+
+async def test_core_ws_path_does_not_persist_real_small_reverse(
+    engine, settings, clock
+):
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            raise AssertionError(request_type)
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="core", source="manual")
+        )
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=sink,
+        clock=clock,
+    )
+    first = {
+        "channel": "allDexsClearinghouseState",
+        "data": {
+            "user": ADDRESS,
+            "clearinghouseStates": {
+                "": _state(
+                    coin="UMA",
+                    szi="1",
+                    value="1397",
+                    liquidation_px=None,
+                )
+            },
+        },
+    }
+    second = {
+        "channel": "allDexsClearinghouseState",
+        "data": {
+            "user": ADDRESS,
+            "clearinghouseStates": {
+                "": _state(
+                    coin="UMA",
+                    szi="-1",
+                    value="2083",
+                    liquidation_px=None,
+                )
+            },
+        },
+    }
+    try:
+        await asyncio.wait_for(monitor.handle_core_message(first), timeout=5)
+        clock.advance(seconds=5)
+        await asyncio.wait_for(monitor.handle_core_message(second), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        event_count = await conn.scalar(select(func.count()).select_from(events))
+    assert event_count == 0
 
 
 async def test_missing_fill_cursor_starts_at_baseline_and_ignores_historical_liquidation(
@@ -780,6 +900,108 @@ async def test_fill_lookup_timeout_does_not_hold_snapshot_event(
         record for record in caplog.records if "成交补查超过" in record.message
     ]
     assert [record.levelname for record in timeout_records] == ["WARNING", "DEBUG", "WARNING"]
+
+
+async def test_deferred_fill_timeout_is_wallet_rate_limited_and_identifies_real_timeout(
+    engine, settings, clock, caplog
+):
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            if request_type == "userFillsByTime":
+                await asyncio.Event().wait()
+            raise AssertionError(request_type)
+
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=None,
+        clock=clock,
+        fill_lookup_timeout_s=0.01,
+    )
+    await _seed_baseline(engine, clock)
+    await asyncio.wait_for(
+        monitor._defer_fill_query(ADDRESS, {"BTC"}, clock.now), timeout=5
+    )
+    caplog.set_level("DEBUG", logger="tidewatch.hyperliquid.monitor")
+
+    await asyncio.wait_for(monitor.run_due_fill_queries(), timeout=1)
+    clock.advance(seconds=1)
+    await asyncio.wait_for(monitor.run_due_fill_queries(), timeout=1)
+    clock.advance(
+        seconds=settings.hyperliquid.frequencies.fill_timeout_warning_interval_s
+    )
+    await asyncio.wait_for(monitor.run_due_fill_queries(), timeout=1)
+
+    records = [
+        record
+        for record in caplog.records
+        if "延期成交补查超过" in record.message
+    ]
+    assert [record.levelname for record in records] == ["WARNING", "DEBUG", "WARNING"]
+    assert all("真实网络超时" in record.message for record in records)
+
+
+def test_normal_and_deferred_fill_timeouts_share_wallet_warning_limit(
+    engine, settings, clock, caplog
+):
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=None,
+        sink=None,
+        clock=clock,
+    )
+    caplog.set_level("DEBUG", logger="tidewatch.hyperliquid.monitor")
+
+    monitor._log_fill_timeout(ADDRESS)
+    monitor._log_fill_timeout(ADDRESS, deferred=True)
+    monitor._log_fill_timeout(OTHER, deferred=True)
+
+    records = [
+        record for record in caplog.records if "成交补查超过" in record.message
+    ]
+    assert [record.levelname for record in records] == ["WARNING", "DEBUG", "WARNING"]
+
+
+async def test_deferred_fill_budget_deferral_is_debug_not_timeout(
+    engine, settings, clock, caplog
+):
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            if request_type == "userFillsByTime":
+                return False, None
+            raise AssertionError(request_type)
+
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=None,
+        clock=clock,
+    )
+    await _seed_baseline(engine, clock)
+    assert await asyncio.wait_for(
+        monitor.lookup_fill_evidence(ADDRESS, {"BTC"}), timeout=5
+    ) is None
+    caplog.set_level("DEBUG", logger="tidewatch.hyperliquid.monitor")
+    caplog.clear()
+    clock.advance(seconds=1)
+
+    await asyncio.wait_for(monitor.run_due_fill_queries(), timeout=5)
+
+    records = [
+        record
+        for record in caplog.records
+        if "延期成交补查" in record.message
+    ]
+    assert [(record.levelname, record.message) for record in records] == [
+        (
+            "DEBUG",
+            f"钱包 {ADDRESS[:6]}…{ADDRESS[-4:]} 延期成交补查因 REST 预算不足，将继续顺延",
+        )
+    ]
+    assert not any("超过" in record.message for record in records)
 
 
 async def test_empty_account_lookup_errors_use_exception_type(
