@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tracemalloc
 from decimal import Decimal
 from pathlib import Path
 
@@ -147,3 +148,47 @@ async def test_parser_rejects_unbounded_single_row():
     with pytest.raises(ValueError, match="单条记录超过"):
         async for _ in iter_leaderboard_rows(stream(), max_buffer_chars=1024):
             pass
+
+
+@async_timeout(60)
+async def test_synthetic_forty_mb_leaderboard_peak_memory_below_limit():
+    """流式合成大响应，不在仓库落盘；验证解析峰值内存与 Top-N。"""
+    row_count = 55_000
+    padding = "榜" * 220
+    emitted = 0
+
+    class GeneratedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            nonlocal emitted
+            yield b'{"leaderboardRows":['
+            for index in range(row_count):
+                row = {
+                    "ethAddress": f"0x{index + 1:040x}",
+                    "accountValue": str(1_000_000 + index),
+                    "displayName": padding,
+                }
+                chunk = (("," if index else "") + json.dumps(row, ensure_ascii=False)).encode()
+                emitted += len(chunk)
+                yield chunk
+            yield b"]}"
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=GeneratedStream())
+
+    tracemalloc.start()
+    try:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await LeaderboardSource(
+                client=client,
+                url="https://example.test/leaderboard",
+            ).fetch_top(limit=10)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert emitted >= 40 * 1024 * 1024
+    assert peak < 32 * 1024 * 1024
+    assert [entry.account_value for entry in result] == [
+        Decimal(1_000_000 + index)
+        for index in range(row_count - 1, row_count - 11, -1)
+    ]

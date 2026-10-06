@@ -4,7 +4,7 @@ import logging
 import pytest
 from sqlalchemy import select
 
-from fakes import FakeNotifier
+from fakes import FakeNotifier, async_timeout
 from tidewatch.health import HealthMonitor
 from tidewatch.notify.base import SendResult
 from tidewatch.store.tables import collector_state
@@ -82,6 +82,51 @@ async def test_load_restores_alert_time_after_restart(engine, settings, clock):
     for _ in range(5):
         await restarted.failure("jin10", "超时")
     assert [ok for _, ok, _ in notifier.health] == [False, True]  # 1 小时内不再告警
+
+
+@async_timeout()
+async def test_load_persists_registered_sources_on_empty_database_without_overwrite(
+    engine, settings, clock
+):
+    """冷启动状态页必须立即看见子源，重启又不能抹掉已有状态与时间。"""
+    names = (
+        "hl_rest",
+        "hl_trades_ws",
+        "hl_core_ws",
+        "hl_leaderboard",
+        "hl_profile",
+    )
+    first = HealthMonitor(engine, FakeNotifier(), settings.dispatch, clock=clock)
+    for name in names:
+        first.register(name, stale_after_s=300)
+    await first.load()
+
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                select(collector_state).where(collector_state.c.name.in_(names))
+            )
+        ).mappings().all()
+    assert {row["name"] for row in rows} == set(names)
+    assert all(row["status"] == "unknown" for row in rows)
+    assert all(row["last_success_at"] is None for row in rows)
+
+    await first.success("hl_rest")
+    succeeded_at = clock.now
+    clock.advance(minutes=1)
+    restarted = HealthMonitor(engine, FakeNotifier(), settings.dispatch, clock=clock)
+    for name in names:
+        restarted.register(name, stale_after_s=300)
+    await restarted.load()
+
+    async with engine.connect() as conn:
+        restored = (
+            await conn.execute(
+                select(collector_state).where(collector_state.c.name == "hl_rest")
+            )
+        ).mappings().one()
+    assert restored["status"] == "normal"
+    assert restored["last_success_at"] == succeeded_at
 
 
 async def test_stale_detection(engine, settings, clock):

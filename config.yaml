@@ -19,6 +19,8 @@ hyperliquid:
   profile_failure_ratio_threshold: 0.1
   # 高频地址首次 10,000 条回溯仅成交响应权重即可达 600，需容纳至少 3 分钟令牌等待。
   profile_wallet_timeout_s: 600
+  # 画像使用最近 30 天成交，保留期不得低于画像窗口。
+  fill_retention_days: 90
   rest_burst_window_s: 10
   aimd_min_budget_per_min: 120
   aimd_recovery_interval_s: 60
@@ -32,8 +34,8 @@ hyperliquid:
     hot_reconcile_aging_s: 30
     normal_reconcile_aging_s: 120
     fill_query_min_interval_s: 60
-    # userAbstraction 按官方通用 20 权重计费，缓存 6 小时以守住监控预算。
-    account_type_cache_s: 21600
+    # 账户类型极少变化；后台低优先级补查并持久化 24 小时，重启后复用。
+    account_type_cache_s: 86400
     deferred_fill_lookup_timeout_s: 15
     fill_timeout_warning_interval_s: 1800
     leaderboard_interval_s: 43200

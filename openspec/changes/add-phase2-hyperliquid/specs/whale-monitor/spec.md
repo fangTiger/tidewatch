@@ -42,7 +42,7 @@
 - **THEN** 系统仅将排序最靠前的 30 个按 20 秒频率对账，其余仍按普通重点钱包频率对账
 
 ### Requirement: 多 dex 与统一账户状态
-系统 SHALL 根据 `userAbstraction` 识别统一账户/组合保证金；其账户价值 MUST 等于 `clearinghouseState` 权益加 `spotClearinghouseState` 的 USDC。主 dex 以外的 HIP-3 仓位 MUST 按 dex 参数分别查询。当前仓位 MUST 幂等保存到以（地址, dex, 币种）为键的 `hl_positions`。
+系统 SHALL 让仓位变化检测关键路径只等待主 `clearinghouseState` 与当前有仓位的 HIP-3 dex 状态，不得等待 `userAbstraction` 或 `spotClearinghouseState`。账户类型 MUST 使用批处理预算在后台低优先级刷新到 `hl_state`，带查询时间且 TTL 默认 24 小时，重启后 MUST 直接读取最近持久化结果。系统 SHALL 根据该结果识别统一账户/组合保证金；其账户价值 MUST 等于 `clearinghouseState` 权益加最近一次 `spotClearinghouseState` 的 USDC。账户元数据缺失时，账户价值与实际杠杆 MUST 保持待更新，不得阻塞仓位对账。主 dex 以外当前有仓位的 HIP-3 dex MUST 按 dex 参数分别查询。当前仓位 MUST 幂等保存到以（地址, dex, 币种）为键的 `hl_positions`。
 
 #### Scenario: 统一账户权益
 - **WHEN** 统一账户合约权益为 800,000 美元且现货 USDC 为 300,000 美元
@@ -51,6 +51,14 @@
 #### Scenario: HIP-3 仓位不被主 dex 覆盖
 - **WHEN** 同一钱包在主 dex 和一个 HIP-3 dex 持有同名币种仓位
 - **THEN** 两个快照按不同 dex 分别保存和比较
+
+#### Scenario: 冷启动账户元数据缺失
+- **WHEN** 重启后 200 个重点钱包均无持久化账户类型
+- **THEN** 首轮仓位对账不请求账户类型，主状态总权重为 400；在 600 权重/分钟、单请求 0.8 秒、并发 4 的假设下保守估算不超过 3 分钟
+
+#### Scenario: 冷启动复用账户元数据
+- **WHEN** 钱包已有未过期或最近一次持久化账户类型与现货状态
+- **THEN** 对账直接用于账户价值与实际杠杆计算，且仍不在关键路径发起账户元数据请求
 
 ### Requirement: 成交补查与增量存储
 系统 SHALL 在重点钱包仓位变化后查询从上次游标起的 `userFillsByTime`，同钱包相邻查询至少间隔 60 秒；未找到对应成交时再查询 `userTwapSliceFills`。名单内成交 MUST 幂等写入 `hl_fills`，并更新 `hl_state` 游标；TWAP 的全零 hash MUST NOT 被用作唯一去重依据。

@@ -31,7 +31,11 @@
 - **THEN** 系统停止新采集、等待当前命令提交或回滚，再关闭 REST/WS 与数据库连接
 
 ### Requirement: 五个健康子源
-系统 SHALL 通过一期 `HealthMonitor.register/success/failure` 分别管理 `hl_rest`、`hl_trades_ws`、`hl_core_ws`、`hl_leaderboard`、`hl_profile`。各子源 MUST 独立累计失败、持久化到 `collector_state`、触发每源每小时最多一次的健康告警并在恢复时通知。画像与排行榜的 `stale_after` MUST 按低频周期设置，实时源按请求或心跳周期设置。
+系统 SHALL 通过一期 `HealthMonitor.register/success/failure` 分别管理 `hl_rest`、`hl_trades_ws`、`hl_core_ws`、`hl_leaderboard`、`hl_profile`。启动加载健康状态时，每个已登记子源 MUST 在 `collector_state` 至少有一行 `status=unknown` 的记录，且不得覆盖已有状态或时间。各子源 MUST 独立累计失败、持久化到 `collector_state`、触发每源每小时最多一次的健康告警并在恢复时通知。画像与排行榜的 `stale_after` MUST 按低频周期设置，实时源按请求或心跳周期设置。
+
+#### Scenario: 空库冷启动展示五个子源
+- **WHEN** `collector_state` 为空且 Hyperliquid 注册五个子源后启动
+- **THEN** 数据库与状态页立即存在五行 `unknown` 状态，尚未运行的子源不会被伪装为正常
 
 #### Scenario: 子源告警互不连带
 - **WHEN** `hl_profile` 连续批次失败达到异常条件，而其他四个子源持续成功
@@ -49,8 +53,12 @@
 - **THEN** Git 不把该文件列为未跟踪文件，而 `tests/fixtures/hyperliquid/` 下的测试夹具仍可被跟踪
 
 ### Requirement: 中文运行日志与限流诊断
-系统 SHALL 沿用一期中文日志，记录 Hyperliquid 子源、钱包短地址、请求种类、权重、队列优先级、冷却时长、有效速率和健康状态，但 MUST NOT 记录密钥或完整私有配置。每个 429 冷却期的首次限流只记一行 WARNING，包含冷却秒数、最近一分钟 429 次数与代理模式，不得打印 Traceback；同一冷却期内已经在途请求产生的后续 429 降为 DEBUG。其他非预期异常仍记 ERROR 与堆栈。切换代理节点的提示 MUST 说明出口 IP 会变化。
+系统 SHALL 沿用一期中文日志，记录 Hyperliquid 子源、钱包短地址、请求种类、权重、队列优先级、冷却时长、有效速率和健康状态，但 MUST NOT 记录密钥、完整 42 字符钱包地址、SQL 参数或完整私有配置。异常日志 MUST 只记录异常类型与脱敏后的可读原因，不得直接打印原始异常文本或 Traceback。每个 429 冷却期的首次限流只记一行 WARNING，包含冷却秒数、最近一分钟 429 次数与代理模式；同一冷却期内已经在途请求产生的后续 429 降为 DEBUG。切换代理节点的提示 MUST 说明出口 IP 会变化。
 
 #### Scenario: 429 日志可诊断
 - **WHEN** `hl_rest` 收到一次 429 并进入 2 秒冷却
 - **THEN** 中文 WARNING 仅占一行，包含子源、请求类型、权重、冷却时长、最近一分钟 429 次数与 `global`/`direct` 模式，不包含密钥或 Traceback
+
+#### Scenario: 异常文本包含地址与 SQL 参数
+- **WHEN** 钱包对账异常原文含完整地址、SQL 与绑定参数
+- **THEN** ERROR 只包含 `0x1234…abcd` 形式短地址、异常类型和脱敏原因，不含完整地址、参数或 Traceback

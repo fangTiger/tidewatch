@@ -170,6 +170,7 @@ hl_fills = Table(
 )
 Index("ix_hl_fills_address_occurred_at", hl_fills.c.address, hl_fills.c.occurred_at)
 Index("ix_hl_fills_coin_occurred_at", hl_fills.c.coin, hl_fills.c.occurred_at)
+Index("ix_hl_fills_occurred_at", hl_fills.c.occurred_at)
 
 
 hl_state = Table(

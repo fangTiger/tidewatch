@@ -97,4 +97,5 @@ def test_hyperliquid_table_metadata_contract():
     assert {index.name for index in fills.indexes} >= {
         "ix_hl_fills_address_occurred_at",
         "ix_hl_fills_coin_occurred_at",
+        "ix_hl_fills_occurred_at",
     }

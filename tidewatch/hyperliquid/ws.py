@@ -13,7 +13,8 @@ from typing import Any
 
 from websockets.asyncio.client import connect as websocket_connect
 
-from tidewatch.collectors.base import Backoff, describe
+from tidewatch.collectors.base import Backoff
+from tidewatch.hyperliquid.logging import exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +151,11 @@ class HyperliquidWsManager:
         except Exception as exc:
             connection = self._connection(name)
             await self._report_failure(connection.health_source, exc)
-            logger.warning("WS 连接 %s 动态订阅发送失败，将在重连后恢复：%s", name, describe(exc))
+            logger.warning(
+                "WS 连接 %s 动态订阅发送失败，将在重连后恢复：%s",
+                name,
+                exception_summary(exc),
+            )
 
     async def run(self) -> None:
         """运行全部逻辑连接，并接纳运行期间新增的连接。"""
@@ -240,7 +245,7 @@ class HyperliquidWsManager:
                     "子源 %s 的 WS 连接 %s 断开：%s；%g 秒后重连，代理模式 %s",
                     connection.health_source,
                     name,
-                    describe(exc),
+                    exception_summary(exc),
                     delay,
                     self.proxy_mode,
                 )
@@ -275,16 +280,20 @@ class HyperliquidWsManager:
             return
         try:
             await self.health.success(source)
-        except Exception:
-            logger.exception("子源 %s 健康成功状态上报失败", source)
+        except Exception as exc:
+            logger.error("子源 %s 健康成功状态上报失败：%s", source, exception_summary(exc))
 
     async def _report_failure(self, source: str, exc: BaseException) -> None:
         if self.health is None:
             return
         try:
-            await self.health.failure(source, describe(exc))
-        except Exception:
-            logger.exception("子源 %s 健康失败状态上报失败", source)
+            await self.health.failure(source, exception_summary(exc))
+        except Exception as report_exc:
+            logger.error(
+                "子源 %s 健康失败状态上报失败：%s",
+                source,
+                exception_summary(report_exc),
+            )
 
     async def aclose(self) -> None:
         """唤醒等待并主动关闭在途连接，使接收循环及时退出。"""

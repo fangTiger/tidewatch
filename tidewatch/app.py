@@ -20,6 +20,7 @@ from tidewatch.collectors.jin10 import Jin10Collector
 from tidewatch.collectors.okx_ann import OkxAnnCollector
 from tidewatch.config import ConfigError, Settings, load_settings
 from tidewatch.health import HealthMonitor
+from tidewatch.hyperliquid.logging import exception_summary
 from tidewatch.hyperliquid.runtime import HyperliquidRuntime
 from tidewatch.logging_setup import setup_logging
 from tidewatch.notify.base import Notifier
@@ -261,8 +262,11 @@ class Application:
         """执行一个收尾步骤，出错只记录日志，不影响后续步骤"""
         try:
             await awaitable
-        except Exception:
-            logger.exception("%s失败", what)
+        except Exception as exc:
+            if "Hyperliquid" in what:
+                logger.error("%s失败：%s", what, exception_summary(exc))
+            else:
+                logger.exception("%s失败", what)
 
     async def _wait_streams_closed(self, timeout: float = 1.0) -> None:
         """保险等待 SSE 响应收尾；Broadcaster.close() 已让流自然结束，这里只负责兜底等待"""
@@ -307,7 +311,10 @@ async def run(settings: Settings, *, groups: set[str], dry_run: bool) -> int:
         try:
             await app.start()
         except Exception as exc:
-            logger.exception("启动失败：%s", exc)
+            if "hyperliquid" in groups:
+                logger.error("启动失败：%s", exception_summary(exc))
+            else:
+                logger.exception("启动失败：%s", exc)
             exit_code = 1
         else:
             stop_waiter = asyncio.create_task(stop_event.wait(), name="stop-signal")
@@ -324,7 +331,12 @@ async def run(settings: Settings, *, groups: set[str], dry_run: bool) -> int:
                         reason = "任务被取消"
                     else:
                         exc = task.exception()
-                        reason = "正常返回" if exc is None else f"{type(exc).__name__}：{exc}"
+                        if exc is None:
+                            reason = "正常返回"
+                        elif task.get_name().startswith("hl-"):
+                            reason = exception_summary(exc)
+                        else:
+                            reason = f"{type(exc).__name__}：{exc}"
                     logger.error(
                         "关键任务 %s 意外结束，进程将退出以便 launchd 重启：%s",
                         task.get_name(),

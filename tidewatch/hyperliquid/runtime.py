@@ -18,7 +18,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
-from tidewatch.collectors.base import Backoff, TokenBucket, describe
+from tidewatch.collectors.base import Backoff, TokenBucket
 from tidewatch.collectors.http import make_client
 from tidewatch.hyperliquid.client import MAX_BASE_WEIGHT, HyperliquidRestClient
 from tidewatch.hyperliquid.discovery import (
@@ -29,6 +29,7 @@ from tidewatch.hyperliquid.discovery import (
 )
 from tidewatch.hyperliquid.importer import AliasCache, LeaderboardImporter
 from tidewatch.hyperliquid.leaderboard import HYPURRSCAN_ALIASES_URL, LEADERBOARD_URL, LeaderboardSource
+from tidewatch.hyperliquid.logging import exception_summary, short_address
 from tidewatch.hyperliquid.monitor import (
     HyperliquidMonitor,
     PriorityReconcileQueue,
@@ -40,10 +41,14 @@ from tidewatch.hyperliquid.profile import (
     WalletProfiler,
     seconds_until_shanghai_midnight,
 )
-from tidewatch.hyperliquid.registry import WalletRegistry, normalize_address
+from tidewatch.hyperliquid.registry import (
+    WalletRegistry,
+    cleanup_monitoring_state,
+    normalize_address,
+)
 from tidewatch.hyperliquid.tiers import TierRecalculator
 from tidewatch.hyperliquid.ws import MAX_SUBSCRIPTIONS, HyperliquidWsManager
-from tidewatch.store.tables import hl_state
+from tidewatch.store.tables import hl_state, hl_wallets
 
 
 HEALTH_SOURCES = ("hl_rest", "hl_trades_ws", "hl_core_ws", "hl_leaderboard", "hl_profile")
@@ -167,6 +172,8 @@ class HyperliquidRuntime:
             on_position=live_updates.on_position if live_updates is not None else None,
             on_market=live_updates.on_market if live_updates is not None else None,
         )
+        self.registry.on_deactivated = self._forget_wallet
+        self.tiers.on_deactivated = self._forget_wallet
         self.profiler = WalletProfiler(
             engine,
             self.rest,
@@ -193,6 +200,7 @@ class HyperliquidRuntime:
         self._reconcile_backoffs: dict[str, Backoff] = {}
         self._next_reconcile: dict[str, float] = {}
         self._inflight_reconciles: set[str] = set()
+        self._deactivated_wallets: set[str] = set()
         self._core_addresses: set[str] = set()
         self._ws_configured = True
         self._ws_config_lock = asyncio.Lock()
@@ -240,6 +248,7 @@ class HyperliquidRuntime:
         )
         await self.registry.sync_configured_core()
         await self.monitor.cleanup_liquidation_risk_states()
+        await self.monitor.cleanup_old_fills()
         await self.monitor.process_pending_liquidations()
         await self.discovery.cleanup_expired_state()
         await self.discovery.restore_pending()
@@ -250,6 +259,8 @@ class HyperliquidRuntime:
             ("hl-core-ws", self.run_core_ws),
             ("hl-trade-messages", self.run_trade_messages),
             ("hl-discovery-cleanup", self.run_discovery_cleanup),
+            ("hl-account-metadata", self.run_account_metadata),
+            ("hl-fill-cleanup", self.run_fill_cleanup),
             ("hl-core-subscriptions", self.run_core_subscriptions),
             ("hl-core-messages", self.run_core_messages),
             ("hl-leaderboard", self.run_leaderboard),
@@ -274,6 +285,7 @@ class HyperliquidRuntime:
                     await workers
                 now = self.monotonic()
                 focus = await self.registry.list_wallets(tier="focus", excluded=False)
+                await self.schedule_focus_wallets(now, focus=focus)
                 if not focus:
                     await self.monitor.run_due_fill_queries()
                     await self._set_health_mode("hl_rest", "degraded")
@@ -284,7 +296,6 @@ class HyperliquidRuntime:
                         return
                     continue
                 await self._set_health_mode("hl_rest", "normal")
-                await self.schedule_focus_wallets(now, focus=focus)
                 if not self.reconcile_queue and not self._inflight_reconciles:
                     await self.monitor.run_due_fill_queries()
                 if await self._wait_or_stop(
@@ -363,6 +374,51 @@ class HyperliquidRuntime:
             ):
                 return
 
+    async def run_account_metadata(self) -> None:
+        """用低优先级批处理预算持续补齐受监控钱包的账户类型与现货权益。"""
+        while not self._stop.is_set():
+            wallets = [
+                *await self.registry.list_wallets(tier="core", excluded=False),
+                *await self.registry.list_wallets(tier="focus", excluded=False),
+            ]
+            for wallet in wallets:
+                if self._stop.is_set():
+                    return
+                try:
+                    if await self.monitor.account_metadata_due(wallet.address):
+                        await self.monitor.refresh_account_metadata(wallet.address)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error(
+                        "Hyperliquid 钱包 %s 账户元数据后台刷新失败：%s",
+                        short_address(wallet.address),
+                        exception_summary(exc),
+                    )
+            if await self._wait_or_stop(60):
+                return
+
+    async def run_fill_cleanup(self) -> None:
+        """每日清理超过配置保留期的成交。"""
+        while not self._stop.is_set():
+            await self.monitor.cleanup_old_fills()
+            if await self._wait_or_stop(86400):
+                return
+
+    def _forget_wallet(self, address: str) -> None:
+        """名单退出监控后清除运行时与监控器中的钱包级缓存。"""
+        normalized = normalize_address(address)
+        # 仅在对账在途时保留墓碑；排队任务可直接丢弃，WS 另有持久化名单复核。
+        if normalized in self._inflight_reconciles:
+            self._deactivated_wallets.add(normalized)
+        else:
+            self._deactivated_wallets.discard(normalized)
+        self.monitor.forget_wallet(normalized)
+        self.reconcile_queue.discard(normalized)
+        self._pending_discoveries.pop(normalized, None)
+        self._reconcile_backoffs.pop(normalized, None)
+        self._next_reconcile.pop(normalized, None)
+
     async def run_core_subscriptions(self) -> None:
         """轮询数据库名单并动态增减核心钱包订阅。"""
         while not self._stop.is_set():
@@ -382,8 +438,8 @@ class HyperliquidRuntime:
                 await self.importer.import_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("Hyperliquid 排行榜导入失败")
+            except Exception as exc:
+                logger.error("Hyperliquid 排行榜导入失败：%s", exception_summary(exc))
                 retry_delay = min(300, self.settings.frequencies.leaderboard_interval_s)
                 if await self._wait_or_stop(retry_delay):
                     return
@@ -393,8 +449,11 @@ class HyperliquidRuntime:
                     await self.tiers.recompute()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("Hyperliquid 排行榜导入后的分层重算失败")
+            except Exception as exc:
+                logger.error(
+                    "Hyperliquid 排行榜导入后的分层重算失败：%s",
+                    exception_summary(exc),
+                )
                 retry_delay = min(300, self.settings.frequencies.leaderboard_interval_s)
                 if await self._wait_or_stop(retry_delay):
                     return
@@ -403,8 +462,11 @@ class HyperliquidRuntime:
                         await self.tiers.recompute()
                 except asyncio.CancelledError:
                     raise
-                except Exception:
-                    logger.exception("Hyperliquid 导入后的分层重算重试失败")
+                except Exception as exc:
+                    logger.error(
+                        "Hyperliquid 导入后的分层重算重试失败：%s",
+                        exception_summary(exc),
+                    )
             if await self._wait_or_stop(self.settings.frequencies.leaderboard_interval_s):
                 return
 
@@ -427,8 +489,8 @@ class HyperliquidRuntime:
                     await self.tiers.recompute()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("Hyperliquid 每日分层重算失败")
+            except Exception as exc:
+                logger.error("Hyperliquid 每日分层重算失败：%s", exception_summary(exc))
                 retrying = True
             else:
                 retrying = False
@@ -472,8 +534,8 @@ class HyperliquidRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.exception("Hyperliquid 画像批次系统性失败")
-                await self.health.failure("hl_profile", describe(exc))
+                logger.error("Hyperliquid 画像批次系统性失败：%s", exception_summary(exc))
+                await self.health.failure("hl_profile", exception_summary(exc))
                 if await self._wait_or_stop(min(300, self.settings.frequencies.profile_interval_s)):
                     return
                 continue
@@ -528,13 +590,35 @@ class HyperliquidRuntime:
                 if stopper in done and getter not in done:
                     continue
                 message = await getter
-            data = message.get("data")
+            address: str | None = None
             try:
+                data = message.get("data")
+                address = (
+                    normalize_address(data["user"])
+                    if isinstance(data, Mapping) and isinstance(data.get("user"), str)
+                    else None
+                )
+                if address is not None and not await self._is_wallet_monitored(address):
+                    self._forget_wallet(address)
+                    await self._cleanup_deactivated_task(address)
+                    continue
                 await self.monitor.handle_core_message(message)
+                if address is not None and not await self._is_wallet_monitored(address):
+                    self._forget_wallet(address)
+                    await self._cleanup_deactivated_task(address)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await self.health.failure("hl_core_ws", describe(exc))
+                if address is not None:
+                    try:
+                        still_monitored = await self._is_wallet_monitored(address)
+                    except Exception:
+                        still_monitored = True
+                    if not still_monitored:
+                        self._forget_wallet(address)
+                        await self._cleanup_deactivated_task(address)
+                        continue
+                await self.health.failure("hl_core_ws", exception_summary(exc))
                 raise
 
     @property
@@ -560,11 +644,21 @@ class HyperliquidRuntime:
     ) -> None:
         """把到期的重点钱包按热点等级加入队列，不制造重复任务。"""
         wallets = focus if focus is not None else await self.registry.list_wallets(tier="focus", excluded=False)
+        core_wallets = await self.registry.list_wallets(tier="core", excluded=False)
         hot = {item.address: item for item in await self.monitor.hot_wallets()}
-        active = {wallet.address for wallet in wallets}
-        for address in list(self._next_reconcile):
-            if address not in active:
-                self._next_reconcile.pop(address, None)
+        active = {wallet.address for wallet in [*wallets, *core_wallets]}
+        self._deactivated_wallets.difference_update(active)
+        tracked = {
+            *self.reconcile_queue.addresses(),
+            *self._next_reconcile,
+            *self._reconcile_backoffs,
+            *self._pending_discoveries,
+            *self._inflight_reconciles,
+            *self._core_addresses,
+            *self.monitor.wallet_cache_addresses(),
+        }
+        for address in tracked - active:
+            self._forget_wallet(address)
         distance_limit = Decimal(str(self.settings.events.hot_liquidation_distance_ratio))
         for wallet in wallets:
             if (
@@ -619,22 +713,32 @@ class HyperliquidRuntime:
             self.reconcile_queue.defer(task, due_at=now)
             raise
         except Exception as exc:
+            if await self._task_deactivated(task, is_discovery=is_discovery):
+                await self._cleanup_deactivated_task(task.address)
+                return
             backoff = self._reconcile_backoffs.setdefault(task.address, Backoff())
             delay = backoff.next()
-            logger.exception(
-                "Hyperliquid 钱包 %s 对账失败，优先级 %s，%g 秒后重试",
-                _short_address(task.address),
+            logger.error(
+                "Hyperliquid 钱包 %s 对账失败，优先级 %s，%g 秒后重试：%s",
+                short_address(task.address),
                 task.priority.name,
                 delay,
+                exception_summary(exc),
             )
-            await self.health.failure("hl_rest", describe(exc))
+            await self.health.failure("hl_rest", exception_summary(exc))
             self.reconcile_queue.defer(task, due_at=now + delay)
             return
         if not complete:
+            if await self._task_deactivated(task, is_discovery=is_discovery):
+                await self._cleanup_deactivated_task(task.address)
+                return
             self.reconcile_queue.defer(
                 task,
                 due_at=max(now + 0.1, self.rest.cooldown_until),
             )
+            return
+        if await self._task_deactivated(task, is_discovery=is_discovery):
+            await self._cleanup_deactivated_task(task.address)
             return
         if discovery_requests:
             discovery_requests.pop(0)
@@ -654,14 +758,54 @@ class HyperliquidRuntime:
             self._reconcile_backoffs.pop(task.address, None)
             return
         interval = await self._interval_after(task)
+        if task.address in self._deactivated_wallets:
+            await self._cleanup_deactivated_task(task.address)
+            return
         self._reconcile_backoffs.pop(task.address, None)
         self._next_reconcile[task.address] = self.monotonic() + interval
+
+    async def _cleanup_deactivated_task(self, address: str) -> None:
+        """对账与名单变更竞态时再次清理可能刚提交的监控状态。"""
+        async with self.engine.begin() as conn:
+            await cleanup_monitoring_state(conn, address)
+        self.monitor.forget_wallet(address)
+        self._reconcile_backoffs.pop(address, None)
+        self._next_reconcile.pop(address, None)
+        self._deactivated_wallets.discard(address)
+
+    async def _is_wallet_monitored(self, address: str) -> bool:
+        """读取持久化名单，识别独立 CLI 进程造成的生命周期变化。"""
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    select(hl_wallets.c.tier, hl_wallets.c.excluded).where(
+                        hl_wallets.c.address == address
+                    )
+                )
+            ).first()
+        return bool(
+            row is not None
+            and not row.excluded
+            and row.tier in {"focus", "core"}
+        )
+
+    async def _task_deactivated(
+        self,
+        task: ScheduledReconcile,
+        *,
+        is_discovery: bool,
+    ) -> bool:
+        """发现任务允许陌生钱包；普通对账则复核跨进程名单状态。"""
+        if task.address in self._deactivated_wallets:
+            return True
+        return not is_discovery and not await self._is_wallet_monitored(task.address)
 
     async def sync_core_subscriptions(self) -> None:
         """把数据库核心名单与 WS 用户订阅同步。"""
         await self._ensure_ws_configured()
         wallets = await self.registry.list_wallets(tier="core", excluded=False)
         desired = {wallet.address for wallet in wallets}
+        self._deactivated_wallets.difference_update(desired)
         if desired and not self._ws_configured:
             await self._ensure_ws_configured(force=True)
         if not self._ws_configured:
@@ -675,10 +819,13 @@ class HyperliquidRuntime:
             error = ValueError(
                 f"Hyperliquid WS 总订阅最多 1,000 个，当前计划需要 {projected} 个"
             )
-            await self.health.failure("hl_core_ws", describe(error))
-            logger.error("拒绝新增 Hyperliquid 核心钱包订阅：%s", describe(error))
+            await self.health.failure("hl_core_ws", exception_summary(error))
+            logger.error("拒绝新增 Hyperliquid 核心钱包订阅：%s", exception_summary(error))
             raise error
         for address in sorted(removals):
+            if not await self._is_wallet_monitored(address):
+                self._forget_wallet(address)
+                await self._cleanup_deactivated_task(address)
             await self.ws.unsubscribe("core", {"type": "userFills", "user": address})
             await self.ws.unsubscribe(
                 "core",
@@ -728,8 +875,8 @@ class HyperliquidRuntime:
             error = ValueError(
                 f"Hyperliquid WS 总订阅最多 1,000 个，当前计划需要 {projected} 个"
             )
-            await self.health.failure("hl_trades_ws", describe(error))
-            logger.error("拒绝刷新 Hyperliquid 成交流订阅：%s", describe(error))
+            await self.health.failure("hl_trades_ws", exception_summary(error))
+            logger.error("拒绝刷新 Hyperliquid 成交流订阅：%s", exception_summary(error))
             raise error
         if "trades" not in self.ws._connections:
             self.ws.add_connection(
@@ -893,7 +1040,3 @@ class HyperliquidRuntime:
         self._resources_closed = True
         await self.rest.aclose()
         await self.http.aclose()
-
-
-def _short_address(address: str) -> str:
-    return f"{address[:6]}…{address[-4:]}"

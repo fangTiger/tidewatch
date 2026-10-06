@@ -13,8 +13,9 @@ from typing import Any, Literal, TypeVar
 
 import httpx
 
-from tidewatch.collectors.base import Backoff, TokenBucket, describe
+from tidewatch.collectors.base import Backoff, TokenBucket
 from tidewatch.collectors.http import make_client
+from tidewatch.hyperliquid.logging import exception_summary
 
 logger = logging.getLogger(__name__)
 
@@ -391,7 +392,7 @@ class HyperliquidRestClient:
                     self.health_source,
                     request_type,
                     base_weight,
-                    describe(exc),
+                    exception_summary(exc),
                     delay,
                     self.proxy_mode,
                 )
@@ -573,16 +574,24 @@ class HyperliquidRestClient:
             return
         try:
             await self.health.success(self.health_source)
-        except Exception:
-            logger.exception("子源 %s 健康成功状态上报失败", self.health_source)
+        except Exception as exc:
+            logger.error(
+                "子源 %s 健康成功状态上报失败：%s",
+                self.health_source,
+                exception_summary(exc),
+            )
 
     async def _report_failure(self, exc: BaseException) -> None:
         if self.health is None:
             return
         try:
-            await self.health.failure(self.health_source, describe(exc))
-        except Exception:
-            logger.exception("子源 %s 健康失败状态上报失败", self.health_source)
+            await self.health.failure(self.health_source, exception_summary(exc))
+        except Exception as report_exc:
+            logger.error(
+                "子源 %s 健康失败状态上报失败：%s",
+                self.health_source,
+                exception_summary(report_exc),
+            )
 
     async def aclose(self) -> None:
         await self._client.aclose()

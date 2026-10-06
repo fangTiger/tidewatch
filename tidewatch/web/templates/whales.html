@@ -39,7 +39,7 @@
         {% if wallet.labels or wallet.tags %}<span class="labels">{{ (wallet.labels + wallet.tags) | join(' · ') }}</span>{% endif %}</td>
       <td><span class="tier tier-{{ wallet.tier or 'excluded' }}">{{ {'core':'核心','focus':'重点','candidate':'候选'}.get(wallet.tier, '已排除') }}</span><small>{{ wallet.source }}</small></td>
       <td>{{ {'directional':'方向型','swing':'波段','market_maker':'做市','high_frequency':'高频','unknown':'未知'}.get(wallet.style, wallet.style or '—') }}</td>
-      <td class="number">{{ wallet.account_value | money }}</td><td class="number">{{ wallet.pnl_30d | money }}</td>
+      <td class="number">{{ '待更新' if wallet.account_value_pending else wallet.account_value | money }}</td><td class="number">{{ wallet.pnl_30d | money }}</td>
       <td class="number">{{ wallet.win_rate | percent }}</td>
       <td class="number">{{ wallet.total_notional | money }}</td><td>{{ wallet.profile_updated }}</td>
       <td class="actions">

@@ -90,9 +90,27 @@ class HealthMonitor:
 
     async def load(self) -> None:
         """启动时从 collector_state 恢复已登记采集器的状态与上次告警时间，避免重启绕过告警限流"""
-        async with self._engine.connect() as conn:
+        names = list(self._states)
+        if not names:
+            return
+        now = self._clock()
+        seed = pg_insert(collector_state).values(
+            [
+                {
+                    "name": name,
+                    "status": "unknown",
+                    "mode": "normal",
+                    "consecutive_failures": 0,
+                    "updated_at": now,
+                }
+                for name in names
+            ]
+        )
+        async with self._engine.begin() as conn:
+            # 冷启动也要让状态页看到所有已登记子源；已有记录必须原样保留。
+            await conn.execute(seed.on_conflict_do_nothing(index_elements=["name"]))
             rows = (
-                await conn.execute(select(collector_state).where(collector_state.c.name.in_(list(self._states))))
+                await conn.execute(select(collector_state).where(collector_state.c.name.in_(names)))
             ).mappings().all()
         for row in rows:
             state = self._states[row["name"]]

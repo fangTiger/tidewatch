@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import func, select
 
+from fakes import async_timeout
 from tidewatch.models import Event
 from tidewatch.pipeline.cluster import Clusterer
 from tidewatch.store.repo import insert_event, save_grading
@@ -73,6 +74,24 @@ async def test_similar_news_join_same_cluster(engine, settings):
     assert first.id == second.id
     assert second.member_count == 2 and second.source_count == 2
     assert second.max_level == "A"
+
+
+@async_timeout()
+async def test_hyperliquid_events_for_different_coins_never_share_cluster(
+    engine, settings
+):
+    """约束类测试：地址和事件族相同也不能跨币种聚簇。"""
+    clusterer = _clusterer(settings)
+    async with engine.begin() as conn:
+        btc = await _add_hl(conn, clusterer, "hl_open", coin="BTC")
+        eth = await _add_hl(
+            conn,
+            clusterer,
+            "hl_increase",
+            coin="ETH",
+            now=NOW + timedelta(minutes=1),
+        )
+    assert btc.id != eth.id
 
 
 async def test_window_expired_creates_new_cluster(engine, settings):

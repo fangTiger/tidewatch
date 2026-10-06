@@ -14,7 +14,7 @@ import httpx
 import pytest
 from sqlalchemy import insert, select
 
-from fakes import wait_until
+from fakes import async_timeout, wait_until
 from tidewatch.store.tables import collector_state, hl_positions, hl_wallets
 from tidewatch.web.broadcaster import Broadcaster
 from tidewatch.web.server import create_app
@@ -113,6 +113,26 @@ async def test_whale_detail_and_unknown_404(engine, settings, clock):
     ):
         assert raw not in page.text
     assert missing.status_code == 404
+
+
+@async_timeout()
+async def test_missing_account_value_and_actual_leverage_show_pending(engine, settings, clock):
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=A,
+                tier="focus",
+                source="manual",
+                excluded=False,
+                profile={"leaderboard_account_value": "1234567"},
+            )
+        )
+    async with await _client(engine, settings, clock) as http:
+        listing = await asyncio.wait_for(http.get("/whales"), timeout=3)
+        detail = await asyncio.wait_for(http.get(f"/whales/{A}"), timeout=3)
+
+    assert listing.text.count("待更新") >= 1
+    assert detail.text.count("待更新") >= 2
 
 
 async def test_whale_actions_require_same_origin_and_broadcast_after_commit(engine, settings, clock):

@@ -717,6 +717,37 @@ async def test_hyperliquid_critical_task_return_causes_nonzero_exit(engine, sett
     assert any("关键任务 hl-rest 意外结束" in record.getMessage() for record in caplog.records)
 
 
+async def test_hyperliquid_critical_task_error_is_redacted(
+    engine, settings, monkeypatch, caplog
+):
+    """Hyperliquid 长期任务异常传播到应用边界后仍不能泄露地址与 SQL 参数。"""
+    from tidewatch.hyperliquid.runtime import HyperliquidRuntime
+
+    address = "0x1234567890abcdef1234567890abcdef12345678"
+
+    async def fail_immediately(self) -> None:
+        raise RuntimeError(
+            f"查询 {address} 失败 [SQL: SELECT *] [parameters: ('{address}',)]"
+        )
+
+    async def wait_until_stopped(self) -> None:
+        await self._stop.wait()
+
+    monkeypatch.setattr(HyperliquidRuntime, "run_rest", fail_immediately)
+    monkeypatch.setattr(HyperliquidRuntime, "run_trades_ws", wait_until_stopped)
+    monkeypatch.setattr(HyperliquidRuntime, "run_core_ws", wait_until_stopped)
+    with caplog.at_level(logging.INFO, logger="tidewatch.app"):
+        code = await asyncio.wait_for(
+            run(settings, groups={"hyperliquid"}, dry_run=True), timeout=5
+        )
+
+    assert code == 1
+    combined = "\n".join(record.getMessage() for record in caplog.records)
+    assert address not in combined
+    assert "parameters" not in combined
+    assert "RuntimeError" in combined
+
+
 # ---------- 装配：启动顺序与币安模式 ----------
 
 

@@ -16,7 +16,6 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
-from tidewatch.collectors.base import describe
 from tidewatch.hyperliquid.baseline import (
     load_last_observed_at,
     load_monitor_baseline,
@@ -32,6 +31,7 @@ from tidewatch.hyperliquid.detect import (
     save_liquidation_risk_state,
 )
 from tidewatch.hyperliquid.positions import upsert_position_snapshot
+from tidewatch.hyperliquid.logging import exception_summary
 from tidewatch.hyperliquid.registry import normalize_address
 from tidewatch.models import FetchResult
 from tidewatch.store.tables import (
@@ -173,6 +173,14 @@ class PriorityReconcileQueue:
             ),
         )
 
+    def discard(self, address: str) -> None:
+        """丢弃指定钱包尚未执行的对账任务。"""
+        self._tasks.pop(normalize_address(address), None)
+
+    def addresses(self) -> set[str]:
+        """返回当前排队钱包快照，供名单生命周期差分清理。"""
+        return set(self._tasks)
+
     def _sort_key(
         self,
         task: ScheduledReconcile,
@@ -206,8 +214,6 @@ class _ReconcileProgress:
     observed_at: datetime
     dexes: tuple[str, ...]
     states: dict[str, Any]
-    abstraction: Any = _MISSING
-    spot: Any = _MISSING
 
 
 class _FillLookupStatus(Enum):
@@ -317,9 +323,7 @@ class HyperliquidMonitor:
         self.on_position = on_position
         self.on_market = on_market
         self.mids: dict[str, Decimal] = {}
-        self._account_types: dict[str, Any] = {}
-        self._account_type_cached_at: dict[str, datetime] = {}
-        self._spot_states: dict[str, Mapping[str, Any]] = {}
+        self._account_metadata: dict[str, dict[str, Any]] = {}
         self._recent_fills: dict[tuple[str, str], Mapping[str, Any]] = {}
         self._deferred_fills: dict[str, tuple[datetime, set[str]]] = {}
         self._pending_reconciles: dict[str, _ReconcileProgress] = {}
@@ -332,7 +336,7 @@ class HyperliquidMonitor:
         return len(self._deferred_fills)
 
     async def reconcile(self, address: str) -> bool:
-        """尝试完成一次钱包 REST 对账；预算不足返回 False 供队列顺延。"""
+        """只用仓位状态完成关键路径对账；账户元数据由后台低优先级刷新。"""
         normalized = normalize_address(address)
         progress = self._pending_reconciles.get(normalized)
         if progress is None:
@@ -349,6 +353,11 @@ class HyperliquidMonitor:
                 dex_cursor = await conn.scalar(
                     select(hl_state.c.cursor).where(hl_state.c.name == f"dexes:{normalized}")
                 )
+                metadata_cursor = await conn.scalar(
+                    select(hl_state.c.cursor).where(
+                        hl_state.c.name == f"account_metadata:{normalized}"
+                    )
+                )
             remembered_dexes = (
                 {str(dex) for dex in dex_cursor.get("dexes", []) if dex}
                 if isinstance(dex_cursor, Mapping)
@@ -358,12 +367,13 @@ class HyperliquidMonitor:
                 observed_at=self.clock(),
                 dexes=(
                     "",
-                    *sorted(position_dexes | remembered_dexes | set(self.cfg.hip3_dexes)),
+                    *sorted(position_dexes | remembered_dexes),
                 ),
                 states={},
-                abstraction=self._cached_account_type(normalized),
             )
             self._pending_reconciles[normalized] = progress
+            if isinstance(metadata_cursor, Mapping):
+                self._account_metadata[normalized] = dict(metadata_cursor)
 
         pending: list[tuple[str, str | None, Any]] = []
         for dex in progress.dexes:
@@ -372,14 +382,6 @@ class HyperliquidMonitor:
                 pending.append(
                     ("state", dex, self._try_info("clearinghouseState", **params))
                 )
-        if progress.abstraction is _MISSING:
-            pending.append(
-                (
-                    "abstraction",
-                    None,
-                    self._try_info("userAbstraction", user=normalized),
-                )
-            )
         if pending:
             results = await asyncio.gather(*(request for _, _, request in pending))
             complete = True
@@ -389,20 +391,11 @@ class HyperliquidMonitor:
                 elif kind == "state":
                     assert dex is not None
                     progress.states[dex] = value
-                else:
-                    progress.abstraction = value
-                    self._cache_account_type(normalized, value)
             if not complete:
                 return False
-        if _is_unified(progress.abstraction) and progress.spot is _MISSING:
-            available, spot = await self._try_info("spotClearinghouseState", user=normalized)
-            if not available:
-                return False
-            progress.spot = spot
 
         clearing = progress.states[""]
-        spot = None if progress.spot is _MISSING else progress.spot
-        account_value = combined_account_value(progress.abstraction, clearing, spot)
+        account_value = self._account_value_from_metadata(normalized, clearing)
         await self._process_states(
             normalized,
             [(dex, progress.states[dex]) for dex in progress.dexes],
@@ -789,8 +782,8 @@ class HyperliquidMonitor:
         if self.on_market is not None:
             try:
                 await self.on_market(dict(self.mids))
-            except Exception:
-                logger.exception("广播 Hyperliquid 行情更新失败")
+            except Exception as exc:
+                logger.error("广播 Hyperliquid 行情更新失败：%s", exception_summary(exc))
 
     async def hot_wallets(self) -> list[HotWallet]:
         """读取重点钱包当前仓位并计算热点集合。"""
@@ -845,12 +838,44 @@ class HyperliquidMonitor:
             )
         return result.rowcount or 0
 
+    async def cleanup_old_fills(self) -> int:
+        """清理画像窗口之外的过期成交；配置保留期至少为 30 天。"""
+        cutoff = self.clock() - timedelta(days=self.cfg.fill_retention_days)
+        async with self.engine.begin() as conn:
+            result = await conn.execute(delete(hl_fills).where(hl_fills.c.occurred_at < cutoff))
+        return result.rowcount or 0
+
+    def forget_wallet(self, address: str) -> None:
+        """清除已退出监控钱包的全部进程内状态。"""
+        normalized = normalize_address(address)
+        self._account_metadata.pop(normalized, None)
+        self._deferred_fills.pop(normalized, None)
+        self._pending_reconciles.pop(normalized, None)
+        self._liquidation_locks.pop(normalized, None)
+        self._fill_timeout_warnings.pop(normalized, None)
+        for mapping in (self._recent_fills, self._account_lookup_warnings):
+            for key in [key for key in mapping if key[0] == normalized]:
+                mapping.pop(key, None)
+
+    def wallet_cache_addresses(self) -> set[str]:
+        """返回所有钱包级进程内状态的地址快照。"""
+        addresses = {
+            *self._account_metadata,
+            *self._deferred_fills,
+            *self._pending_reconciles,
+            *self._liquidation_locks,
+            *self._fill_timeout_warnings,
+        }
+        addresses.update(address for address, _coin in self._recent_fills)
+        addresses.update(address for address, _kind in self._account_lookup_warnings)
+        return addresses
+
     async def _process_states(
         self,
         address: str,
         states: list[tuple[str, Any]],
         *,
-        account_value: Decimal,
+        account_value: Decimal | None,
         allow_fill_lookup: bool,
         observed_at: datetime | None = None,
     ) -> None:
@@ -988,9 +1013,18 @@ class HyperliquidMonitor:
                         level,
                         now,
                     )
-            dexes = sorted({dex for dex, _ in responses if dex})
-            if dexes:
-                await _save_known_dexes(conn, address, dexes, now)
+            active_dexes = sorted(
+                {
+                    dex
+                    for dex, state in responses
+                    if dex
+                    and any(
+                        snapshot.szi != 0
+                        for snapshot in _snapshots(state, address, dex, now)
+                    )
+                }
+            )
+            await _save_known_dexes(conn, address, active_dexes, now)
             if establishing_baseline:
                 await save_monitor_baseline(conn, address, now)
                 await _initialize_fill_cursor(conn, address, now)
@@ -1000,8 +1034,13 @@ class HyperliquidMonitor:
         if self.on_position is not None:
             try:
                 await self.on_position(address, dict(self.mids))
-            except Exception:
-                logger.exception("广播钱包 %s…%s 仓位更新失败", address[:6], address[-4:])
+            except Exception as exc:
+                logger.error(
+                    "广播钱包 %s…%s 仓位更新失败：%s",
+                    address[:6],
+                    address[-4:],
+                    exception_summary(exc),
+                )
         if establishing_baseline:
             for key in [key for key in self._recent_fills if key[0] == address]:
                 self._recent_fills.pop(key, None)
@@ -1188,62 +1227,99 @@ class HyperliquidMonitor:
             return await method(request_type, budget="monitor", **params)
         return True, await self.rest.info(request_type, budget="monitor", **params)
 
-    async def _core_account_value(self, address: str, clearing: Any) -> Decimal:
-        """有界刷新核心钱包账户类型与现货 USDC，失败时使用最近缓存。"""
-        cached = self._cached_account_type(address)
-        abstraction = None if cached is _MISSING else cached
-        if cached is _MISSING:
-            try:
-                available, value = await asyncio.wait_for(
-                    self._try_info("userAbstraction", user=address),
-                    timeout=self.account_lookup_timeout_s,
+    async def _core_account_value(self, address: str, clearing: Any) -> Decimal | None:
+        """读取最近一次持久化账户元数据，不在核心 WS 处理路径发起 REST 请求。"""
+        normalized = normalize_address(address)
+        if normalized not in self._account_metadata:
+            async with self.engine.connect() as conn:
+                cursor = await conn.scalar(
+                    select(hl_state.c.cursor).where(
+                        hl_state.c.name == f"account_metadata:{normalized}"
+                    )
                 )
-            except Exception as exc:
-                self._log_account_lookup_failure(
-                    address,
-                    "account_type",
-                    "钱包 %s…%s 账户类型查询失败，暂按普通账户处理：%s",
-                    exc,
-                )
-            else:
-                if available:
-                    abstraction = value
-                    self._cache_account_type(address, value)
-        abstraction = abstraction or "disabled"
-        spot = self._spot_states.get(address)
-        if _is_unified(abstraction):
-            try:
-                available, value = await asyncio.wait_for(
-                    self._try_info("spotClearinghouseState", user=address),
-                    timeout=self.account_lookup_timeout_s,
-                )
-            except Exception as exc:
-                self._log_account_lookup_failure(
-                    address,
-                    "spot",
-                    "钱包 %s…%s 现货 USDC 查询失败，使用最近缓存：%s",
-                    exc,
-                )
-            else:
-                if available and isinstance(value, Mapping):
-                    spot = value
-                    self._spot_states[address] = value
-        return combined_account_value(abstraction, clearing, spot)
+            if isinstance(cursor, Mapping):
+                self._account_metadata[normalized] = dict(cursor)
+        return self._account_value_from_metadata(normalized, clearing)
 
-    def _cached_account_type(self, address: str) -> Any:
-        cached_at = self._account_type_cached_at.get(address)
-        if cached_at is None:
-            return _MISSING
-        age = (self.clock() - cached_at).total_seconds()
-        if age >= self.cfg.frequencies.account_type_cache_s:
-            self._account_types.pop(address, None)
-            self._account_type_cached_at.pop(address, None)
-            return _MISSING
-        return self._account_types.get(address, _MISSING)
+    def _account_value_from_metadata(self, address: str, clearing: Any) -> Decimal | None:
+        """从最近账户类型与现货快照计算权益；资料缺失时保持待更新。"""
+        metadata = self._account_metadata.get(address)
+        if not metadata or "account_type" not in metadata:
+            return None
+        account_type = metadata["account_type"]
+        if _is_unified(account_type) and not isinstance(metadata.get("spot"), Mapping):
+            return None
+        return combined_account_value(account_type, clearing, metadata.get("spot"))
 
-    def _cache_account_type(self, address: str, value: Any) -> None:
-        self._account_types[address] = value
-        self._account_type_cached_at[address] = self.clock()
+    async def refresh_account_metadata(self, address: str) -> None:
+        """用批处理预算低优先级刷新账户类型及统一账户现货权益，并持久化结果。"""
+        normalized = normalize_address(address)
+        if self.rest is None:
+            return
+        account_type = await self.rest.info(
+            "userAbstraction", budget="batch", user=normalized
+        )
+        now = self.clock()
+        metadata: dict[str, Any] = {
+            "account_type": account_type,
+            "account_type_updated_at": now.isoformat(),
+        }
+        if _is_unified(account_type):
+            spot = await self.rest.info(
+                "spotClearinghouseState", budget="batch", user=normalized
+            )
+            if isinstance(spot, Mapping):
+                metadata["spot"] = dict(spot)
+                metadata["spot_updated_at"] = now.isoformat()
+        stmt = pg_insert(hl_state).values(
+            name=f"account_metadata:{normalized}", cursor=metadata, updated_at=now
+        )
+        async with self.engine.begin() as conn:
+            wallet = (
+                await conn.execute(
+                    select(hl_wallets.c.tier, hl_wallets.c.excluded).where(
+                        hl_wallets.c.address == normalized
+                    )
+                )
+            ).first()
+            if (
+                wallet is None
+                or wallet.excluded
+                or wallet.tier not in {"focus", "core"}
+            ):
+                self._account_metadata.pop(normalized, None)
+                return
+            await conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["name"],
+                    set_={
+                        "cursor": stmt.excluded.cursor,
+                        "updated_at": stmt.excluded.updated_at,
+                    },
+                )
+            )
+        self._account_metadata[normalized] = metadata
+
+    async def account_metadata_due(self, address: str) -> bool:
+        """判断账户元数据是否缺失或超过可配置 TTL。"""
+        normalized = normalize_address(address)
+        metadata = self._account_metadata.get(normalized)
+        if metadata is None:
+            async with self.engine.connect() as conn:
+                cursor = await conn.scalar(
+                    select(hl_state.c.cursor).where(
+                        hl_state.c.name == f"account_metadata:{normalized}"
+                    )
+                )
+            if isinstance(cursor, Mapping):
+                metadata = dict(cursor)
+                self._account_metadata[normalized] = metadata
+        if not metadata:
+            return True
+        updated_at = _parse_datetime(metadata.get("account_type_updated_at"))
+        return updated_at is None or (
+            self.clock() - updated_at
+        ).total_seconds() >= self.cfg.frequencies.account_type_cache_s
 
     def _log_fill_timeout(self, address: str, *, deferred: bool = False) -> None:
         """同钱包真实成交补查超时每半小时至多记录一次 WARNING。"""
@@ -1288,7 +1364,7 @@ class HyperliquidMonitor:
             previous is None or (now - previous).total_seconds() >= warning_interval
         )
         log = logger.warning if emit_warning else logger.debug
-        log(message, address[:6], address[-4:], describe(exc))
+        log(message, address[:6], address[-4:], exception_summary(exc))
         if emit_warning:
             self._account_lookup_warnings[key] = now
 
@@ -1335,16 +1411,9 @@ async def _save_known_dexes(
     dexes: Iterable[str],
     updated_at: datetime,
 ) -> None:
-    """持久化钱包曾出现过的 HIP-3 dex，避免平仓后停止对账。"""
+    """持久化钱包当前仍有仓位的 HIP-3 dex。"""
     name = f"dexes:{normalize_address(address)}"
-    old_cursor = await conn.scalar(select(hl_state.c.cursor).where(hl_state.c.name == name))
-    remembered = (
-        {str(dex) for dex in old_cursor.get("dexes", []) if dex}
-        if isinstance(old_cursor, Mapping)
-        else set()
-    )
-    remembered.update(str(dex) for dex in dexes if dex)
-    cursor = {"dexes": sorted(remembered)}
+    cursor = {"dexes": sorted({str(dex) for dex in dexes if dex})}
     stmt = pg_insert(hl_state).values(name=name, cursor=cursor, updated_at=updated_at)
     await conn.execute(
         stmt.on_conflict_do_update(
@@ -1410,7 +1479,11 @@ def _snapshot_mark_px(snapshot: PositionSnapshot) -> Decimal | None:
     return snapshot.notional_usd / abs(snapshot.szi)
 
 
-def _with_account(snapshot: PositionSnapshot, value: Decimal, notional: Decimal) -> PositionSnapshot:
+def _with_account(
+    snapshot: PositionSnapshot,
+    value: Decimal | None,
+    notional: Decimal,
+) -> PositionSnapshot:
     return PositionSnapshot(
         **{
             **snapshot.__dict__,

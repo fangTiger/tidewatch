@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from decimal import Decimal
 
 import httpx
+import pytest
 import respx
 from sqlalchemy import func, insert, select
 from websockets.asyncio.server import serve
@@ -13,6 +15,7 @@ from websockets.asyncio.server import serve
 from fakes import async_timeout
 from tidewatch.hyperliquid.client import BASE_WEIGHTS
 from tidewatch.hyperliquid.monitor import ReconcilePriority
+from tidewatch.hyperliquid.registry import WalletRegistry
 from tidewatch.hyperliquid.runtime import HyperliquidRuntime
 from tidewatch.pipeline.sink import create_event_sink
 from tidewatch.store.tables import events, hl_positions, hl_state, hl_wallets, push_log
@@ -333,7 +336,7 @@ async def test_reconnect_hook_reconciles_hot_wallet_final_state_through_rest(
         with respx.mock:
             respx.post(settings.hyperliquid.rest_url).mock(side_effect=respond)
             await runtime._on_core_connected()
-            # 空桶需先积累主状态 2 + 账户类型 20 的官方权重。
+            # 空桶只需积累主状态权重 2；0.3 秒包含少量调度余量。
             now["value"] = 102.3
             assert await runtime.run_reconcile_once(now["value"])
     finally:
@@ -393,6 +396,84 @@ async def test_focus_scheduler_uses_three_minute_period_and_budget_deferral_keep
         assert len(runtime.reconcile_queue) == 0
         await runtime.schedule_focus_wallets(280.1)
         assert len(runtime.reconcile_queue) == 1
+    finally:
+        await runtime.close_resources()
+
+
+@async_timeout()
+async def test_external_registry_exclusion_cleans_runtime_queue_and_caches(
+    engine, settings, clock
+):
+    """独立 CLI 修改名单后，daemon 下一轮名单同步必须完整清理内存状态。"""
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS, tier="focus", source="manual"
+            )
+        )
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+    )
+    runtime.reconcile_queue.schedule(
+        ADDRESS,
+        ReconcilePriority.NORMAL,
+        due_at=100,
+        reason="普通对账",
+    )
+    runtime._next_reconcile[ADDRESS] = 200
+    runtime.monitor._account_metadata[ADDRESS] = {"account_type": "disabled"}
+    try:
+        assert await WalletRegistry(engine, clock=clock).set_excluded(ADDRESS)
+        await runtime.schedule_focus_wallets(100)
+
+        assert ADDRESS not in runtime.reconcile_queue
+        assert ADDRESS not in runtime._next_reconcile
+        assert ADDRESS not in runtime.monitor._account_metadata
+    finally:
+        await runtime.close_resources()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+@async_timeout()
+async def test_external_exclusion_during_reconcile_is_not_deferred(
+    engine, settings, clock, raises
+):
+    """对账返回预算顺延或异常前若钱包已退出监控，不得重新入队。"""
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS, tier="focus", source="manual"
+            )
+        )
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+        monotonic=lambda: 100.0,
+    )
+
+    async def reconcile(_address: str) -> bool:
+        assert await WalletRegistry(engine, clock=clock).set_excluded(ADDRESS)
+        if raises:
+            raise RuntimeError("模拟在途对账失败")
+        return False
+
+    runtime.monitor.reconcile = reconcile
+    runtime.reconcile_queue.schedule(
+        ADDRESS,
+        ReconcilePriority.NORMAL,
+        due_at=100,
+        reason="普通对账",
+    )
+    try:
+        assert await runtime.run_reconcile_once(100)
+        assert ADDRESS not in runtime.reconcile_queue
     finally:
         await runtime.close_resources()
 
@@ -457,6 +538,159 @@ async def test_two_hundred_focus_wallets_finish_within_three_minute_latency_mode
     assert request_count == 400
     assert 1 < max_active_wallets <= settings.hyperliquid.reconcile_concurrency
     assert modeled_elapsed_s <= settings.hyperliquid.frequencies.focus_reconcile_interval_s
+
+
+@async_timeout()
+async def test_cold_reconcile_never_waits_for_account_metadata_with_or_without_cache(
+    engine, settings, clock
+):
+    """持久化账户类型存在或缺失时，首轮关键路径都只发仓位状态请求。"""
+    addresses = [ADDRESS, OTHER]
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets),
+            [
+                {"address": address, "tier": "focus", "source": "manual"}
+                for address in addresses
+            ],
+        )
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"account_metadata:{ADDRESS}",
+                cursor={
+                    "account_type": "disabled",
+                    "account_type_updated_at": clock.now.isoformat(),
+                },
+                updated_at=clock.now,
+            )
+        )
+
+    class Rest:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def try_info(self, request_type: str, **params):
+            self.calls.append((request_type, params["user"]))
+            if request_type == "clearinghouseState":
+                return True, _state("0", "0")
+            raise AssertionError(f"对账关键路径不应查询 {request_type}")
+
+    rest = Rest()
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+    )
+    runtime.monitor.rest = rest
+    try:
+        for address in addresses:
+            assert await runtime.monitor.reconcile(address)
+    finally:
+        await runtime.close_resources()
+
+    assert rest.calls == [
+        ("clearinghouseState", ADDRESS),
+        ("clearinghouseState", OTHER),
+    ]
+
+
+@async_timeout()
+async def test_background_account_metadata_uses_batch_budget_and_persists_result(
+    engine, settings, clock
+):
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS,
+                tier="focus",
+                source="manual",
+            )
+        )
+
+    class Rest:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def info(self, request_type: str, *, budget: str, **params):
+            self.calls.append((request_type, budget))
+            if request_type == "userAbstraction":
+                return "unifiedAccount"
+            if request_type == "spotClearinghouseState":
+                return {"balances": [{"coin": "USDC", "total": "300000"}]}
+            raise AssertionError(request_type)
+
+    rest = Rest()
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+    )
+    runtime.monitor.rest = rest
+    try:
+        await runtime.monitor.refresh_account_metadata(ADDRESS)
+    finally:
+        await runtime.close_resources()
+
+    async with engine.connect() as conn:
+        cursor = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name == f"account_metadata:{ADDRESS}"
+            )
+        )
+    assert rest.calls == [
+        ("userAbstraction", "batch"),
+        ("spotClearinghouseState", "batch"),
+    ]
+    assert cursor["account_type"] == "unifiedAccount"
+    assert cursor["spot"]["balances"][0]["total"] == "300000"
+    assert cursor["account_type_updated_at"] == clock.now.isoformat()
+
+
+@async_timeout()
+async def test_reconcile_log_redacts_address_and_sql_parameters(
+    engine, settings, clock, caplog
+):
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS, tier="focus", source="manual"
+            )
+        )
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+        monotonic=lambda: 100.0,
+    )
+
+    async def fail(_address: str) -> bool:
+        raise RuntimeError(
+            f"查询 {ADDRESS} 失败 [SQL: SELECT *] [parameters: ('{ADDRESS}',)]"
+        )
+
+    runtime.monitor.reconcile = fail
+    runtime.reconcile_queue.schedule(
+        ADDRESS,
+        ReconcilePriority.NORMAL,
+        due_at=100.0,
+        reason="普通对账",
+    )
+    caplog.set_level(logging.ERROR, logger="tidewatch.hyperliquid.runtime")
+    try:
+        assert await runtime.run_reconcile_once(100.0)
+    finally:
+        await runtime.close_resources()
+
+    assert ADDRESS not in caplog.text
+    assert "parameters" not in caplog.text.lower()
+    assert "0x1234…5678" in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 @async_timeout()
@@ -600,35 +834,23 @@ async def test_continuous_trade_triggers_reconcile_within_maximum_wait(
     assert calls == [settings.hyperliquid.frequencies.trade_max_wait_s]
 
 
-def test_two_hundred_wallet_budget_estimate_stays_below_six_hundred_per_minute(settings):
-    """按最保守的全统一账户估算常态状态请求，不含按变化触发的成交补查。"""
+def test_two_hundred_wallet_cold_start_weight_and_latency_estimate(settings):
+    """账户补查移出关键路径后，200 钱包首轮在 600/分钟预算下远低于三分钟。"""
     focus_count = settings.hyperliquid.tiers.focus_limit
-    hot_count = settings.hyperliquid.tiers.hot_limit
-    normal_count = focus_count - hot_count
     clearing_weight = BASE_WEIGHTS["clearinghouseState"]
-    spot_weight = BASE_WEIGHTS["spotClearinghouseState"]
-    abstraction_weight = BASE_WEIGHTS.get("userAbstraction", 2)
-    normal_per_minute = (
-        normal_count
-        * (clearing_weight + spot_weight)
-        / (settings.hyperliquid.frequencies.focus_reconcile_interval_s / 60)
+    first_round_weight = focus_count * clearing_weight
+    budget_seconds = first_round_weight / settings.hyperliquid.monitor_budget_per_min * 60
+    network_seconds = (
+        focus_count / settings.hyperliquid.reconcile_concurrency * 0.8
     )
-    hot_per_minute = (
-        hot_count
-        * (clearing_weight + spot_weight)
-        / (settings.hyperliquid.frequencies.hot_reconcile_interval_s / 60)
-    )
-    abstraction_per_minute = (
-        focus_count
-        * abstraction_weight
-        / (settings.hyperliquid.frequencies.account_type_cache_s / 60)
-    )
+    conservative_seconds = budget_seconds + network_seconds
 
-    total_per_minute = normal_per_minute + hot_per_minute + abstraction_per_minute
-
-    assert total_per_minute < settings.hyperliquid.monitor_budget_per_min
-    assert settings.hyperliquid.frequencies.focus_reconcile_interval_s <= 180
-    assert 597 < total_per_minute < 598
+    assert first_round_weight == 400
+    assert budget_seconds == 40
+    assert network_seconds == 40
+    assert conservative_seconds <= 180
+    assert BASE_WEIGHTS["userAbstraction"] == 20
+    assert focus_count * BASE_WEIGHTS["userAbstraction"] == 4_000
 
 
 @async_timeout()
@@ -656,6 +878,12 @@ async def test_runtime_starts_with_empty_configured_ten_second_buckets(
 async def test_429_defers_reconcile_until_global_cooldown_without_wallet_backoff(
     engine, settings, clock
 ):
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS, tier="focus", source="manual"
+            )
+        )
     now = {"value": 0.0}
     runtime = HyperliquidRuntime(
         settings.hyperliquid,
@@ -701,6 +929,12 @@ async def test_429_defers_reconcile_until_global_cooldown_without_wallet_backoff
 async def test_reconcile_transient_failures_back_off_without_blocking_queue(
     engine, settings, clock
 ):
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS, tier="focus", source="manual"
+            )
+        )
     runtime = HyperliquidRuntime(
         settings.hyperliquid,
         Health(),
@@ -762,7 +996,7 @@ async def test_focus_position_change_is_detected_on_three_minute_reconcile_cycle
         with respx.mock:
             respx.post(settings.hyperliquid.rest_url).mock(side_effect=respond)
             await runtime.schedule_focus_wallets(now["value"])
-            # 空桶需先积累主状态 2 + 账户类型 20 的官方权重。
+            # 空桶只需积累主状态权重 2；0.3 秒包含少量调度余量。
             now["value"] = 102.3
             assert await runtime.run_reconcile_once(now["value"])
             first_completed_at = now["value"]
@@ -810,6 +1044,13 @@ async def test_core_subscription_sync_adds_and_removes_cli_changes(engine, setti
         await runtime.sync_core_subscriptions()
         assert runtime.core_addresses == {ADDRESS}
         assert runtime.ws.subscription_count == 3
+        runtime.monitor._account_metadata[ADDRESS] = {"account_type": "disabled"}
+        runtime.reconcile_queue.schedule(
+            ADDRESS,
+            ReconcilePriority.NORMAL,
+            due_at=100,
+            reason="普通对账",
+        )
         async with engine.begin() as conn:
             await conn.execute(
                 hl_wallets.update().where(hl_wallets.c.address == ADDRESS).values(tier="focus")
@@ -817,6 +1058,9 @@ async def test_core_subscription_sync_adds_and_removes_cli_changes(engine, setti
         await runtime.sync_core_subscriptions()
         assert runtime.core_addresses == set()
         assert runtime.ws.subscription_count == 1
+        assert ADDRESS not in runtime._deactivated_wallets
+        assert ADDRESS in runtime.reconcile_queue
+        assert ADDRESS in runtime.monitor._account_metadata
     finally:
         await runtime.close_resources()
 
@@ -825,6 +1069,15 @@ async def test_core_subscription_sync_adds_and_removes_cli_changes(engine, setti
 async def test_core_messages_for_different_wallets_are_processed_concurrently(
     engine, settings, clock
 ):
+    addresses = [f"0x{index + 1:040x}" for index in range(10)]
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets),
+            [
+                {"address": address, "tier": "core", "source": "manual"}
+                for address in addresses
+            ],
+        )
     runtime = HyperliquidRuntime(
         settings.hyperliquid,
         Health(),
@@ -841,8 +1094,7 @@ async def test_core_messages_for_different_wallets_are_processed_concurrently(
     runtime.monitor.handle_core_message = handle
     worker = asyncio.create_task(runtime.run_core_messages())
     try:
-        for index in range(10):
-            address = f"0x{index + 1:040x}"
+        for address in addresses:
             assert await runtime._handle_ws_message(
                 {
                     "channel": "allDexsClearinghouseState",
@@ -865,6 +1117,12 @@ async def test_core_messages_for_different_wallets_are_processed_concurrently(
 
 @async_timeout()
 async def test_core_messages_for_same_wallet_keep_arrival_order(engine, settings, clock):
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS, tier="core", source="manual"
+            )
+        )
     runtime = HyperliquidRuntime(
         settings.hyperliquid,
         Health(),
@@ -913,3 +1171,73 @@ async def test_core_messages_for_same_wallet_keep_arrival_order(engine, settings
         await runtime.close_resources()
 
     assert completed == [1, 2]
+
+
+@async_timeout()
+async def test_core_message_in_flight_after_external_exclusion_is_cleaned(
+    engine, settings, clock
+):
+    """独立 CLI 在核心消息处理中移除钱包时，消息不得留下新的监控状态。"""
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS, tier="focus", source="manual"
+            )
+        )
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    wrote = asyncio.Event()
+
+    async def write_after_exclusion(_message) -> None:
+        entered.set()
+        await release.wait()
+        async with engine.begin() as conn:
+            await conn.execute(
+                insert(hl_state).values(
+                    name=f"monitor_baseline:{ADDRESS}",
+                    cursor={"established_at": clock.now.isoformat()},
+                    updated_at=clock.now,
+                )
+            )
+        wrote.set()
+
+    runtime.monitor.handle_core_message = write_after_exclusion
+    queue: asyncio.Queue = asyncio.Queue()
+    await queue.put(
+        {
+            "channel": "allDexsClearinghouseState",
+            "data": {"user": ADDRESS, "clearinghouseStates": []},
+        }
+    )
+    worker = asyncio.create_task(runtime._run_core_message_worker(queue))
+    try:
+        await entered.wait()
+        assert await WalletRegistry(engine, clock=clock).set_excluded(ADDRESS)
+        release.set()
+        await wrote.wait()
+
+        async def cleaned() -> None:
+            while True:
+                async with engine.connect() as conn:
+                    count = await conn.scalar(
+                        select(func.count()).select_from(hl_state).where(
+                            hl_state.c.name == f"monitor_baseline:{ADDRESS}"
+                        )
+                    )
+                if count == 0:
+                    return
+                await asyncio.sleep(0.01)
+
+        await cleaned()
+    finally:
+        runtime._stop.set()
+        release.set()
+        await worker
+        await runtime.close_resources()

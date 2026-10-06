@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
 from tidewatch.hyperliquid.baseline import invalidate_monitor_baseline
 from tidewatch.hyperliquid.leaderboard import LeaderboardEntry
-from tidewatch.store.tables import hl_positions, hl_wallets
+from tidewatch.store.tables import hl_positions, hl_state, hl_wallets
 
 
 _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
@@ -26,6 +26,34 @@ _AUTOMATIC_PROFILE_KEYS = {
     "leaderboard_display_name",
     "hypurrscan_alias",
 }
+_MONITOR_STATE_PREFIXES = (
+    "monitor_baseline",
+    "fills",
+    "liquidations",
+    "liq_risk",
+    "dexes",
+    "account_metadata",
+)
+
+
+async def cleanup_monitoring_state(conn: AsyncConnection, address: str) -> None:
+    """删除钱包退出监控后不再有效的仓位与监控游标，保留画像成交。"""
+    normalized = normalize_address(address)
+    await conn.execute(delete(hl_positions).where(hl_positions.c.address == normalized))
+    await conn.execute(
+        delete(hl_state).where(
+            or_(
+                hl_state.c.name.in_(
+                    [
+                        f"{prefix}:{normalized}"
+                        for prefix in _MONITOR_STATE_PREFIXES
+                        if prefix != "liq_risk"
+                    ]
+                ),
+                hl_state.c.name.like(f"liq_risk:{normalized}:%"),
+            )
+        )
+    )
 
 
 def normalize_address(value: str) -> str:
@@ -91,12 +119,20 @@ class WalletRegistry:
         core_limit: int = 10,
         focus_limit: int = 200,
         clock: Clock = utcnow,
+        on_deactivated: Callable[[str], None] | None = None,
     ) -> None:
         self.engine = engine
         self.configured_core = frozenset(normalize_address(address) for address in configured_core)
         self.core_limit = core_limit
         self.focus_limit = focus_limit
         self.clock = clock
+        self.on_deactivated = on_deactivated
+
+    def _notify_deactivated(self, addresses: Iterable[str]) -> None:
+        if self.on_deactivated is None:
+            return
+        for address in dict.fromkeys(addresses):
+            self.on_deactivated(address)
 
     async def import_leaderboard(
         self,
@@ -192,8 +228,11 @@ class WalletRegistry:
                 if last_trade_at < discovered_cutoff:
                     stale.append(row["address"])
             if stale:
+                for address in stale:
+                    await cleanup_monitoring_state(conn, address)
                 result = await conn.execute(delete(hl_wallets).where(hl_wallets.c.address.in_(stale)))
                 removed = result.rowcount or 0
+        self._notify_deactivated(stale)
         return ImportResult(imported, removed)
 
     async def excluded_addresses(self) -> set[str]:
@@ -215,6 +254,7 @@ class WalletRegistry:
     async def add(self, address: str) -> bool:
         """手动添加重点钱包；满额时淘汰名义最低的非手动重点。"""
         normalized = normalize_address(address)
+        deactivated: list[str] = []
         async with self.engine.begin() as conn:
             await self._lock_registry(conn)
             rows = (await conn.execute(select(hl_wallets).with_for_update())).mappings().all()
@@ -227,7 +267,9 @@ class WalletRegistry:
                 and (existing["profile"] or {}).get("manual_focus")
             ):
                 return False
-            await self._make_focus_room(conn, rows)
+            victim = await self._make_focus_room(conn, rows)
+            if victim is not None:
+                deactivated.append(victim)
             profile = dict(existing["profile"] or {}) if existing is not None else {}
             profile["manual_focus"] = True
             if existing is None:
@@ -247,6 +289,7 @@ class WalletRegistry:
                     .values(tier="focus", profile=profile)
                 )
             await invalidate_monitor_baseline(conn, normalized)
+        self._notify_deactivated(deactivated)
         return True
 
     async def promote_discovered(
@@ -260,6 +303,8 @@ class WalletRegistry:
         normalized = normalize_address(address)
         if last_trade_at.tzinfo is None:
             raise ValueError("发现成交时间必须带时区")
+        deactivated: list[str] = []
+        result: PromotionResult
         async with self.engine.begin() as conn:
             await self._lock_registry(conn)
             rows = (await conn.execute(select(hl_wallets).with_for_update())).mappings().all()
@@ -311,7 +356,8 @@ class WalletRegistry:
                             .where(hl_wallets.c.address == victim)
                             .values(tier="candidate")
                         )
-                        await invalidate_monitor_baseline(conn, victim)
+                        await cleanup_monitoring_state(conn, victim)
+                        deactivated.append(victim)
                     else:
                         reason = "not_above_lowest"
                 else:
@@ -335,7 +381,9 @@ class WalletRegistry:
                 )
             if promoted:
                 await invalidate_monitor_baseline(conn, normalized)
-            return PromotionResult(promoted, replaced=replaced, reason=reason)
+            result = PromotionResult(promoted, replaced=replaced, reason=reason)
+        self._notify_deactivated(deactivated)
+        return result
 
     async def remove(self, address: str) -> bool:
         """移除手动名单关系；配置核心保持不变。"""
@@ -360,7 +408,8 @@ class WalletRegistry:
                     .where(hl_wallets.c.address == normalized)
                     .values(tier="candidate", profile=profile)
                 )
-            await invalidate_monitor_baseline(conn, normalized)
+            await cleanup_monitoring_state(conn, normalized)
+        self._notify_deactivated([normalized])
         return True
 
     async def set_core(self, address: str, enabled: bool = True) -> bool:
@@ -408,7 +457,7 @@ class WalletRegistry:
                 return True
             if existing is None or existing["tier"] != "core":
                 return False
-            await self._make_focus_room(conn, rows, excluding=normalized)
+            victim = await self._make_focus_room(conn, rows, excluding=normalized)
             profile = dict(existing["profile"] or {})
             profile.pop("manual_core", None)
             await conn.execute(
@@ -416,11 +465,14 @@ class WalletRegistry:
                 .where(hl_wallets.c.address == normalized)
                 .values(tier="focus", profile=profile)
             )
-            return True
+        if victim is not None:
+            self._notify_deactivated([victim])
+        return True
 
     async def set_excluded(self, address: str, excluded: bool = True) -> bool:
         """设置或解除排除；核心必须先解除。"""
         normalized = normalize_address(address)
+        changed = False
         async with self.engine.begin() as conn:
             await self._lock_registry(conn)
             row = (
@@ -446,17 +498,19 @@ class WalletRegistry:
                         .where(hl_wallets.c.address == normalized)
                         .values(tier=None, excluded=True)
                     )
+                await cleanup_monitoring_state(conn, normalized)
+                changed = True
+            elif row is not None and row["excluded"]:
+                await conn.execute(
+                    update(hl_wallets)
+                    .where(hl_wallets.c.address == normalized)
+                    .values(tier="candidate", excluded=False)
+                )
                 await invalidate_monitor_baseline(conn, normalized)
-                return True
-            if row is None or not row["excluded"]:
-                return False
-            await conn.execute(
-                update(hl_wallets)
-                .where(hl_wallets.c.address == normalized)
-                .values(tier="candidate", excluded=False)
-            )
-            await invalidate_monitor_baseline(conn, normalized)
-            return True
+                changed = True
+        if changed and excluded:
+            self._notify_deactivated([normalized])
+        return changed
 
     async def set_label(self, address: str, note: str | None) -> bool:
         """设置用户备注；空白备注视为清除。"""
@@ -488,6 +542,7 @@ class WalletRegistry:
 
     async def sync_configured_core(self) -> None:
         """在一个事务中同步配置核心；超限时不产生部分写入。"""
+        deactivated: list[str] = []
         async with self.engine.begin() as conn:
             await self._lock_registry(conn)
             rows = (await conn.execute(select(hl_wallets).with_for_update())).mappings().all()
@@ -520,6 +575,9 @@ class WalletRegistry:
                         .where(hl_wallets.c.address == row["address"])
                         .values(tier=tier, profile=profile)
                     )
+                    if tier == "candidate":
+                        await cleanup_monitoring_state(conn, row["address"])
+                        deactivated.append(row["address"])
             for address in self.configured_core:
                 existing = by_address.get(address)
                 if existing is not None and existing["excluded"]:
@@ -544,6 +602,7 @@ class WalletRegistry:
                     )
                     if existing["tier"] != "core":
                         await invalidate_monitor_baseline(conn, address)
+        self._notify_deactivated(deactivated)
 
     async def list_wallets(
         self,
@@ -591,10 +650,10 @@ class WalletRegistry:
         rows: list[Mapping[str, Any]],
         *,
         excluding: str | None = None,
-    ) -> None:
+    ) -> str | None:
         focus_rows = [row for row in rows if row["tier"] == "focus" and row["address"] != excluding]
         if len(focus_rows) < self.focus_limit:
-            return
+            return None
         automatic = [
             row
             for row in focus_rows
@@ -619,7 +678,8 @@ class WalletRegistry:
         await conn.execute(
             update(hl_wallets).where(hl_wallets.c.address == victim).values(tier="candidate")
         )
-        await invalidate_monitor_baseline(conn, victim)
+        await cleanup_monitoring_state(conn, victim)
+        return victim
 
     @staticmethod
     async def _lock_registry(conn: AsyncConnection) -> None:

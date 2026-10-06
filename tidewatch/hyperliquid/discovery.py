@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
 from tidewatch.hyperliquid.baseline import save_monitor_baseline
+from tidewatch.hyperliquid.logging import exception_summary, redact_text
 from tidewatch.hyperliquid.positions import upsert_position_snapshot
 from tidewatch.hyperliquid.registry import WalletRegistry, normalize_address
 from tidewatch.hyperliquid.tiers import NON_PROMOTABLE_STYLES
@@ -214,7 +215,9 @@ class TradeDiscovery:
             ):
                 self._processed[name] = self.clock()
                 continue
-            await self._write_window(request, status="closed", processed=False)
+            # 达标窗口的首个落盘状态就是 queued；后续任何读库、过滤或调度失败，
+            # 重启都能从这一状态恢复资格查询。
+            await self._write_window(request, status="queued", processed=False)
             wallet = await self._wallet(window.address)
             if wallet is not None and wallet["tier"] in {"focus", "core"}:
                 if self.trigger_reconcile is not None:
@@ -247,7 +250,6 @@ class TradeDiscovery:
             else:
                 await _invoke(self.schedule_query, request)
                 self._queued[name] = self.clock()
-                await self._write_window(request, status="queued", processed=False)
         self._maybe_log_summary()
 
     def record_query_limit_deferral(self) -> None:
@@ -317,7 +319,11 @@ class TradeDiscovery:
                     trade_count=int(cursor["trade_count"]),
                 )
             except (KeyError, TypeError, ValueError) as exc:
-                logger.warning("忽略损坏的发现查询游标 %s：%s", name, exc)
+                logger.warning(
+                    "忽略损坏的发现查询游标 %s：%s",
+                    redact_text(name),
+                    exception_summary(exc),
+                )
                 continue
             await _invoke(self.schedule_query, request)
             self._queued[name] = self.clock()

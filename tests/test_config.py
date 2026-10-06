@@ -354,7 +354,8 @@ def test_hyperliquid_default_config_is_valid_and_complete(tmp_path):
     assert cfg.frequencies.focus_reconcile_interval_s == 180
     assert cfg.frequencies.hot_reconcile_aging_s == 30
     assert cfg.frequencies.normal_reconcile_aging_s == 120
-    assert cfg.frequencies.account_type_cache_s == 21600
+    assert cfg.frequencies.account_type_cache_s == 86400
+    assert cfg.fill_retention_days == 90
     assert cfg.frequencies.deferred_fill_lookup_timeout_s == 15
     assert cfg.frequencies.fill_timeout_warning_interval_s == 1800
     assert cfg.frequencies.discovery_summary_interval_s == 300

@@ -5,7 +5,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import insert, select
+from sqlalchemy import func, insert, select
 
 from fakes import async_timeout
 from tidewatch.hyperliquid.leaderboard import LeaderboardEntry
@@ -84,6 +84,65 @@ async def test_monitor_baseline_is_invalidated_when_wallet_reenters_monitored_ti
             select(hl_state.c.cursor).where(hl_state.c.name == f"monitor_baseline:{address}")
         )
     assert restored_baseline is None
+
+
+@async_timeout()
+async def test_excluding_wallet_cleans_positions_monitor_state_and_memory_callback(
+    engine, clock
+):
+    address = _address(100)
+    forgotten: list[str] = []
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=address,
+                tier="focus",
+                source="manual",
+                profile={"manual_focus": True},
+            )
+        )
+        await conn.execute(
+            insert(hl_positions).values(
+                address=address,
+                dex="",
+                coin="BTC",
+                szi=Decimal("1"),
+                notional_usd=Decimal("100000"),
+                updated_at=clock.now,
+            )
+        )
+        await conn.execute(
+            insert(hl_state),
+            [
+                {"name": f"monitor_baseline:{address}", "cursor": {"established_at": clock.now.isoformat()}, "updated_at": clock.now},
+                {"name": f"fills:{address}", "cursor": {"last_time": 1}, "updated_at": clock.now},
+                {"name": f"liquidations:{address}", "cursor": {"last_tid": 1}, "updated_at": clock.now},
+                {"name": f"liq_risk:{address}::BTC", "cursor": {"level": "A"}, "updated_at": clock.now},
+                {"name": f"dexes:{address}", "cursor": {"dexes": ["xyz"]}, "updated_at": clock.now},
+                {"name": f"account_metadata:{address}", "cursor": {"account_type": "unifiedAccount"}, "updated_at": clock.now},
+                {"name": f"profile_fills:{address}", "cursor": {"last_time": 1}, "updated_at": clock.now},
+            ],
+        )
+
+    registry = WalletRegistry(engine, clock=clock, on_deactivated=forgotten.append)
+    assert await registry.set_excluded(address, True)
+
+    async with engine.connect() as conn:
+        position_count = await conn.scalar(
+            select(func.count()).select_from(hl_positions).where(
+                hl_positions.c.address == address
+            )
+        )
+        names = set(
+            (
+                await conn.execute(
+                    select(hl_state.c.name).where(hl_state.c.name.contains(address))
+                )
+            ).scalars()
+        )
+    assert position_count == 0
+    assert names == {f"profile_fills:{address}"}
+    assert forgotten == [address]
 
 
 @async_timeout()

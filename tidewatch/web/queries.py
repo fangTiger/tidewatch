@@ -211,7 +211,8 @@ def _wallet_dict(row: Any, total_notional: Decimal) -> dict[str, Any]:
     if not isinstance(tags, list):
         tags = []
     note = row["note"]
-    account_value = _decimal(profile.get("account_value", profile.get("leaderboard_account_value")))
+    # 排行榜值可能只含合约权益，账户类型未知时不能冒充统一账户完整权益。
+    account_value = _decimal(profile.get("account_value"))
     pnl_30d = _decimal(profile.get("pnl_30d"))
     win_rate = _decimal(profile.get("win_rate"))
     return {
@@ -230,6 +231,7 @@ def _wallet_dict(row: Any, total_notional: Decimal) -> dict[str, Any]:
         "profile_updated": _local_time(row["profile_updated_at"]),
         "account_value": _decimal_text(account_value),
         "account_value_value": account_value,
+        "account_value_pending": account_value is None,
         "pnl_30d": _decimal_text(pnl_30d),
         "pnl_30d_value": pnl_30d,
         "win_rate": _decimal_text(win_rate),

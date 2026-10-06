@@ -237,7 +237,8 @@ positions.appendChild(positionsBody);
 
 global.document = new DocumentStub([live, timeline, collectors, marketStrip, netPositions, netUpdated, positions]);
 global.EventSource = EventSourceStub;
-global.location = {reload() {}};
+let reloadCount = 0;
+global.location = {reload() { reloadCount += 1; }};
 global.setInterval = () => 1;
 
 const responses = [];
@@ -389,10 +390,16 @@ async function testHyperliquidUpdates() {
   assert.equal(positionsBody.rows[0].children[8].textContent, "-$0.00");
 }
 
+async function testResyncReloadsFullPage() {
+  await EventSourceStub.instance.emit("resync", {});
+  assert.equal(reloadCount, 1);
+}
+
 (async () => {
   await testTimeline();
   await testStatus();
   await testHyperliquidUpdates();
+  await testResyncReloadsFullPage();
   process.stdout.write("app DOM tests passed\n");
 })().catch((error) => {
   console.error(error);

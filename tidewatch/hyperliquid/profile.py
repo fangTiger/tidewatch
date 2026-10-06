@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
+from tidewatch.hyperliquid.logging import exception_summary, short_address
 from tidewatch.hyperliquid.monitor import combined_account_value
 from tidewatch.hyperliquid.registry import normalize_address
 from tidewatch.store.tables import hl_fills, hl_state, hl_wallets
@@ -649,8 +650,8 @@ class WalletProfiler:
         except Exception as exc:
             logger.warning(
                 "钱包 %s 的旧成交字段补齐失败，将按数据不足继续计算：%s",
-                normalized,
-                exc,
+                short_address(normalized),
+                exception_summary(exc),
             )
         portfolio = await self.rest.info("portfolio", budget="batch", user=normalized)
         abstraction = await self.rest.info("userAbstraction", budget="batch", user=normalized)
@@ -702,7 +703,11 @@ class WalletProfiler:
         async with self.engine.begin() as conn:
             current = (
                 await conn.execute(
-                    select(hl_wallets.c.profile, hl_wallets.c.excluded)
+                    select(
+                        hl_wallets.c.profile,
+                        hl_wallets.c.excluded,
+                        hl_wallets.c.tier,
+                    )
                     .where(hl_wallets.c.address == normalized)
                     .with_for_update()
                 )
@@ -722,6 +727,28 @@ class WalletProfiler:
                     style=computed.style,
                 )
             )
+            if current["tier"] in {"focus", "core"}:
+                metadata: dict[str, Any] = {
+                    "account_type": abstraction,
+                    "account_type_updated_at": now.isoformat(),
+                }
+                if isinstance(spot, Mapping):
+                    metadata["spot"] = dict(spot)
+                    metadata["spot_updated_at"] = now.isoformat()
+                metadata_stmt = pg_insert(hl_state).values(
+                    name=f"account_metadata:{normalized}",
+                    cursor=metadata,
+                    updated_at=now,
+                )
+                await conn.execute(
+                    metadata_stmt.on_conflict_do_update(
+                        index_elements=["name"],
+                        set_={
+                            "cursor": metadata_stmt.excluded.cursor,
+                            "updated_at": metadata_stmt.excluded.updated_at,
+                        },
+                    )
+                )
         return {
             "address": normalized,
             "style": computed.style,

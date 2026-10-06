@@ -14,7 +14,7 @@ import httpx
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from tidewatch.clock import Clock, utcnow
-from tidewatch.collectors.base import describe
+from tidewatch.hyperliquid.logging import exception_summary
 from tidewatch.hyperliquid.leaderboard import HYPURRSCAN_ALIASES_URL
 from tidewatch.hyperliquid.registry import ImportResult, WalletRegistry, normalize_address
 from tidewatch.store.tables import hl_state
@@ -71,7 +71,7 @@ class AliasCache:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return AliasResult(cached, True, describe(exc))
+            return AliasResult(cached, True, exception_summary(exc))
 
     def _read_cache(self) -> tuple[datetime | None, dict[str, str]]:
         try:
@@ -161,7 +161,7 @@ class LeaderboardImporter:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            await self._failure(describe(exc))
+            await self._failure(exception_summary(exc))
             raise
         if alias_result.refresh_failed:
             await self._failure(alias_result.error or "Hypurrscan 别名刷新失败")

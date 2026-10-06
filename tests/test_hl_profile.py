@@ -999,6 +999,55 @@ async def test_profiler_queries_each_configured_hip3_dex_with_batch_budget(engin
     assert rest.clearing_calls == [{"user": ADDRESS}, {"user": ADDRESS, "dex": "xyz"}]
     assert result["profile"]["account_value"] == "1500"
     assert result["profile"]["actual_leverage"] == "2"
+    async with engine.connect() as conn:
+        metadata = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name == f"account_metadata:{ADDRESS}"
+            )
+        )
+    assert metadata["account_type"] == "disabled"
+    assert metadata["account_type_updated_at"] == clock.now.isoformat()
+
+
+@async_timeout()
+async def test_candidate_profile_does_not_persist_monitoring_account_metadata(
+    engine, clock
+):
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS,
+                tier="candidate",
+                source="leaderboard",
+                excluded=False,
+            )
+        )
+
+    class Rest:
+        async def info(self, request_type: str, *, budget: str, **params):
+            assert budget == "batch"
+            if request_type == "userFillsByTime":
+                return []
+            if request_type == "portfolio":
+                return _portfolio()
+            if request_type == "userAbstraction":
+                return "disabled"
+            if request_type == "clearinghouseState":
+                return {
+                    "marginSummary": {"accountValue": "1000", "totalNtlPos": "0"},
+                    "assetPositions": [],
+                }
+            raise AssertionError(request_type)
+
+    await WalletProfiler(engine, Rest(), clock=clock).profile_wallet(ADDRESS)
+
+    async with engine.connect() as conn:
+        metadata = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name == f"account_metadata:{ADDRESS}"
+            )
+        )
+    assert metadata is None
 
 
 class _FakeProfiler:
@@ -1068,6 +1117,60 @@ async def test_batch_prioritizes_focus_shards_candidates_and_isolates_failure(en
         )
     assert cursor["phase"] == "complete"
     assert cursor["failed"] == [failing]
+
+
+@async_timeout()
+async def test_fill_page_commit_failure_does_not_advance_profile_cursor(
+    engine, clock, monkeypatch
+):
+    """约束类测试：成交页与游标必须处于同一事务。"""
+    old_time = int((clock.now - timedelta(hours=2)).timestamp() * 1000)
+    new_fill = _fill(
+        99,
+        coin="BTC",
+        hours=1,
+        start="0",
+        size="1",
+        side="B",
+    )
+
+    class Rest:
+        async def info(self, request_type: str, **params):
+            assert request_type == "userFillsByTime"
+            return [new_fill]
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"profile_fills:{ADDRESS}",
+                cursor={"last_time": old_time},
+                updated_at=clock.now,
+            )
+        )
+    profiler = WalletProfiler(engine, Rest(), clock=clock)
+    original = profiler._store_fill_page
+
+    async def fail_after_write(conn, address, fills):
+        await original(conn, address, fills)
+        raise RuntimeError("模拟事务提交前失败")
+
+    monkeypatch.setattr(profiler, "_store_fill_page", fail_after_write)
+    with pytest.raises(RuntimeError, match="模拟事务提交前失败"):
+        await profiler.sync_fills(
+            ADDRESS,
+            start_at=clock.now - timedelta(days=1),
+            end_at=clock.now,
+        )
+
+    async with engine.connect() as conn:
+        cursor = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name == f"profile_fills:{ADDRESS}"
+            )
+        )
+        count = await conn.scalar(select(func.count()).select_from(hl_fills))
+    assert cursor["last_time"] == old_time
+    assert count == 0
 
 
 @async_timeout()

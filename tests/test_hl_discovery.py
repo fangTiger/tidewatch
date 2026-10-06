@@ -851,6 +851,103 @@ async def test_queued_qualification_is_restored_after_restart(engine, settings, 
 
 
 @async_timeout()
+async def test_qualification_window_is_queued_before_in_memory_schedule(
+    engine, settings, clock
+):
+    """调度进程在接收任务时崩溃，数据库里也必须已经是可恢复的 queued。"""
+    address = "0x1111111111111111111111111111111111111111"
+
+    def crash_after_accepting(_request: QualificationRequest) -> None:
+        raise RuntimeError("模拟调度进程崩溃")
+
+    discovery = TradeDiscovery(
+        settings.hyperliquid,
+        engine=engine,
+        registry=WalletRegistry(engine, clock=clock),
+        monitor=None,
+        rest=None,
+        sink=None,
+        clock=clock,
+        schedule_query=crash_after_accepting,
+    )
+    await discovery.handle_message(
+        {
+            "channel": "trades",
+            "data": [
+                _trade(
+                    address=address,
+                    time_ms=1_000,
+                    px="100",
+                    sz="50000",
+                    tid=1,
+                )
+            ],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="模拟调度进程崩溃"):
+        await discovery.flush_due(3_000)
+
+    async with engine.connect() as conn:
+        cursor = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name.like("discovery_window:%")
+            )
+        )
+    assert cursor["status"] == "queued"
+    assert cursor["processed"] is False
+
+
+@async_timeout()
+async def test_qualification_window_is_queued_before_database_decision(
+    engine, settings, clock
+):
+    """资格判断读库失败时，窗口也必须已处于可恢复的 queued 状态。"""
+    address = "0x1111111111111111111111111111111111111111"
+    discovery = TradeDiscovery(
+        settings.hyperliquid,
+        engine=engine,
+        registry=WalletRegistry(engine, clock=clock),
+        monitor=None,
+        rest=None,
+        sink=None,
+        clock=clock,
+        schedule_query=lambda request: None,
+    )
+
+    async def fail_wallet_lookup(_address: str):
+        raise RuntimeError("模拟名单读取失败")
+
+    discovery._wallet = fail_wallet_lookup
+    await discovery.handle_message(
+        {
+            "channel": "trades",
+            "data": [
+                _trade(
+                    address=address,
+                    time_ms=1_000,
+                    px="100",
+                    sz="50000",
+                    tid=1,
+                )
+            ],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="模拟名单读取失败"):
+        await discovery.flush_due(3_000)
+
+    async with engine.connect() as conn:
+        cursor = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name.like("discovery_window:%")
+            )
+        )
+    assert cursor["status"] == "queued"
+    assert cursor["processed"] is False
+
+
+@async_timeout()
 async def test_runtime_builds_main_and_allowlisted_hip3_trade_subscriptions(
     engine, settings, clock
 ):

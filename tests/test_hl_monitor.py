@@ -155,7 +155,7 @@ async def test_first_reconcile_with_existing_positions_only_establishes_baseline
     }
     assert fill_cursor["last_time"] == int(clock.now.timestamp() * 1000)
     assert risk == {"level": "S"}
-    assert [call["type"] for call in calls] == ["clearinghouseState", "userAbstraction"]
+    assert [call["type"] for call in calls] == ["clearinghouseState"]
 
 
 async def test_web_callbacks_run_after_position_commit_and_market_update(engine, settings, clock):
@@ -628,6 +628,117 @@ def test_unified_account_value_adds_spot_usdc_only_for_unified_accounts():
     assert combined_account_value("disabled", clearing, spot) == Decimal("800000")
 
 
+@async_timeout()
+async def test_daily_fill_cleanup_honors_configured_retention_and_profile_window(
+    engine, settings, clock
+):
+    settings.hyperliquid.fill_retention_days = 30
+    rows = []
+    for tid, days in ((1, 31), (2, 30), (3, 29)):
+        rows.append(
+            {
+                "address": ADDRESS,
+                "tid": tid,
+                "coin": "BTC",
+                "dir": "Open Long",
+                "px": Decimal("100"),
+                "sz": Decimal("1"),
+                "closed_pnl": Decimal("0"),
+                "fee": Decimal("0"),
+                "crossed": True,
+                "occurred_at": clock.now - timedelta(days=days),
+                "hash": f"0x{tid:064x}",
+                "is_twap": False,
+            }
+        )
+    async with engine.begin() as conn:
+        await conn.execute(insert(hl_fills), rows)
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=None,
+        sink=None,
+        clock=clock,
+    )
+
+    removed = await asyncio.wait_for(monitor.cleanup_old_fills(), timeout=5)
+
+    async with engine.connect() as conn:
+        tids = list((await conn.execute(select(hl_fills.c.tid))).scalars())
+    assert removed == 1
+    assert tids == [2, 3]
+
+
+@async_timeout()
+async def test_ws_replayed_tid_is_stored_once(engine, settings, clock):
+    """约束类测试：WS 重连重放相同 tid 时依赖（地址, tid）保持幂等。"""
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=None,
+        sink=None,
+        clock=clock,
+    )
+    message = {
+        "channel": "userFills",
+        "data": {
+            "user": ADDRESS,
+            "isSnapshot": False,
+            "fills": [
+                {
+                    "coin": "BTC",
+                    "px": "100000",
+                    "sz": "1",
+                    "dir": "Open Long",
+                    "side": "B",
+                    "startPosition": "0",
+                    "closedPnl": "0",
+                    "fee": "1",
+                    "crossed": True,
+                    "time": int(clock.now.timestamp() * 1000),
+                    "hash": "0xabc",
+                    "tid": 42,
+                }
+            ],
+        },
+    }
+
+    await monitor.handle_core_message(message)
+    await monitor.handle_core_message(message)
+
+    async with engine.connect() as conn:
+        count = await conn.scalar(select(func.count()).select_from(hl_fills))
+    assert count == 1
+
+
+@async_timeout()
+async def test_forget_wallet_clears_all_wallet_scoped_memory(settings, engine, clock):
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=None,
+        sink=None,
+        clock=clock,
+    )
+    monitor._account_metadata[ADDRESS] = {"account_type": "unifiedAccount"}
+    monitor._recent_fills[(ADDRESS, "BTC")] = {"tid": 1}
+    monitor._deferred_fills[ADDRESS] = (clock.now, {"BTC"})
+    monitor._pending_reconciles[ADDRESS] = object()
+    monitor._liquidation_locks[ADDRESS] = asyncio.Lock()
+    monitor._fill_timeout_warnings[ADDRESS] = clock.now
+    monitor._account_lookup_warnings[(ADDRESS, "spot")] = clock.now
+
+    monitor.forget_wallet(ADDRESS)
+
+    assert ADDRESS not in monitor._account_metadata
+    assert ADDRESS not in monitor._deferred_fills
+    assert ADDRESS not in monitor._pending_reconciles
+    assert ADDRESS not in monitor._liquidation_locks
+    assert ADDRESS not in monitor._fill_timeout_warnings
+    assert not any(key[0] == ADDRESS for key in monitor._recent_fills)
+    assert not any(key[0] == ADDRESS for key in monitor._account_lookup_warnings)
+
+
 async def test_rest_reconcile_persists_snapshot_fill_and_cursor_then_ingests_event(
     engine, settings, clock
 ):
@@ -674,6 +785,18 @@ async def test_rest_reconcile_persists_snapshot_fill_and_cursor_then_ingests_eve
         await conn.execute(
             insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual")
         )
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"account_metadata:{ADDRESS}",
+                cursor={
+                    "account_type": "unifiedAccount",
+                    "account_type_updated_at": clock.now.isoformat(),
+                    "spot": {"balances": [{"coin": "USDC", "total": "300000"}]},
+                    "spot_updated_at": clock.now.isoformat(),
+                },
+                updated_at=clock.now,
+            )
+        )
     sink = create_event_sink(engine, settings, clock=clock)
     await sink.start()
     rest = HyperliquidRestClient(
@@ -714,7 +837,7 @@ async def test_rest_reconcile_persists_snapshot_fill_and_cursor_then_ingests_eve
     assert pushes == 1
 
 
-async def test_multi_request_reconcile_resumes_completed_steps_after_budget_deferral(
+async def test_multi_dex_reconcile_resumes_completed_steps_after_budget_deferral(
     engine, settings, clock
 ):
     class Rest:
@@ -727,14 +850,21 @@ async def test_multi_request_reconcile_resumes_completed_steps_after_budget_defe
             if not self.allowance:
                 return False, None
             self.allowance -= 1
-            if request_type == "clearinghouseState":
-                return True, {"marginSummary": {"accountValue": "800000"}, "assetPositions": []}
-            if request_type == "userAbstraction":
-                return True, "disabled"
-            raise AssertionError(request_type)
+            assert request_type == "clearinghouseState"
+            return True, {"marginSummary": {"accountValue": "800000"}, "assetPositions": []}
 
     async with engine.begin() as conn:
         await conn.execute(insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual"))
+        await conn.execute(
+            insert(hl_positions).values(
+                address=ADDRESS,
+                dex="xyz",
+                coin="xyz:GOLD",
+                szi=Decimal("1"),
+                notional_usd=Decimal("1000000"),
+                updated_at=clock.now,
+            )
+        )
     rest = Rest()
     monitor = HyperliquidMonitor(
         settings.hyperliquid,
@@ -747,10 +877,10 @@ async def test_multi_request_reconcile_resumes_completed_steps_after_budget_defe
     assert not await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
     rest.allowance = 1
     assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
-    assert rest.calls == ["clearinghouseState", "userAbstraction", "userAbstraction"]
+    assert rest.calls == ["clearinghouseState", "clearinghouseState", "clearinghouseState"]
 
 
-async def test_reconcile_starts_independent_state_and_account_queries_concurrently(
+async def test_reconcile_starts_main_and_active_hip3_queries_concurrently(
     engine, settings, clock
 ):
     started: set[str] = set()
@@ -759,15 +889,24 @@ async def test_reconcile_starts_independent_state_and_account_queries_concurrent
 
     class Rest:
         async def try_info(self, request_type: str, **params):
-            started.add(request_type)
-            if started == {"clearinghouseState", "userAbstraction"}:
+            assert request_type == "clearinghouseState"
+            started.add(params.get("dex", "main"))
+            if started == {"main", "xyz"}:
                 both_started.set()
             await release.wait()
-            if request_type == "clearinghouseState":
-                return True, _empty_state()
-            if request_type == "userAbstraction":
-                return True, "disabled"
-            raise AssertionError(request_type)
+            return True, _empty_state()
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_positions).values(
+                address=ADDRESS,
+                dex="xyz",
+                coin="xyz:GOLD",
+                szi=Decimal("1"),
+                notional_usd=Decimal("1000000"),
+                updated_at=clock.now,
+            )
+        )
 
     monitor = HyperliquidMonitor(
         settings.hyperliquid,
@@ -788,17 +927,24 @@ async def test_reconcile_starts_independent_state_and_account_queries_concurrent
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_account_type_cache_refreshes_after_one_hour(engine, settings, clock):
+async def test_account_metadata_background_refresh_obeys_persistent_ttl(engine, settings, clock):
     abstraction_calls = 0
 
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS,
+                tier="focus",
+                source="manual",
+            )
+        )
+
     class Rest:
-        async def try_info(self, request_type: str, **params):
+        async def info(self, request_type: str, **params):
             nonlocal abstraction_calls
-            if request_type == "clearinghouseState":
-                return True, _empty_state()
             if request_type == "userAbstraction":
                 abstraction_calls += 1
-                return True, "disabled"
+                return "disabled"
             raise AssertionError(request_type)
 
     monitor = HyperliquidMonitor(
@@ -808,11 +954,13 @@ async def test_account_type_cache_refreshes_after_one_hour(engine, settings, clo
         sink=None,
         clock=clock,
     )
-    assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=1)
+    assert await asyncio.wait_for(monitor.account_metadata_due(ADDRESS), timeout=1)
+    await asyncio.wait_for(monitor.refresh_account_metadata(ADDRESS), timeout=1)
     clock.advance(seconds=settings.hyperliquid.frequencies.account_type_cache_s - 1)
-    assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=1)
+    assert not await asyncio.wait_for(monitor.account_metadata_due(ADDRESS), timeout=1)
     clock.advance(seconds=1)
-    assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=1)
+    assert await asyncio.wait_for(monitor.account_metadata_due(ADDRESS), timeout=1)
+    await asyncio.wait_for(monitor.refresh_account_metadata(ADDRESS), timeout=1)
 
     assert abstraction_calls == 2
 
@@ -1208,14 +1356,12 @@ async def test_deferred_fill_budget_deferral_is_debug_not_timeout(
     assert not any("超过" in record.message for record in records)
 
 
-async def test_empty_account_lookup_errors_use_exception_type(
+async def test_core_account_value_missing_metadata_is_pending_without_network(
     engine, settings, clock, caplog
 ):
     class AccountRest:
         async def try_info(self, request_type: str, **params):
-            if request_type == "userAbstraction":
-                raise asyncio.TimeoutError()
-            raise AssertionError(request_type)
+            raise AssertionError(f"核心路径不应查询 {request_type}")
 
     account_monitor = HyperliquidMonitor(
         settings.hyperliquid,
@@ -1224,26 +1370,38 @@ async def test_empty_account_lookup_errors_use_exception_type(
         sink=None,
         clock=clock,
     )
-    caplog.set_level("WARNING", logger="tidewatch.hyperliquid.monitor")
     account_value = await asyncio.wait_for(
         account_monitor._core_account_value(ADDRESS, _empty_state()),
         timeout=1,
     )
 
-    assert account_value == Decimal("800000")
-    assert any(
-        "账户类型查询失败，暂按普通账户处理：TimeoutError()" in record.message
-        for record in caplog.records
-    )
-    caplog.clear()
+    assert account_value is None
+    assert not caplog.records
 
+
+async def test_core_account_value_uses_latest_persisted_spot_even_when_refresh_is_due(
+    engine, settings, clock, caplog
+):
     class Rest:
         async def try_info(self, request_type: str, **params):
-            if request_type == "userAbstraction":
-                return True, "unifiedAccount"
-            if request_type == "spotClearinghouseState":
-                raise asyncio.TimeoutError()
-            raise AssertionError(request_type)
+            raise AssertionError(f"核心路径不应查询 {request_type}")
+
+    stale_at = clock.now - timedelta(
+        seconds=settings.hyperliquid.frequencies.account_type_cache_s + 1
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"account_metadata:{ADDRESS}",
+                cursor={
+                    "account_type": "unifiedAccount",
+                    "account_type_updated_at": stale_at.isoformat(),
+                    "spot": {"balances": [{"coin": "USDC", "total": "300000"}]},
+                    "spot_updated_at": stale_at.isoformat(),
+                },
+                updated_at=stale_at,
+            )
+        )
 
     monitor = HyperliquidMonitor(
         settings.hyperliquid,
@@ -1253,49 +1411,11 @@ async def test_empty_account_lookup_errors_use_exception_type(
         clock=clock,
     )
     value = await asyncio.wait_for(
-        monitor._core_account_value(ADDRESS, _empty_state()),
-        timeout=1,
+        monitor._core_account_value(ADDRESS, _empty_state()), timeout=1
     )
 
-    assert value == Decimal("800000")
-    assert any(
-        "现货 USDC 查询失败，使用最近缓存：TimeoutError()" in record.message
-        for record in caplog.records
-    )
-
-
-async def test_spot_lookup_timeout_uses_rest_compatible_timeout_and_wallet_warning_limit(
-    engine, settings, clock, caplog
-):
-    class Rest:
-        async def try_info(self, request_type: str, **params):
-            if request_type == "userAbstraction":
-                return True, "unifiedAccount"
-            if request_type == "spotClearinghouseState":
-                raise asyncio.TimeoutError()
-            raise AssertionError(request_type)
-
-    monitor = HyperliquidMonitor(
-        settings.hyperliquid,
-        engine=engine,
-        rest=Rest(),
-        sink=None,
-        clock=clock,
-    )
-    assert monitor.account_lookup_timeout_s >= monitor.fill_lookup_timeout_s
-    caplog.set_level("DEBUG", logger="tidewatch.hyperliquid.monitor")
-
-    await asyncio.wait_for(monitor._core_account_value(ADDRESS, _empty_state()), timeout=1)
-    await asyncio.wait_for(monitor._core_account_value(ADDRESS, _empty_state()), timeout=1)
-    clock.advance(seconds=settings.hyperliquid.frequencies.fill_timeout_warning_interval_s)
-    await asyncio.wait_for(monitor._core_account_value(ADDRESS, _empty_state()), timeout=1)
-
-    records = [
-        record
-        for record in caplog.records
-        if "现货 USDC 查询失败，使用最近缓存" in record.message
-    ]
-    assert [record.levelname for record in records] == ["WARNING", "DEBUG", "WARNING"]
+    assert value == Decimal("1100000")
+    assert await monitor.account_metadata_due(ADDRESS)
 
 
 async def test_reconcile_refreshes_known_hip3_dex_without_overwriting_main_dex(
@@ -1380,7 +1500,7 @@ async def test_reconcile_refreshes_known_hip3_dex_without_overwriting_main_dex(
     assert event_type == "hl_increase"
 
 
-async def test_known_hip3_dex_remains_reconciled_after_position_closes(engine, settings, clock):
+async def test_closed_hip3_dex_leaves_followup_reconcile_critical_path(engine, settings, clock):
     requests: list[dict] = []
 
     class Rest:
@@ -1434,7 +1554,6 @@ async def test_known_hip3_dex_remains_reconciled_after_position_closes(engine, s
     clearing = [item for item in requests if item["type"] == "clearinghouseState"]
     assert clearing == [
         {"type": "clearinghouseState", "budget": "monitor", "user": ADDRESS},
-        {"type": "clearinghouseState", "budget": "monitor", "user": ADDRESS, "dex": "xyz"},
     ]
     async with engine.connect() as conn:
         risk = await conn.scalar(
@@ -1445,7 +1564,7 @@ async def test_known_hip3_dex_remains_reconciled_after_position_closes(engine, s
     assert risk is None
 
 
-async def test_configured_hip3_dex_is_queried_before_wallet_has_local_position(
+async def test_configured_hip3_dex_without_local_position_is_not_on_critical_path(
     engine, settings, clock
 ):
     requests: list[dict] = []
@@ -1473,12 +1592,6 @@ async def test_configured_hip3_dex_is_queried_before_wallet_has_local_position(
     clearing = [item for item in requests if item["type"] == "clearinghouseState"]
     assert clearing == [
         {"type": "clearinghouseState", "budget": "monitor", "user": ADDRESS},
-        {
-            "type": "clearinghouseState",
-            "budget": "monitor",
-            "user": ADDRESS,
-            "dex": "xyz",
-        },
     ]
 
 
@@ -1727,6 +1840,18 @@ async def test_core_ws_unified_account_uses_current_spot_usdc(engine, settings, 
 
     async with engine.begin() as conn:
         await conn.execute(insert(hl_wallets).values(address=ADDRESS, tier="core", source="manual"))
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"account_metadata:{ADDRESS}",
+                cursor={
+                    "account_type": "unifiedAccount",
+                    "account_type_updated_at": clock.now.isoformat(),
+                    "spot": {"balances": [{"coin": "USDC", "total": "300000"}]},
+                    "spot_updated_at": clock.now.isoformat(),
+                },
+                updated_at=clock.now,
+            )
+        )
     sink = create_event_sink(engine, settings, clock=clock)
     await sink.start()
     monitor = HyperliquidMonitor(

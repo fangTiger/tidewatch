@@ -33,7 +33,11 @@ NAMED_INDEXES = {
     "push_log": {"ix_push_log_cluster_id", "ix_push_log_status"},
     "hl_wallets": {"ix_hl_wallets_tier_excluded", "ix_hl_wallets_last_position_at"},
     "hl_positions": {"ix_hl_positions_coin", "ix_hl_positions_updated_at"},
-    "hl_fills": {"ix_hl_fills_address_occurred_at", "ix_hl_fills_coin_occurred_at"},
+    "hl_fills": {
+        "ix_hl_fills_address_occurred_at",
+        "ix_hl_fills_coin_occurred_at",
+        "ix_hl_fills_occurred_at",
+    },
 }
 
 

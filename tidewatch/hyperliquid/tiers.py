@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tidewatch.clock import Clock, utcnow
 from tidewatch.hyperliquid.baseline import invalidate_monitor_baseline
 from tidewatch.hyperliquid.positions import upsert_position_snapshot
-from tidewatch.hyperliquid.registry import REGISTRY_LOCK_KEY
+from tidewatch.hyperliquid.registry import REGISTRY_LOCK_KEY, cleanup_monitoring_state
 from tidewatch.store.tables import hl_positions, hl_state, hl_wallets
 
 
@@ -44,6 +44,7 @@ class TierRecalculator:
         focus_limit: int = 200,
         no_position_days: int = 7,
         clock: Clock = utcnow,
+        on_deactivated: Callable[[str], None] | None = None,
     ) -> None:
         self.engine = engine
         self.rest = rest
@@ -51,6 +52,7 @@ class TierRecalculator:
         self.focus_limit = focus_limit
         self.no_position_days = no_position_days
         self.clock = clock
+        self.on_deactivated = on_deactivated
 
     async def recompute(self) -> TierResult:
         """查询全部可自动晋升候选并重算；失败时保留查询断点。"""
@@ -133,6 +135,7 @@ class TierRecalculator:
     ) -> TierResult:
         now = self.clock()
         cutoff = now - timedelta(days=self.no_position_days)
+        deactivated: list[str] = []
         async with self.engine.begin() as conn:
             await conn.execute(select(func.pg_advisory_xact_lock(REGISTRY_LOCK_KEY)))
             wallet_rows = (
@@ -218,7 +221,11 @@ class TierRecalculator:
                 if old_tier != new_tier and (
                     old_tier in {"focus", "core"} or new_tier in {"focus", "core"}
                 ):
-                    await invalidate_monitor_baseline(conn, address)
+                    if old_tier in {"focus", "core"} and new_tier not in {"focus", "core"}:
+                        await cleanup_monitoring_state(conn, address)
+                        deactivated.append(address)
+                    else:
+                        await invalidate_monitor_baseline(conn, address)
 
             cursor = {
                 "phase": "complete",
@@ -233,6 +240,9 @@ class TierRecalculator:
                 set_={"cursor": stmt.excluded.cursor, "updated_at": stmt.excluded.updated_at},
             )
             await conn.execute(stmt)
+        if self.on_deactivated is not None:
+            for address in deactivated:
+                self.on_deactivated(address)
         return TierResult(queried, promoted, demoted)
 
     async def _write_query_cursor(
