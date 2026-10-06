@@ -83,3 +83,32 @@ async def test_execute_profile_prints_all_metrics(engine, clock):
     assert "胜率" in output and "62.50%" in output
     assert "波段" in output
     assert "样本量：8" in output
+
+
+@async_timeout()
+async def test_profile_only_prints_top_ten_leverages_by_current_notional(engine, clock):
+    address = _address(3)
+    registry = WalletRegistry(engine, clock=clock)
+    await registry.add(address)
+    leverages = {f"COIN{number:02d}": str(number) for number in range(1, 13)}
+    notionals = {f"COIN{number:02d}": str(number * 1000) for number in range(1, 13)}
+
+    class Profiler:
+        async def profile_wallet(self, requested: str):
+            assert requested == address
+            return {
+                "address": address,
+                "style": "directional",
+                "profile": {
+                    "configured_leverage": leverages,
+                    "configured_leverage_notionals": notionals,
+                },
+            }
+
+    output = await execute(parse_args(["profile", address]), registry, profiler=Profiler())
+    leverage_line = next(line for line in output.splitlines() if line.startswith("设置杠杆："))
+
+    assert leverage_line.index("COIN12 12x") < leverage_line.index("COIN11 11x")
+    assert "COIN03 3x" in leverage_line
+    assert "COIN02 2x" not in leverage_line and "COIN01 1x" not in leverage_line
+    assert "另有 2 个" in leverage_line

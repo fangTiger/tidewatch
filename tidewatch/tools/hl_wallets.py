@@ -171,7 +171,7 @@ def _format_profile(result: dict[str, Any]) -> str:
         f"日均成交：{_number(profile.get('daily_fill_count'))} 笔{_sample_suffix(coverage, 'daily_fill_count')}",
         f"挂单占比：{_percent(profile.get('passive_fill_ratio'))}",
         f"实际杠杆：{_number(profile.get('actual_leverage'))}x{_sample_suffix(coverage, 'actual_leverage')}",
-        f"设置杠杆：{_configured_leverage(profile.get('configured_leverage'))}{_sample_suffix(coverage, 'configured_leverage')}",
+        f"设置杠杆：{_configured_leverage(profile.get('configured_leverage'), profile.get('configured_leverage_notionals'))}{_sample_suffix(coverage, 'configured_leverage')}",
     ]
     return "\n".join(lines)
 
@@ -219,10 +219,20 @@ def _preferred_coins(value: Any) -> str:
     ) or "数据不足"
 
 
-def _configured_leverage(value: Any) -> str:
+def _configured_leverage(value: Any, notionals: Any = None) -> str:
     if not isinstance(value, dict) or not value:
         return "数据不足"
-    return "、".join(f"{coin} {leverage}x" for coin, leverage in sorted(value.items()))
+    notional_values = notionals if isinstance(notionals, dict) else {}
+    items = sorted(
+        value.items(),
+        key=lambda item: (
+            -(_decimal(notional_values.get(item[0])) or Decimal(0)),
+            item[0],
+        ),
+    )
+    shown = "、".join(f"{coin} {leverage}x" for coin, leverage in items[:10])
+    remaining = len(items) - 10
+    return f"{shown}（另有 {remaining} 个）" if remaining > 0 else shown
 
 
 def _sample_suffix(coverage: dict[str, Any], key: str) -> str:

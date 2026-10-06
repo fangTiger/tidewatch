@@ -287,14 +287,26 @@ def test_leverage_and_account_value_include_configured_hip3_dexes():
         clearing_state={
             "marginSummary": {"accountValue": "1000", "totalNtlPos": "2000"},
             "assetPositions": [
-                {"position": {"coin": "BTC", "leverage": {"value": 2}}},
+                {
+                    "position": {
+                        "coin": "BTC",
+                        "leverage": {"value": 2},
+                        "positionValue": "2000",
+                    }
+                },
             ],
         },
         dex_clearing_states={
             "xyz": {
                 "marginSummary": {"accountValue": "500", "totalNtlPos": "1000"},
                 "assetPositions": [
-                    {"position": {"coin": "xyz:SILVER", "leverage": {"value": 4}}},
+                    {
+                        "position": {
+                            "coin": "xyz:SILVER",
+                            "leverage": {"value": 4},
+                            "positionValue": "1000",
+                        }
+                    },
                 ],
             }
         },
@@ -307,10 +319,14 @@ def test_leverage_and_account_value_include_configured_hip3_dexes():
     assert result.profile["account_value"] == "2000"
     assert result.profile["actual_leverage"] == "1.5"
     assert result.profile["configured_leverage"] == {"BTC": "2", "xyz:SILVER": "4"}
+    assert result.profile["configured_leverage_notionals"] == {
+        "BTC": "2000",
+        "xyz:SILVER": "1000",
+    }
     assert result.profile["coverage"]["account_value"]["sample_size"] == 3
 
 
-def test_drawdown_uses_each_starting_account_value_not_only_global_pnl_peak():
+def test_drawdown_amount_uses_pnl_peak_and_ratio_uses_that_peaks_account_value():
     portfolio = [
         [
             "allTime",
@@ -339,8 +355,75 @@ def test_drawdown_uses_each_starting_account_value_not_only_global_pnl_peak():
         now=NOW,
     )
 
-    assert result.profile["max_drawdown"] == "90"
-    assert result.profile["max_drawdown_ratio"] == "0.9"
+    assert result.profile["max_drawdown"] == "100"
+    assert result.profile["max_drawdown_ratio"] == "0.01"
+
+
+def test_drawdown_aligns_nearest_earlier_account_value_when_pnl_peak_is_near_zero():
+    portfolio = [
+        [
+            "allTime",
+            {
+                "accountValueHistory": [[100, "500"], [250, "400"]],
+                "pnlHistory": [[100, "-1"], [200, "0.01"], [300, "-100"]],
+                "vlm": "0",
+            },
+        ]
+    ]
+
+    result = calculate_wallet_profile(
+        portfolio=portfolio,
+        fills=[],
+        clearing_state={
+            "marginSummary": {"accountValue": "1", "totalNtlPos": "0"},
+            "assetPositions": [],
+        },
+        abstraction="disabled",
+        spot_state=None,
+        coverage=FillCoverage(NOW - timedelta(days=30), NOW, True, 0),
+        now=NOW,
+    )
+
+    assert result.profile["max_drawdown"] == "100.01"
+    assert result.profile["max_drawdown_ratio"] == "0.20002"
+
+
+@pytest.mark.parametrize(
+    ("accounts", "reason"),
+    [
+        ([[250, "500"]], "回撤起点前没有可对齐的账户价值"),
+        ([[100, "0"]], "回撤起点对应的账户价值小于等于零"),
+    ],
+)
+def test_drawdown_keeps_amount_and_explains_unavailable_ratio(accounts, reason):
+    portfolio = [
+        [
+            "allTime",
+            {
+                "accountValueHistory": accounts,
+                "pnlHistory": [[100, "10"], [200, "-20"]],
+                "vlm": "0",
+            },
+        ]
+    ]
+
+    result = calculate_wallet_profile(
+        portfolio=portfolio,
+        fills=[],
+        clearing_state={
+            "marginSummary": {"accountValue": "1", "totalNtlPos": "0"},
+            "assetPositions": [],
+        },
+        abstraction="disabled",
+        spot_state=None,
+        coverage=FillCoverage(NOW - timedelta(days=30), NOW, True, 0),
+        now=NOW,
+    )
+
+    assert result.profile["max_drawdown"] == "30"
+    assert result.profile["max_drawdown_ratio"] is None
+    assert result.profile["coverage"]["max_drawdown"]["sufficient"] is False
+    assert result.profile["coverage"]["max_drawdown"]["reason"] == reason
 
 
 def test_holding_rounds_only_count_complete_zero_to_position_to_zero_cycles():
@@ -665,6 +748,159 @@ async def test_monitor_and_profile_rest_overlap_share_fill_idempotency(engine, s
         rows = (await conn.execute(select(hl_fills))).mappings().all()
     assert len(rows) == 1
     assert rows[0]["side"] == "B" and rows[0]["start_position"] == Decimal("0")
+
+
+@async_timeout()
+async def test_profile_backfills_old_fill_fields_with_batch_pagination_before_calculation(
+    engine, clock
+):
+    old_fills = [
+        _fill(601, coin="BTC", hours=1, start="0", size="1", side="B"),
+        _fill(602, coin="BTC", hours=2, start="1", size="1", side="B"),
+        _fill(603, coin="BTC", hours=7, start="2", size="2", side="A"),
+    ]
+    base_time = clock() - timedelta(days=2)
+    for fill, hours in zip(old_fills, (1, 2, 7), strict=True):
+        fill["time"] = int((base_time + timedelta(hours=hours)).timestamp() * 1000)
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS, tier="candidate", source="leaderboard", excluded=False
+            )
+        )
+        await conn.execute(
+            insert(hl_fills),
+            [
+                {
+                    "address": ADDRESS,
+                    "tid": fill["tid"],
+                    "coin": fill["coin"],
+                    "dir": f"旧方向 {fill['tid']}",
+                    "side": None,
+                    "start_position": None,
+                    "px": Decimal(fill["px"]),
+                    "sz": Decimal(fill["sz"]),
+                    "closed_pnl": Decimal(fill["closedPnl"]),
+                    "fee": Decimal("9"),
+                    "crossed": fill["crossed"],
+                    "occurred_at": datetime.fromtimestamp(
+                        fill["time"] / 1000, tz=timezone.utc
+                    ),
+                    "hash": fill["hash"],
+                    "is_twap": False,
+                    "liquidation": None,
+                }
+                for fill in old_fills
+            ],
+        )
+
+    class Rest:
+        def __init__(self):
+            self.fill_calls: list[dict] = []
+
+        async def info(self, request_type: str, *, budget: str, **params):
+            assert budget == "batch"
+            if request_type == "userFillsByTime":
+                self.fill_calls.append(params)
+                pages = [[], old_fills[:2], old_fills[1:], []]
+                return pages[len(self.fill_calls) - 1]
+            if request_type == "portfolio":
+                return _portfolio()
+            if request_type == "userAbstraction":
+                return "disabled"
+            if request_type == "clearinghouseState":
+                return {
+                    "marginSummary": {"accountValue": "100", "totalNtlPos": "0"},
+                    "assetPositions": [],
+                }
+            raise AssertionError(request_type)
+
+    rest = Rest()
+    profiler = WalletProfiler(engine, rest, clock=clock, fill_page_size=2)
+
+    result = await profiler.profile_wallet(ADDRESS)
+
+    assert len(rest.fill_calls) == 4
+    assert rest.fill_calls[1]["startTime"] == old_fills[0]["time"]
+    assert rest.fill_calls[1]["endTime"] == old_fills[-1]["time"]
+    assert rest.fill_calls[2]["startTime"] == old_fills[1]["time"]
+    assert result["profile"]["holding_duration_avg_s"] == 6 * 3600
+    assert result["profile"]["coverage"]["holding_duration"]["sufficient"] is True
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(select(hl_fills).order_by(hl_fills.c.tid))
+        ).mappings().all()
+    assert len(rows) == 3
+    assert [(row["side"], row["start_position"]) for row in rows] == [
+        ("B", Decimal("0")),
+        ("B", Decimal("1")),
+        ("A", Decimal("2")),
+    ]
+    assert [row["dir"] for row in rows] == ["旧方向 601", "旧方向 602", "旧方向 603"]
+    assert [row["fee"] for row in rows] == [Decimal("9")] * 3
+
+
+@async_timeout()
+async def test_profile_marks_holding_data_insufficient_when_old_fill_backfill_fails(
+    engine, clock
+):
+    fill = _fill(611, coin="BTC", hours=1, start="0", size="1", side="B")
+    fill["time"] = int((clock() - timedelta(days=2)).timestamp() * 1000)
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=ADDRESS, tier="candidate", source="leaderboard", excluded=False
+            )
+        )
+        await conn.execute(
+            insert(hl_fills).values(
+                address=ADDRESS,
+                tid=fill["tid"],
+                coin=fill["coin"],
+                dir=fill["dir"],
+                side=None,
+                start_position=None,
+                px=Decimal(fill["px"]),
+                sz=Decimal(fill["sz"]),
+                closed_pnl=Decimal(fill["closedPnl"]),
+                fee=Decimal(fill["fee"]),
+                crossed=fill["crossed"],
+                occurred_at=datetime.fromtimestamp(fill["time"] / 1000, tz=timezone.utc),
+                hash=fill["hash"],
+                is_twap=False,
+            )
+        )
+
+    class Rest:
+        def __init__(self):
+            self.fill_calls = 0
+
+        async def info(self, request_type: str, *, budget: str, **params):
+            assert budget == "batch"
+            if request_type == "userFillsByTime":
+                self.fill_calls += 1
+                if self.fill_calls == 1:
+                    return []
+                raise RuntimeError("补齐请求失败")
+            if request_type == "portfolio":
+                return _portfolio()
+            if request_type == "userAbstraction":
+                return "disabled"
+            if request_type == "clearinghouseState":
+                return {
+                    "marginSummary": {"accountValue": "100", "totalNtlPos": "0"},
+                    "assetPositions": [],
+                }
+            raise AssertionError(request_type)
+
+    rest = Rest()
+    result = await WalletProfiler(engine, rest, clock=clock).profile_wallet(ADDRESS)
+
+    assert rest.fill_calls == 2
+    assert result["profile"]["holding_duration_avg_s"] is None
+    assert result["profile"]["coverage"]["holding_duration"]["reason"] == (
+        "1 笔成交缺少 side 或 startPosition，无法完整重建"
+    )
 
 
 @async_timeout()

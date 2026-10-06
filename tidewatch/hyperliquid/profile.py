@@ -14,7 +14,7 @@ from statistics import median
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
@@ -196,7 +196,9 @@ def calculate_wallet_profile(
     pnl_30d = _history_delta(month, "pnlHistory")
     volume_total = _window_decimal(all_time, "vlm")
     volume_30d = _window_decimal(month, "vlm")
-    drawdown, drawdown_ratio, drawdown_samples = _max_drawdown(all_time)
+    drawdown, drawdown_ratio, drawdown_samples, drawdown_ratio_reason = _max_drawdown(
+        all_time
+    )
 
     close_pnls = [
         _decimal(fill.get("closedPnl", fill.get("closed_pnl", 0)))
@@ -247,8 +249,12 @@ def calculate_wallet_profile(
     )
     actual_leverage = total_notional / account_value if account_value > 0 else None
     configured_leverage = _configured_leverage(clearing_state)
+    configured_leverage_notionals = _configured_leverage_notionals(clearing_state)
     for dex, state in dex_states.items():
         configured_leverage.update(_configured_leverage(state, dex=dex))
+        configured_leverage_notionals.update(
+            _configured_leverage_notionals(state, dex=dex)
+        )
     style = classify_style(
         passive_ratio,
         daily_fill_count,
@@ -283,6 +289,7 @@ def calculate_wallet_profile(
         "passive_fill_ratio": passive_ratio,
         "actual_leverage": _decimal_text(actual_leverage),
         "configured_leverage": configured_leverage,
+        "configured_leverage_notionals": configured_leverage_notionals,
         "generated_at": now.isoformat(),
         "coverage": {
             "account_value": _coverage(
@@ -294,10 +301,10 @@ def calculate_wallet_profile(
             "pnl_30d": _portfolio_coverage(month, "pnlHistory", expected_days=30),
             "volume_total": _portfolio_coverage(all_time, "pnlHistory"),
             "volume_30d": _portfolio_coverage(month, "pnlHistory", expected_days=30),
-            "max_drawdown": _portfolio_coverage(
+            "max_drawdown": _drawdown_coverage(
                 all_time,
-                "pnlHistory",
                 sample_size=drawdown_samples,
+                ratio_reason=drawdown_ratio_reason,
             ),
             "win_rate": _coverage(
                 coverage.start_at,
@@ -497,10 +504,123 @@ class WalletProfiler:
     ) -> None:
         for fill in fills:
             row = _fill_row(address, fill)
-            stmt = pg_insert(hl_fills).values(**row).on_conflict_do_nothing(
-                index_elements=["address", "tid"]
+            stmt = pg_insert(hl_fills).values(**row)
+            await conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["address", "tid"],
+                    set_={
+                        "side": func.coalesce(hl_fills.c.side, stmt.excluded.side),
+                        "start_position": func.coalesce(
+                            hl_fills.c.start_position,
+                            stmt.excluded.start_position,
+                        ),
+                    },
+                )
             )
-            await conn.execute(stmt)
+
+    async def _backfill_missing_fill_fields(
+        self,
+        address: str,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+    ) -> int:
+        """按缺字段旧成交的实际时间段分页回拉，并仅更新两个新增字段。"""
+        async with self.engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    select(
+                        hl_fills.c.tid,
+                        hl_fills.c.occurred_at,
+                        hl_fills.c.side,
+                        hl_fills.c.start_position,
+                    ).where(
+                        hl_fills.c.address == address,
+                        hl_fills.c.occurred_at >= start_at,
+                        hl_fills.c.occurred_at <= end_at,
+                        or_(
+                            hl_fills.c.side.is_(None),
+                            hl_fills.c.start_position.is_(None),
+                        ),
+                    )
+                )
+            ).mappings().all()
+        if not rows:
+            return 0
+
+        missing = {
+            int(row["tid"]): {
+                "side": row["side"],
+                "start_position": row["start_position"],
+            }
+            for row in rows
+        }
+        current_start = int(min(row["occurred_at"] for row in rows).timestamp() * 1000)
+        end_ms = int(max(row["occurred_at"] for row in rows).timestamp() * 1000)
+        seen_tids: set[int] = set()
+
+        for _ in range(self.fill_max_pages):
+            raw = await self.rest.info(
+                "userFillsByTime",
+                budget="batch",
+                user=address,
+                startTime=current_start,
+                endTime=end_ms,
+            )
+            if not isinstance(raw, list):
+                raise ValueError("userFillsByTime 响应必须是数组")
+            page = [fill for fill in raw if isinstance(fill, Mapping)]
+            if len(page) != len(raw):
+                raise ValueError("userFillsByTime 成交记录必须是对象")
+            times = [int(fill.get("time") or 0) for fill in page]
+            if any(value <= 0 for value in times):
+                raise ValueError("userFillsByTime 成交记录缺少有效 time")
+
+            async with self.engine.begin() as conn:
+                for fill in page:
+                    try:
+                        tid = int(fill["tid"])
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ValueError("userFillsByTime 成交记录缺少有效 tid") from exc
+                    stored = missing.get(tid)
+                    if stored is None:
+                        continue
+                    values: dict[str, Any] = {}
+                    side = str(fill.get("side") or "") or None
+                    start_position = _optional_decimal(fill.get("startPosition"))
+                    if stored["side"] is None and side is not None:
+                        values["side"] = side
+                        stored["side"] = side
+                    if stored["start_position"] is None and start_position is not None:
+                        values["start_position"] = start_position
+                        stored["start_position"] = start_position
+                    if values:
+                        await conn.execute(
+                            update(hl_fills)
+                            .where(
+                                hl_fills.c.address == address,
+                                hl_fills.c.tid == tid,
+                            )
+                            .values(**values)
+                        )
+
+            page_tids = {int(fill["tid"]) for fill in page}
+            request_complete = len(page) < self.fill_page_size
+            if request_complete or (page and not (page_tids - seen_tids)):
+                break
+            seen_tids.update(page_tids)
+            if not times:
+                break
+            next_start = max(times)
+            if next_start < current_start:
+                break
+            current_start = next_start
+
+        return sum(
+            1
+            for values in missing.values()
+            if values["side"] is None or values["start_position"] is None
+        )
 
     async def profile_wallet(self, address: str) -> dict[str, Any]:
         """立即计算并持久化一个已登记钱包的完整画像。"""
@@ -519,6 +639,18 @@ class WalletProfiler:
         now = self.clock()
         start_at = now - PROFILE_WINDOW
         coverage = await self.sync_fills(normalized, start_at=start_at, end_at=now)
+        try:
+            await self._backfill_missing_fill_fields(
+                normalized,
+                start_at=coverage.start_at,
+                end_at=coverage.end_at,
+            )
+        except Exception as exc:
+            logger.warning(
+                "钱包 %s 的旧成交字段补齐失败，将按数据不足继续计算：%s",
+                normalized,
+                exc,
+            )
         portfolio = await self.rest.info("portfolio", budget="batch", user=normalized)
         abstraction = await self.rest.info("userAbstraction", budget="batch", user=normalized)
         clearing = await self.rest.info("clearinghouseState", budget="batch", user=normalized)
@@ -847,30 +979,34 @@ def _history(window: Mapping[str, Any] | None, key: str) -> list[tuple[int, Deci
 
 def _max_drawdown(
     window: Mapping[str, Any] | None,
-) -> tuple[Decimal | None, Decimal | None, int]:
+) -> tuple[Decimal | None, Decimal | None, int, str | None]:
     pnl = _history(window, "pnlHistory")
-    accounts = dict(_history(window, "accountValueHistory"))
     if len(pnl) < 2:
-        return None, None, len(pnl)
+        return None, None, len(pnl), None
+
+    peak_time, peak_pnl = pnl[0]
     worst = Decimal(0)
-    worst_ratio: Decimal | None = None
-    fallback_loss = Decimal(0)
-    for start_index, (start_time, start_pnl) in enumerate(pnl[:-1]):
-        account = accounts.get(start_time)
-        for _, end_pnl in pnl[start_index + 1 :]:
-            loss = start_pnl - end_pnl
-            if loss <= 0:
-                continue
-            fallback_loss = max(fallback_loss, loss)
-            if account is None or account <= 0:
-                continue
-            ratio = loss / account
-            if worst_ratio is None or ratio > worst_ratio:
-                worst = loss
-                worst_ratio = ratio
-    if worst_ratio is None:
-        return fallback_loss, None, len(pnl)
-    return worst, worst_ratio, len(pnl)
+    worst_peak_time = peak_time
+    for current_time, current_pnl in pnl[1:]:
+        if current_pnl > peak_pnl:
+            peak_time = current_time
+            peak_pnl = current_pnl
+            continue
+        loss = peak_pnl - current_pnl
+        if loss > worst:
+            worst = loss
+            worst_peak_time = peak_time
+
+    aligned_account: Decimal | None = None
+    for account_time, account_value in _history(window, "accountValueHistory"):
+        if account_time > worst_peak_time:
+            break
+        aligned_account = account_value
+    if aligned_account is None:
+        return worst, None, len(pnl), "回撤起点前没有可对齐的账户价值"
+    if aligned_account <= 0:
+        return worst, None, len(pnl), "回撤起点对应的账户价值小于等于零"
+    return worst, worst / aligned_account, len(pnl), None
 
 
 def _window_decimal(window: Mapping[str, Any] | None, key: str) -> Decimal | None:
@@ -908,6 +1044,48 @@ def _configured_leverage(clearing: Any, *, dex: str = "") -> dict[str, str]:
             key = coin if not dex or ":" in coin else f"{dex}:{coin}"
             result[key] = _decimal_text(parsed) or "0"
     return result
+
+
+def _configured_leverage_notionals(
+    clearing: Any,
+    *,
+    dex: str = "",
+) -> dict[str, str]:
+    """返回设置杠杆仓位的当前名义价值，供 CLI 排序展示。"""
+    if not isinstance(clearing, Mapping):
+        return {}
+    positions = clearing.get("assetPositions")
+    if not isinstance(positions, list):
+        return {}
+    result: dict[str, str] = {}
+    for item in positions:
+        position = item.get("position") if isinstance(item, Mapping) else None
+        if not isinstance(position, Mapping) or not position.get("coin"):
+            continue
+        notional = _optional_decimal(position.get("positionValue"))
+        if notional is None:
+            continue
+        coin = str(position["coin"])
+        key = coin if not dex or ":" in coin else f"{dex}:{coin}"
+        result[key] = _decimal_text(abs(notional)) or "0"
+    return result
+
+
+def _drawdown_coverage(
+    window: Mapping[str, Any] | None,
+    *,
+    sample_size: int,
+    ratio_reason: str | None,
+) -> dict[str, Any]:
+    coverage = _portfolio_coverage(
+        window,
+        "pnlHistory",
+        sample_size=sample_size,
+    )
+    if ratio_reason is not None and coverage["sufficient"]:
+        coverage["sufficient"] = False
+        coverage["reason"] = ratio_reason
+    return coverage
 
 
 def _portfolio_coverage(
