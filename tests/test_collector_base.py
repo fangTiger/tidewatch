@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from fakes import FakeHealth, FakeNotifier, FakeSink, FakeSleep
+from fakes import FakeHealth, FakeNotifier, FakeSink, FakeSleep, async_timeout
 from tidewatch.collectors.base import Backoff, PollCollector, StreamCollector, TokenBucket, describe
 from tidewatch.collectors.http import make_client
 from tidewatch.config import CollectorCfg
@@ -53,6 +53,32 @@ async def test_token_bucket_acquires_weight_atomically():
     await asyncio.wait_for(bucket.acquire(2), timeout=5)
 
     assert sleeps == [pytest.approx(0.5)]
+
+
+@async_timeout()
+async def test_token_bucket_can_start_empty_and_adjust_effective_rate():
+    clock = {"t": 0.0}
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    bucket = TokenBucket(
+        10,
+        capacity=100,
+        initial_tokens=0,
+        monotonic=lambda: clock["t"],
+        sleep=fake_sleep,
+    )
+
+    assert not await bucket.try_acquire(1)
+    await asyncio.wait_for(bucket.acquire(20), timeout=5)
+    await bucket.set_rate(5, capacity=50)
+
+    assert sleeps == [pytest.approx(2)]
+    assert bucket.rate_per_s == 5
+    assert bucket.capacity == 50
 
 
 async def test_hyperliquid_monitoring_and_batch_budgets_are_independent():

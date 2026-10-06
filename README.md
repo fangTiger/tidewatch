@@ -47,6 +47,8 @@ deploy/uninstall.sh          # 卸载
 
 - 阈值、关键词、频率：`config.yaml`（可在 `config.local.yaml` 按键覆盖；列表项按 `symbol`/`id` 合并，写 `remove: true` 删除默认项）
 - Hyperliquid 的 REST 与 WS 共用 `hyperliquid.proxy`：`global` 使用全局 `proxy_url`，`direct` 直连。上游按出口 IP 限流，切换代理节点会改变限流出口 IP，并使本地令牌桶与上游当前窗口短暂不同步。
+- Hyperliquid REST 默认监控/批处理预算为 600/200 权重每分钟、对账并发为 4，低于上游曾公布的单 IP 额度。原因是全局代理出口可能由多人共享，且上游实际限额与窗口策略可能变化；不要把文档上限直接当成稳定可用额度。令牌桶只保留 10 秒突发量并从空桶启动；一旦收到 429，监控与批处理会一起冷却并通过单个探测请求恢复，同时自动降低速率再逐分钟回升。
+- 以 200 个重点钱包、其中 30 个热点、统一账户均需现货查询的保守模型计算：170 个普通钱包每 3 分钟约 226.7 权重/分钟，30 个热点每 20 秒约 360 权重/分钟，账户类型缓存约 6.7 权重/分钟，合计约 593.3 权重/分钟。因此普通钱包 3 分钟周期在 600 预算下理论可达，但只剩约 6.7 权重/分钟余量；HIP-3、多次成交补查或共享出口拥挤会触发顺延。如长期接近预算，应优先降低 `tiers.hot_limit` 或延长 `frequencies.hot_reconcile_interval_s`，不要提高本地预算掩盖 429。
 - 币安公告：`.env` 中配置只读的 `BINANCE_API_KEY` 与 `BINANCE_API_SECRET` 时使用 WebSocket 实时推送，否则每 30 秒轮询（状态页显示「降级」）
 - 日志：`log/tidewatch_YYYY-MM-DD.log`，保留 14 天。`log/launchd.err.log` 只记录启动早期的错误且不会轮转，必要时请手动清理
 

@@ -341,9 +341,12 @@ def test_hyperliquid_default_config_is_valid_and_complete(tmp_path):
     assert cfg.proxy == "global"
     assert cfg.rest_url == "https://api.hyperliquid.xyz/info"
     assert cfg.ws_url == "wss://api.hyperliquid.xyz/ws"
-    assert cfg.monitor_budget_per_min == 900
-    assert cfg.batch_budget_per_min == 300
-    assert cfg.reconcile_concurrency == 8
+    assert cfg.monitor_budget_per_min == 600
+    assert cfg.batch_budget_per_min == 200
+    assert cfg.reconcile_concurrency == 4
+    assert cfg.rest_burst_window_s == 10
+    assert cfg.aimd_min_budget_per_min == 120
+    assert cfg.aimd_recovery_interval_s == 60
     assert cfg.frequencies.ws_ping_interval_s == 50
     assert cfg.frequencies.hot_reconcile_interval_s == 20
     assert cfg.frequencies.focus_reconcile_interval_s == 180
@@ -382,7 +385,16 @@ def test_hyperliquid_unknown_key_reports_chinese(tmp_path):
     assert "未知配置项" in message
 
 
-@pytest.mark.parametrize("field", ["monitor_budget_per_min", "batch_budget_per_min"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "monitor_budget_per_min",
+        "batch_budget_per_min",
+        "rest_burst_window_s",
+        "aimd_min_budget_per_min",
+        "aimd_recovery_interval_s",
+    ],
+)
 @pytest.mark.parametrize("value", [0, -1])
 def test_hyperliquid_budget_must_be_positive_and_reports_chinese(tmp_path, field, value):
     base = _copy_default(tmp_path)

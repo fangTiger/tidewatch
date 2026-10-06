@@ -50,16 +50,58 @@ class TokenBucket:
         rate_per_s: float,
         capacity: float | None = None,
         *,
+        initial_tokens: float | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
+        if rate_per_s <= 0:
+            raise ValueError("令牌补充速率必须大于 0")
         self._rate = rate_per_s
-        self._capacity = capacity or max(1.0, rate_per_s)
-        self._tokens = self._capacity
+        self._capacity = capacity if capacity is not None else max(1.0, rate_per_s)
+        if self._capacity <= 0:
+            raise ValueError("令牌桶容量必须大于 0")
+        self._tokens = self._capacity if initial_tokens is None else initial_tokens
+        if not 0 <= self._tokens <= self._capacity:
+            raise ValueError("初始令牌数必须在 0 与桶容量之间")
         self._monotonic = monotonic
         self._sleep = sleep
         self._last = monotonic()
         self._lock = asyncio.Lock()
+
+    @property
+    def rate_per_s(self) -> float:
+        """当前每秒有效补充速率。"""
+        return self._rate
+
+    @property
+    def capacity(self) -> float:
+        """当前令牌桶容量。"""
+        return self._capacity
+
+    def _refill_locked(self, now: float) -> None:
+        self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
+        self._last = now
+
+    async def set_rate(self, rate_per_s: float, *, capacity: float | None = None) -> None:
+        """原子调整有效速率；未指定容量时保留现有容量。"""
+        if rate_per_s <= 0:
+            raise ValueError("令牌补充速率必须大于 0")
+        new_capacity = self._capacity if capacity is None else capacity
+        if new_capacity <= 0:
+            raise ValueError("令牌桶容量必须大于 0")
+        async with self._lock:
+            self._refill_locked(self._monotonic())
+            self._rate = rate_per_s
+            self._capacity = new_capacity
+            self._tokens = min(self._tokens, self._capacity)
+
+    async def refund(self, weight: float = 1) -> None:
+        """归还尚未实际发送请求所预留的令牌。"""
+        if weight <= 0:
+            raise ValueError("归还令牌权重必须大于 0")
+        async with self._lock:
+            self._refill_locked(self._monotonic())
+            self._tokens = min(self._capacity, self._tokens + weight)
 
     async def acquire(self, weight: float = 1) -> None:
         """原子获取指定权重；不传参数时保持一期的单令牌行为。"""
@@ -70,8 +112,7 @@ class TokenBucket:
         while True:
             async with self._lock:
                 now = self._monotonic()
-                self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
-                self._last = now
+                self._refill_locked(now)
                 if self._tokens >= weight:
                     self._tokens -= weight
                     return
@@ -86,8 +127,7 @@ class TokenBucket:
             raise ValueError("令牌权重不能超过桶容量")
         async with self._lock:
             now = self._monotonic()
-            self._tokens = min(self._capacity, self._tokens + (now - self._last) * self._rate)
-            self._last = now
+            self._refill_locked(now)
             if self._tokens < weight:
                 return False
             self._tokens -= weight

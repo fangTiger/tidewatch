@@ -8,9 +8,12 @@ hyperliquid:
   ws_url: wss://api.hyperliquid.xyz/ws
   leaderboard_url: https://stats-data.hyperliquid.xyz/Mainnet/leaderboard
   aliases_url: https://api.hypurrscan.io/globalAliases
-  monitor_budget_per_min: 900
-  batch_budget_per_min: 300
-  reconcile_concurrency: 8
+  monitor_budget_per_min: 600
+  batch_budget_per_min: 200
+  reconcile_concurrency: 4
+  rest_burst_window_s: 10
+  aimd_min_budget_per_min: 120
+  aimd_recovery_interval_s: 60
   frequencies:
     ws_ping_interval_s: 50
     core_state_interval_s: 5

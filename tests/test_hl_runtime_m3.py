@@ -320,19 +320,21 @@ async def test_reconnect_hook_reconciles_hot_wallet_final_state_through_rest(
         )
     sink = create_event_sink(engine, settings, clock=clock)
     await sink.start()
+    now = {"value": 100.0}
     runtime = HyperliquidRuntime(
         settings.hyperliquid,
         Health(),
         engine=engine,
         sink=sink,
         clock=clock,
-        monotonic=lambda: 100.0,
+        monotonic=lambda: now["value"],
     )
     try:
         with respx.mock:
             respx.post(settings.hyperliquid.rest_url).mock(side_effect=respond)
             await runtime._on_core_connected()
-            assert await runtime.run_reconcile_once(100.0)
+            now["value"] = 100.4
+            assert await runtime.run_reconcile_once(now["value"])
     finally:
         await runtime.close_resources()
         await asyncio.wait_for(sink.stop(), timeout=5)
@@ -560,7 +562,7 @@ async def test_free_reconcile_slot_takes_trade_before_waiting_normal_wallets(
     assert started[2] == trade_address
 
 
-def test_monitor_budget_estimate_stays_below_nine_hundred_per_minute(settings):
+def test_two_hundred_wallet_budget_estimate_stays_below_six_hundred_per_minute(settings):
     """按最保守的全统一账户估算常态状态请求，不含按变化触发的成交补查。"""
     focus_count = settings.hyperliquid.tiers.focus_limit
     hot_count = settings.hyperliquid.tiers.hot_limit
@@ -584,7 +586,77 @@ def test_monitor_budget_estimate_stays_below_nine_hundred_per_minute(settings):
         / (settings.hyperliquid.frequencies.account_type_cache_s / 60)
     )
 
-    assert normal_per_minute + hot_per_minute + abstraction_per_minute < 900
+    total_per_minute = normal_per_minute + hot_per_minute + abstraction_per_minute
+
+    assert total_per_minute < settings.hyperliquid.monitor_budget_per_min
+    assert settings.hyperliquid.frequencies.focus_reconcile_interval_s <= 180
+    assert 593 < total_per_minute < 594
+
+
+@async_timeout()
+async def test_runtime_starts_with_empty_configured_ten_second_buckets(
+    engine, settings, clock
+):
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+        monotonic=lambda: 100.0,
+    )
+    try:
+        assert runtime.monitoring_bucket.capacity == 100
+        assert abs(runtime.batch_bucket.capacity - (200 / 6)) < 1e-9
+        assert not await runtime.monitoring_bucket.try_acquire(1)
+        assert not await runtime.batch_bucket.try_acquire(1)
+    finally:
+        await runtime.close_resources()
+
+
+@async_timeout()
+async def test_429_defers_reconcile_until_global_cooldown_without_wallet_backoff(
+    engine, settings, clock
+):
+    now = {"value": 0.0}
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+        monotonic=lambda: now["value"],
+    )
+    responses = iter([httpx.Response(429, json={"error": "限流"}), httpx.Response(200, json={})])
+
+    async def reconcile(address: str) -> bool:
+        available, _ = await runtime.rest.try_info("clearinghouseState", user=address)
+        return available
+
+    runtime.monitor.reconcile = reconcile
+    runtime.reconcile_queue.schedule(
+        ADDRESS, ReconcilePriority.TRADE, due_at=0.0, reason="成交触发"
+    )
+    try:
+        with respx.mock:
+            route = respx.post(settings.hyperliquid.rest_url).mock(side_effect=responses)
+            now["value"] = 0.2
+            assert await runtime.run_reconcile_once(now["value"])
+            assert route.call_count == 1
+            assert ADDRESS in runtime.reconcile_queue
+            assert ADDRESS not in runtime._reconcile_backoffs
+            deferred = runtime.reconcile_queue._tasks[ADDRESS]
+            assert deferred.priority is ReconcilePriority.TRADE
+            assert deferred.reason == "成交触发"
+            assert runtime.reconcile_queue.pop_ready(1.19) is None
+
+            now["value"] = 1.2
+            assert await runtime.run_reconcile_once(now["value"])
+            assert route.call_count == 2
+    finally:
+        await runtime.close_resources()
+
+    assert ADDRESS not in runtime.reconcile_queue
 
 
 @async_timeout()
@@ -652,11 +724,20 @@ async def test_focus_position_change_is_detected_on_three_minute_reconcile_cycle
         with respx.mock:
             respx.post(settings.hyperliquid.rest_url).mock(side_effect=respond)
             await runtime.schedule_focus_wallets(now["value"])
+            now["value"] = 100.4
             assert await runtime.run_reconcile_once(now["value"])
-            now["value"] += settings.hyperliquid.frequencies.focus_reconcile_interval_s - 0.1
+            first_completed_at = now["value"]
+            now["value"] = (
+                first_completed_at
+                + settings.hyperliquid.frequencies.focus_reconcile_interval_s
+                - 0.1
+            )
             await runtime.schedule_focus_wallets(now["value"])
             assert len(runtime.reconcile_queue) == 0
-            now["value"] = 100.0 + settings.hyperliquid.frequencies.focus_reconcile_interval_s
+            now["value"] = (
+                first_completed_at
+                + settings.hyperliquid.frequencies.focus_reconcile_interval_s
+            )
             await runtime.schedule_focus_wallets(now["value"])
             assert await runtime.run_reconcile_once(now["value"])
     finally:
@@ -668,7 +749,11 @@ async def test_focus_position_change_is_detected_on_three_minute_reconcile_cycle
         push_count = await conn.scalar(select(func.count()).select_from(push_log))
     assert event_type == "hl_open"
     assert push_count == 1
-    assert now["value"] - 100.0 == settings.hyperliquid.frequencies.focus_reconcile_interval_s
+    assert abs(
+        now["value"]
+        - first_completed_at
+        - settings.hyperliquid.frequencies.focus_reconcile_interval_s
+    ) < 1e-9
 
 
 @async_timeout()

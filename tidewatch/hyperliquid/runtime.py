@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from tidewatch.clock import Clock, utcnow
 from tidewatch.collectors.base import Backoff, TokenBucket, describe
 from tidewatch.collectors.http import make_client
-from tidewatch.hyperliquid.client import HyperliquidRestClient
+from tidewatch.hyperliquid.client import MAX_BASE_WEIGHT, HyperliquidRestClient
 from tidewatch.hyperliquid.importer import AliasCache, LeaderboardImporter
 from tidewatch.hyperliquid.leaderboard import HYPURRSCAN_ALIASES_URL, LEADERBOARD_URL, LeaderboardSource
 from tidewatch.hyperliquid.monitor import (
@@ -63,6 +63,7 @@ class HyperliquidRuntime:
         clock: Clock = utcnow,
         data_dir: Path | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.settings = settings
         self.health = health
@@ -70,13 +71,22 @@ class HyperliquidRuntime:
         self.sink = sink
         self.clock = clock
         self.monotonic = monotonic
+        burst_window_s = settings.rest_burst_window_s
+        monitoring_rate = settings.monitor_budget_per_min / 60
+        batch_rate = settings.batch_budget_per_min / 60
         self.monitoring_bucket = TokenBucket(
-            settings.monitor_budget_per_min / 60,
-            capacity=settings.monitor_budget_per_min,
+            monitoring_rate,
+            capacity=max(MAX_BASE_WEIGHT, monitoring_rate * burst_window_s),
+            initial_tokens=0,
+            monotonic=monotonic,
+            sleep=sleep,
         )
         self.batch_bucket = TokenBucket(
-            settings.batch_budget_per_min / 60,
-            capacity=settings.batch_budget_per_min,
+            batch_rate,
+            capacity=max(MAX_BASE_WEIGHT, batch_rate * burst_window_s),
+            initial_tokens=0,
+            monotonic=monotonic,
+            sleep=sleep,
         )
         self.rest = HyperliquidRestClient(
             self.monitoring_bucket,
@@ -85,6 +95,11 @@ class HyperliquidRuntime:
             proxy_url=proxy_url,
             health=health,
             url=settings.rest_url,
+            sleep=sleep,
+            monotonic=monotonic,
+            burst_window_s=burst_window_s,
+            aimd_min_budget_per_min=settings.aimd_min_budget_per_min,
+            aimd_recovery_interval_s=settings.aimd_recovery_interval_s,
         )
         self.ws = HyperliquidWsManager(
             proxy_mode=settings.proxy,
@@ -491,7 +506,10 @@ class HyperliquidRuntime:
             self.reconcile_queue.defer(task, due_at=now + delay)
             return
         if not complete:
-            self.reconcile_queue.defer(task, due_at=now + 0.1)
+            self.reconcile_queue.defer(
+                task,
+                due_at=max(now + 0.1, self.rest.cooldown_until),
+            )
             return
         interval = await self._interval_after(task)
         self._reconcile_backoffs.pop(task.address, None)

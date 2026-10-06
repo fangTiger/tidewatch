@@ -258,9 +258,12 @@ class HyperliquidCfg(_Strict):
     ws_url: str = "wss://api.hyperliquid.xyz/ws"
     leaderboard_url: str = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
     aliases_url: str = "https://api.hypurrscan.io/globalAliases"
-    monitor_budget_per_min: float = Field(default=900, gt=0)
-    batch_budget_per_min: float = Field(default=300, gt=0)
-    reconcile_concurrency: int = Field(default=8, gt=0)
+    monitor_budget_per_min: float = Field(default=600, gt=0)
+    batch_budget_per_min: float = Field(default=200, gt=0)
+    reconcile_concurrency: int = Field(default=4, gt=0)
+    rest_burst_window_s: float = Field(default=10, gt=0)
+    aimd_min_budget_per_min: float = Field(default=120, gt=0)
+    aimd_recovery_interval_s: float = Field(default=60, gt=0)
     frequencies: HyperliquidFrequenciesCfg = HyperliquidFrequenciesCfg()
     tiers: HyperliquidTiersCfg = HyperliquidTiersCfg()
     events: HyperliquidEventsCfg = HyperliquidEventsCfg()
