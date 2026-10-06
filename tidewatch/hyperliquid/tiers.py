@@ -13,6 +13,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
+from tidewatch.hyperliquid.baseline import invalidate_monitor_baseline
 from tidewatch.hyperliquid.positions import upsert_position_snapshot
 from tidewatch.hyperliquid.registry import REGISTRY_LOCK_KEY
 from tidewatch.store.tables import hl_positions, hl_state, hl_wallets
@@ -214,6 +215,10 @@ class TierRecalculator:
                 await conn.execute(
                     update(hl_wallets).where(hl_wallets.c.address == address).values(**values)
                 )
+                if old_tier != new_tier and (
+                    old_tier in {"focus", "core"} or new_tier in {"focus", "core"}
+                ):
+                    await invalidate_monitor_baseline(conn, address)
 
             cursor = {
                 "phase": "complete",

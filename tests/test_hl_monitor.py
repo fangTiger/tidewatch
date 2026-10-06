@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import httpx
 import respx
-from sqlalchemy import func, insert, select
+from sqlalchemy import delete, func, insert, select
 
 from fakes import FakeHealth
 from tidewatch.collectors.base import TokenBucket
@@ -20,7 +20,15 @@ from tidewatch.hyperliquid.monitor import (
     select_hot_wallets,
 )
 from tidewatch.pipeline.sink import create_event_sink
-from tidewatch.store.tables import events, hl_fills, hl_positions, hl_state, hl_wallets, push_log
+from tidewatch.store.tables import (
+    collector_state,
+    events,
+    hl_fills,
+    hl_positions,
+    hl_state,
+    hl_wallets,
+    push_log,
+)
 
 
 ADDRESS = "0x1234567890abcdef1234567890abcdef12345678"
@@ -45,6 +53,277 @@ def _state(*, szi: str = "60", value: str = "6000000", liquidation_px: str = "95
             }
         ],
     }
+
+
+def _empty_state() -> dict:
+    return {
+        "marginSummary": {"accountValue": "800000", "totalNtlPos": "0"},
+        "assetPositions": [],
+    }
+
+
+async def _seed_baseline(engine, clock, address: str = ADDRESS) -> None:
+    """为只关注后续行为的测试预置已完成的监控基线。"""
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"monitor_baseline:{address}",
+                cursor={"established_at": clock.now.isoformat()},
+                updated_at=clock.now,
+            )
+        )
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"fills:{address}",
+                cursor={"last_time": int(clock.now.timestamp() * 1000)},
+                updated_at=clock.now,
+            )
+        )
+
+
+async def test_first_reconcile_with_existing_positions_only_establishes_baseline(
+    engine, settings, clock
+):
+    calls: list[dict] = []
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            calls.append({"type": request_type, **params})
+            if request_type == "clearinghouseState":
+                return True, _state(szi="120", value="12000000", liquidation_px="98000")
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            raise AssertionError(f"首次基线不应补查成交：{request_type}")
+
+    async with engine.begin() as conn:
+        await conn.execute(insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual"))
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=sink,
+        clock=clock,
+    )
+    try:
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
+        await asyncio.wait_for(monitor.update_mids({"BTC": "100000"}), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        event_count = await conn.scalar(select(func.count()).select_from(events))
+        baseline = await conn.scalar(
+            select(hl_state.c.cursor).where(hl_state.c.name == f"monitor_baseline:{ADDRESS}")
+        )
+        fill_cursor = await conn.scalar(
+            select(hl_state.c.cursor).where(hl_state.c.name == f"fills:{ADDRESS}")
+        )
+        risk = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name == f"liq_risk:{ADDRESS}::BTC"
+            )
+        )
+
+    assert event_count == 0
+    assert baseline == {
+        "established_at": clock.now.isoformat(),
+        "last_observed_at": clock.now.isoformat(),
+    }
+    assert fill_cursor["last_time"] == int(clock.now.timestamp() * 1000)
+    assert risk == {"level": "S"}
+    assert [call["type"] for call in calls] == ["clearinghouseState", "userAbstraction"]
+
+
+async def test_open_after_baseline_emits_one_event(engine, settings, clock):
+    clearing_calls = 0
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            nonlocal clearing_calls
+            if request_type == "clearinghouseState":
+                clearing_calls += 1
+                return True, _empty_state() if clearing_calls == 1 else _state()
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            if request_type == "userFillsByTime":
+                return True, []
+            if request_type == "userTwapSliceFills":
+                return True, []
+            raise AssertionError(request_type)
+
+    async with engine.begin() as conn:
+        await conn.execute(insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual"))
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=sink,
+        clock=clock,
+    )
+    try:
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
+        clock.advance(seconds=1)
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        event_types = (await conn.execute(select(events.c.event_type))).scalars().all()
+    assert event_types == ["hl_open"]
+
+
+async def test_stale_snapshot_change_without_fill_is_backfill_and_not_pushed(
+    engine, settings, clock
+):
+    clearing_calls = 0
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            nonlocal clearing_calls
+            if request_type == "clearinghouseState":
+                clearing_calls += 1
+                state = _empty_state() if clearing_calls == 1 else _state()
+                return True, state
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            if request_type in {"userFillsByTime", "userTwapSliceFills"}:
+                return True, []
+            raise AssertionError(request_type)
+
+    async with engine.begin() as conn:
+        await conn.execute(insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual"))
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=sink,
+        clock=clock,
+    )
+    try:
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
+        baseline_at = clock.now
+        clock.advance(minutes=30)
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        row = (await conn.execute(select(events.c.occurred_at, events.c.raw))).one()
+        push_count = await conn.scalar(select(func.count()).select_from(push_log))
+    assert row.occurred_at == baseline_at
+    assert row.raw["backfill"] is True
+    assert push_count == 0
+
+
+async def test_missing_fill_cursor_starts_at_baseline_and_ignores_historical_liquidation(
+    engine, settings, clock
+):
+    clearing_calls = 0
+    fill_requests: list[dict] = []
+    historical_time = int((clock.now - timedelta(hours=1)).timestamp() * 1000)
+    historical_fill = {
+        "coin": "BTC",
+        "px": "100000",
+        "sz": "60",
+        "dir": "Liquidated Long",
+        "closedPnl": "-100",
+        "fee": "1",
+        "crossed": True,
+        "time": historical_time,
+        "hash": "0xold",
+        "tid": 501,
+        "liquidation": {"liquidatedUser": ADDRESS},
+    }
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            nonlocal clearing_calls
+            if request_type == "clearinghouseState":
+                clearing_calls += 1
+                state = _state() if clearing_calls == 1 else _state(szi="120", value="12000000")
+                return True, state
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            if request_type == "userFillsByTime":
+                fill_requests.append(dict(params))
+                return True, [historical_fill]
+            if request_type == "userTwapSliceFills":
+                return True, [{"fill": historical_fill, "twapId": 1}]
+            raise AssertionError(request_type)
+
+    async with engine.begin() as conn:
+        await conn.execute(insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual"))
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=sink,
+        clock=clock,
+    )
+    try:
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
+        baseline_ms = int(clock.now.timestamp() * 1000)
+        async with engine.begin() as conn:
+            await conn.execute(delete(hl_state).where(hl_state.c.name == f"fills:{ADDRESS}"))
+        clock.advance(seconds=1)
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        event_types = (await conn.execute(select(events.c.event_type))).scalars().all()
+        fill_count = await conn.scalar(select(func.count()).select_from(hl_fills))
+    assert fill_requests == [{"budget": "monitor", "user": ADDRESS, "startTime": baseline_ms}]
+    assert event_types == ["hl_increase"]
+    assert fill_count == 0
+
+
+async def test_hyperliquid_events_do_not_create_hl_monitor_collector_state(
+    engine, settings, clock
+):
+    clearing_calls = 0
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            nonlocal clearing_calls
+            if request_type == "clearinghouseState":
+                clearing_calls += 1
+                return True, _empty_state() if clearing_calls == 1 else _state()
+            if request_type == "userAbstraction":
+                return True, "disabled"
+            if request_type in {"userFillsByTime", "userTwapSliceFills"}:
+                return True, []
+            raise AssertionError(request_type)
+
+    async with engine.begin() as conn:
+        await conn.execute(insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual"))
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=sink,
+        clock=clock,
+    )
+    try:
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
+        clock.advance(seconds=1)
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=5)
+    finally:
+        await asyncio.wait_for(sink.stop(), timeout=5)
+
+    async with engine.connect() as conn:
+        names = (await conn.execute(select(collector_state.c.name))).scalars().all()
+    assert "hl_monitor" not in names
 
 
 def test_priority_queue_keeps_deferred_low_priority_and_deduplicates_wallet():
@@ -110,13 +389,16 @@ async def test_rest_reconcile_persists_snapshot_fill_and_cursor_then_ingests_eve
 ):
     now_ms = int(clock.now.timestamp() * 1000)
     requests: list[dict] = []
+    clearing_calls = 0
 
     def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal clearing_calls
         payload = json.loads(request.content)
         requests.append(payload)
         request_type = payload["type"]
         if request_type == "clearinghouseState":
-            return httpx.Response(200, json=_state())
+            clearing_calls += 1
+            return httpx.Response(200, json=_empty_state() if clearing_calls == 1 else _state())
         if request_type == "userAbstraction":
             return httpx.Response(200, json="unifiedAccount")
         if request_type == "spotClearinghouseState":
@@ -242,7 +524,7 @@ async def test_unmatched_fill_lookup_falls_back_to_twap_and_minute_guard_does_no
                         "closedPnl": "0",
                         "fee": "0.2",
                         "crossed": True,
-                        "time": int(clock.now.timestamp() * 1000) - 1,
+                        "time": int(clock.now.timestamp() * 1000),
                         "hash": "0xeth",
                         "tid": 98,
                     }
@@ -274,6 +556,7 @@ async def test_unmatched_fill_lookup_falls_back_to_twap_and_minute_guard_does_no
         sink=None,
         clock=clock,
     )
+    await _seed_baseline(engine, clock)
     first = await asyncio.wait_for(monitor.lookup_fill_evidence(ADDRESS, {"BTC"}), timeout=5)
     async with engine.connect() as conn:
         first_cursor = await conn.scalar(
@@ -320,6 +603,7 @@ async def test_successful_fill_query_starts_minute_guard_when_twap_budget_is_exh
         sink=None,
         clock=clock,
     )
+    await _seed_baseline(engine, clock)
 
     assert await asyncio.wait_for(
         monitor.lookup_fill_evidence(ADDRESS, {"BTC"}), timeout=5
@@ -352,6 +636,7 @@ async def test_deferred_fill_query_is_restored_after_monitor_restart(engine, set
     first = HyperliquidMonitor(
         settings.hyperliquid, engine=engine, rest=Rest(), sink=None, clock=clock
     )
+    await _seed_baseline(engine, clock)
     await asyncio.wait_for(first.lookup_fill_evidence(ADDRESS, {"BTC"}), timeout=5)
 
     clock.advance(seconds=settings.hyperliquid.frequencies.fill_query_min_interval_s)
@@ -369,10 +654,14 @@ async def test_deferred_fill_query_is_restored_after_monitor_restart(engine, set
 
 
 async def test_fill_lookup_timeout_does_not_hold_snapshot_event(engine, settings, clock):
+    clearing_calls = 0
+
     class Rest:
         async def try_info(self, request_type: str, **params):
+            nonlocal clearing_calls
             if request_type == "clearinghouseState":
-                return True, _state()
+                clearing_calls += 1
+                return True, _empty_state() if clearing_calls == 1 else _state()
             if request_type == "userAbstraction":
                 return True, "disabled"
             if request_type == "userFillsByTime":
@@ -392,6 +681,8 @@ async def test_fill_lookup_timeout_does_not_hold_snapshot_event(engine, settings
         fill_lookup_timeout_s=0.01,
     )
     try:
+        assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=0.5)
+        clock.advance(seconds=1)
         assert await asyncio.wait_for(monitor.reconcile(ADDRESS), timeout=0.5)
     finally:
         await asyncio.wait_for(sink.stop(), timeout=5)
@@ -456,6 +747,7 @@ async def test_reconcile_refreshes_known_hip3_dex_without_overwriting_main_dex(
                 updated_at=clock.now - timedelta(minutes=1),
             )
         )
+    await _seed_baseline(engine, clock)
     sink = create_event_sink(engine, settings, clock=clock)
     await sink.start()
     rest = HyperliquidRestClient(
@@ -593,6 +885,7 @@ async def test_all_mids_uses_local_prices_for_hysteresis_and_a_to_s_upgrade(
                 updated_at=clock.now,
             )
         )
+    await _seed_baseline(engine, clock)
     sink = create_event_sink(engine, settings, clock=clock)
     await sink.start()
     monitor = HyperliquidMonitor(
@@ -650,6 +943,15 @@ async def test_user_fills_snapshot_is_persisted_but_not_used_as_event_evidence(
     try:
         await asyncio.wait_for(
             monitor.handle_core_message(
+                {
+                    "channel": "allDexsClearinghouseState",
+                    "data": {"user": ADDRESS, "clearinghouseStates": [_empty_state()]},
+                }
+            ),
+            timeout=5,
+        )
+        await asyncio.wait_for(
+            monitor.handle_core_message(
                 {"channel": "userFills", "data": {"user": ADDRESS, "isSnapshot": True, "fills": [fill]}}
             ),
             timeout=5,
@@ -700,6 +1002,15 @@ async def test_live_user_fill_becomes_state_change_evidence(engine, settings, cl
     try:
         await asyncio.wait_for(
             monitor.handle_core_message(
+                {
+                    "channel": "allDexsClearinghouseState",
+                    "data": {"user": ADDRESS, "clearinghouseStates": [_empty_state()]},
+                }
+            ),
+            timeout=5,
+        )
+        await asyncio.wait_for(
+            monitor.handle_core_message(
                 {"channel": "userFills", "data": {"user": ADDRESS, "isSnapshot": False, "fills": [fill]}}
             ),
             timeout=5,
@@ -742,6 +1053,15 @@ async def test_core_ws_unified_account_uses_current_spot_usdc(engine, settings, 
         clock=clock,
     )
     try:
+        await asyncio.wait_for(
+            monitor.handle_core_message(
+                {
+                    "channel": "allDexsClearinghouseState",
+                    "data": {"user": ADDRESS, "clearinghouseStates": [_empty_state()]},
+                }
+            ),
+            timeout=5,
+        )
         await asyncio.wait_for(
             monitor.handle_core_message(
                 {

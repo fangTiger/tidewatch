@@ -572,14 +572,16 @@ class HyperliquidRuntime:
         return tuple(self._tasks)
 
     async def stop(self) -> None:
-        """停止新接收并有界等待在途处理，超时后再取消外部请求。"""
+        """停止新接收并立即取消在途后台请求，避免等待 HTTP 超时。"""
         self._stop.set()
-        await self.ws.aclose()
-        if self._tasks:
-            _, pending = await asyncio.wait(self._tasks, timeout=10)
-            for task in pending:
+        current = asyncio.current_task()
+        managed = [task for task in self._tasks if task is not current]
+        for task in managed:
+            if not task.done():
                 task.cancel()
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+        await self.ws.aclose()
+        if managed:
+            await asyncio.gather(*managed, return_exceptions=True)
         await self.close_resources()
 
     async def close_resources(self) -> None:

@@ -16,6 +16,12 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
+from tidewatch.hyperliquid.baseline import (
+    load_last_observed_at,
+    load_monitor_baseline,
+    save_last_observed_at,
+    save_monitor_baseline,
+)
 from tidewatch.hyperliquid.detect import (
     PositionSnapshot,
     detect_events_with_state,
@@ -289,6 +295,10 @@ class HyperliquidMonitor:
         state_name = f"fills:{normalized}"
         async with self.engine.connect() as conn:
             cursor = await conn.scalar(select(hl_state.c.cursor).where(hl_state.c.name == state_name))
+            baseline_at = await load_monitor_baseline(conn, normalized)
+        if baseline_at is None:
+            self._deferred_fills.pop(normalized, None)
+            return None
         cursor = dict(cursor) if isinstance(cursor, Mapping) else {}
         last_query = _parse_datetime(cursor.get("last_query_at"))
         now = self.clock()
@@ -303,7 +313,8 @@ class HyperliquidMonitor:
                 )
                 return None
 
-        start_time = int(cursor.get("last_time") or 0)
+        baseline_ms = int(baseline_at.timestamp() * 1000)
+        start_time = max(int(cursor.get("last_time") or 0), baseline_ms)
         available, raw_fills = await self._try_info(
             "userFillsByTime",
             user=normalized,
@@ -312,7 +323,11 @@ class HyperliquidMonitor:
         if not available:
             await self._defer_fill_query(normalized, changed_coins, now + timedelta(seconds=1))
             return None
-        fills = _unwrap_fills(raw_fills, is_twap=False)
+        fills = [
+            item
+            for item in _unwrap_fills(raw_fills, is_twap=False)
+            if int(item[0].get("time") or 0) >= baseline_ms
+        ]
         await self._store_fills(normalized, fills, last_query_at=now)
         matching = [fill for fill, _ in fills if fill.get("coin") in changed_coins]
         if not matching:
@@ -324,7 +339,11 @@ class HyperliquidMonitor:
                     now + timedelta(seconds=self.cfg.frequencies.fill_query_min_interval_s),
                 )
                 return None
-            twap_fills = _unwrap_fills(raw_twap, is_twap=True)
+            twap_fills = [
+                item
+                for item in _unwrap_fills(raw_twap, is_twap=True)
+                if int(item[0].get("time") or 0) >= baseline_ms
+            ]
             await self._store_fills(normalized, twap_fills, last_query_at=now)
             fills.extend(twap_fills)
 
@@ -452,11 +471,19 @@ class HyperliquidMonitor:
             await self._store_fills(normalized, fills)
             if data.get("isSnapshot"):
                 return
-            for fill, _ in fills:
+            async with self.engine.connect() as conn:
+                baseline_at = await load_monitor_baseline(conn, normalized)
+            if baseline_at is None:
+                return
+            baseline_ms = int(baseline_at.timestamp() * 1000)
+            current_fills = [
+                fill for fill, _ in fills if int(fill.get("time") or 0) >= baseline_ms
+            ]
+            for fill in current_fills:
                 coin = fill.get("coin")
                 if isinstance(coin, str):
                     self._recent_fills[(normalized, coin)] = fill
-            await self._emit_liquidations(normalized, [fill for fill, _ in fills])
+            await self._emit_liquidations(normalized, current_fills)
             return
         if channel == "allDexsClearinghouseState":
             states = _all_dex_states(data)
@@ -496,9 +523,22 @@ class HyperliquidMonitor:
                     )
                 )
             ).mappings().all()
+            baseline_names = set(
+                (
+                    await conn.execute(
+                        select(hl_state.c.name).where(
+                            hl_state.c.name.like("monitor_baseline:%")
+                        )
+                    )
+                ).scalars()
+            )
         selected = {item.address for item in select_hot_wallets(rows, self.mids, self.cfg)}
         for row in rows:
-            if row["address"] not in selected or row["coin"] not in changed:
+            if (
+                row["address"] not in selected
+                or row["coin"] not in changed
+                or f"monitor_baseline:{row['address']}" not in baseline_names
+            ):
                 continue
             snapshot = _snapshot_from_row(row, updated_at=self.clock())
             async with self.engine.connect() as conn:
@@ -514,7 +554,11 @@ class HyperliquidMonitor:
                 wallet={"tier": row["tier"]},
             )
             if result.events and self.sink is not None:
-                await self.sink.ingest(FetchResult(result.events, None), collector="hl_monitor")
+                await self.sink.ingest(
+                    FetchResult(result.events, None),
+                    collector="hl_monitor",
+                    track_collector_state=False,
+                )
             async with self.engine.begin() as conn:
                 await save_liquidation_risk_state(
                     conn,
@@ -547,6 +591,10 @@ class HyperliquidMonitor:
         observed_at: datetime | None = None,
     ) -> None:
         now = observed_at or self.clock()
+        async with self.engine.connect() as conn:
+            baseline_at = await load_monitor_baseline(conn, address)
+            last_observed_at = await load_last_observed_at(conn, address)
+        establishing_baseline = baseline_at is None
         total_notional = sum(
             (sum((snapshot.notional_usd for snapshot in _snapshots(state, address, dex, now)), Decimal(0)) for dex, state in states),
             Decimal(0),
@@ -566,7 +614,12 @@ class HyperliquidMonitor:
                 ).mappings().all()
             previous = {row["coin"]: _snapshot_from_row(row, updated_at=row["updated_at"]) for row in old_rows}
             for coin in sorted(previous.keys() | current.keys()):
-                old = previous.get(coin) or _zero_snapshot(address, dex, coin, now)
+                old = previous.get(coin) or _zero_snapshot(
+                    address,
+                    dex,
+                    coin,
+                    last_observed_at or now,
+                )
                 new = current.get(coin) or _zero_snapshot(address, dex, coin, now)
                 old = _with_account(old, account_value, total_notional)
                 new = _with_account(new, account_value, total_notional)
@@ -575,7 +628,7 @@ class HyperliquidMonitor:
 
         changed_coins = {new.coin for old, new in transitions if old.szi != new.szi}
         fill = None
-        if changed_coins and allow_fill_lookup:
+        if changed_coins and allow_fill_lookup and not establishing_baseline:
             try:
                 fill = await asyncio.wait_for(
                     self.lookup_fill_evidence(address, changed_coins),
@@ -599,7 +652,11 @@ class HyperliquidMonitor:
                 await conn.execute(select(hl_wallets).where(hl_wallets.c.address == address))
             ).mappings().first()
             risk_states = {
-                (new.dex, new.coin): await load_liquidation_risk_state(conn, address, new.dex, new.coin)
+                (new.dex, new.coin): (
+                    None
+                    if establishing_baseline
+                    else await load_liquidation_risk_state(conn, address, new.dex, new.coin)
+                )
                 for _, new in transitions
             }
         wallet = dict(wallet_row or {})
@@ -613,20 +670,36 @@ class HyperliquidMonitor:
                 evidence = self._recent_fills.get((address, new.coin))
             if evidence is not None:
                 used_fill_keys.append((address, new.coin))
+            mark_px = self.mids.get(new.coin) or _snapshot_mark_px(new) or _snapshot_mark_px(old)
             result = detect_events_with_state(
                 old,
                 new,
                 cfg=self.cfg,
                 fill=evidence,
-                mark_px=self.mids.get(new.coin),
+                mark_px=mark_px,
                 liquidation_risk_state=risk_states[(new.dex, new.coin)],
                 wallet=wallet,
             )
-            events.extend(result.events)
+            if not establishing_baseline:
+                if (
+                    evidence is None
+                    and now - old.updated_at
+                    > timedelta(seconds=self.cfg.events.max_push_age_s)
+                ):
+                    suffix = str(int(old.updated_at.timestamp() * 1000))
+                    for event in result.events:
+                        event.occurred_at = old.updated_at
+                        event.raw["backfill"] = True
+                        event.dedupe_key = f"{event.dedupe_key.rsplit(':', 1)[0]}:{suffix}"
+                events.extend(result.events)
             next_risks[(new.dex, new.coin)] = result.liquidation_risk_state
 
         if events and self.sink is not None:
-            await self.sink.ingest(FetchResult(events, None), collector="hl_monitor")
+            await self.sink.ingest(
+                FetchResult(events, None),
+                collector="hl_monitor",
+                track_collector_state=False,
+            )
         async with self.engine.begin() as conn:
             for dex, state in responses:
                 await upsert_position_snapshot(
@@ -641,6 +714,16 @@ class HyperliquidMonitor:
             dexes = sorted({dex for dex, _ in responses if dex})
             if dexes:
                 await _save_known_dexes(conn, address, dexes, now)
+            if establishing_baseline:
+                await save_monitor_baseline(conn, address, now)
+                await _initialize_fill_cursor(conn, address, now)
+            else:
+                assert baseline_at is not None
+                await save_last_observed_at(conn, address, baseline_at, now)
+        if establishing_baseline:
+            for key in [key for key in self._recent_fills if key[0] == address]:
+                self._recent_fills.pop(key, None)
+            self._deferred_fills.pop(address, None)
         for key in used_fill_keys:
             self._recent_fills.pop(key, None)
 
@@ -648,11 +731,17 @@ class HyperliquidMonitor:
         if self.sink is None:
             return
         async with self.engine.connect() as conn:
+            baseline_at = await load_monitor_baseline(conn, address)
+            if baseline_at is None:
+                return
             rows = (
                 await conn.execute(select(hl_positions).where(hl_positions.c.address == address))
             ).mappings().all()
         events = []
+        baseline_ms = int(baseline_at.timestamp() * 1000)
         for fill in fills:
+            if int(fill.get("time") or 0) < baseline_ms:
+                continue
             row = next((item for item in rows if item["coin"] == fill.get("coin")), None)
             if row is None:
                 continue
@@ -666,7 +755,11 @@ class HyperliquidMonitor:
             )
             events.extend(event for event in result.events if event.event_type == "hl_liquidated")
         if events:
-            await self.sink.ingest(FetchResult(events, None), collector="hl_monitor")
+            await self.sink.ingest(
+                FetchResult(events, None),
+                collector="hl_monitor",
+                track_collector_state=False,
+            )
 
     async def _store_fills(
         self,
@@ -748,6 +841,25 @@ class HyperliquidMonitor:
         return combined_account_value(abstraction, clearing, spot)
 
 
+async def _initialize_fill_cursor(
+    conn: AsyncConnection,
+    address: str,
+    baseline_at: datetime,
+) -> None:
+    """把首次成交补查起点固定为监控基线，避免回扫全量历史。"""
+    stmt = pg_insert(hl_state).values(
+        name=f"fills:{address}",
+        cursor={"last_time": int(baseline_at.timestamp() * 1000)},
+        updated_at=baseline_at,
+    )
+    await conn.execute(
+        stmt.on_conflict_do_update(
+            index_elements=["name"],
+            set_={"cursor": stmt.excluded.cursor, "updated_at": stmt.excluded.updated_at},
+        )
+    )
+
+
 async def _save_known_dexes(
     conn: AsyncConnection,
     address: str,
@@ -820,6 +932,13 @@ def _snapshot_from_row(row: Mapping[str, Any], *, updated_at: datetime) -> Posit
 
 def _zero_snapshot(address: str, dex: str, coin: str, updated_at: datetime) -> PositionSnapshot:
     return PositionSnapshot(address, dex, coin, Decimal(0), Decimal(0), updated_at)
+
+
+def _snapshot_mark_px(snapshot: PositionSnapshot) -> Decimal | None:
+    """从仓位名义与数量还原状态消息隐含的当前标记价。"""
+    if snapshot.szi == 0 or snapshot.notional_usd <= 0:
+        return None
+    return snapshot.notional_usd / abs(snapshot.szi)
 
 
 def _with_account(snapshot: PositionSnapshot, value: Decimal, notional: Decimal) -> PositionSnapshot:

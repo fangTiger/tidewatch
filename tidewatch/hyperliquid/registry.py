@@ -13,6 +13,7 @@ from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
+from tidewatch.hyperliquid.baseline import invalidate_monitor_baseline
 from tidewatch.hyperliquid.leaderboard import LeaderboardEntry
 from tidewatch.store.tables import hl_positions, hl_wallets
 
@@ -235,6 +236,7 @@ class WalletRegistry:
                     .where(hl_wallets.c.address == normalized)
                     .values(tier="focus", profile=profile)
                 )
+            await invalidate_monitor_baseline(conn, normalized)
         return True
 
     async def remove(self, address: str) -> bool:
@@ -260,6 +262,7 @@ class WalletRegistry:
                     .where(hl_wallets.c.address == normalized)
                     .values(tier="candidate", profile=profile)
                 )
+            await invalidate_monitor_baseline(conn, normalized)
         return True
 
     async def set_core(self, address: str, enabled: bool = True) -> bool:
@@ -302,6 +305,8 @@ class WalletRegistry:
                         .where(hl_wallets.c.address == normalized)
                         .values(tier="core", profile=profile)
                     )
+                if existing is None or existing["tier"] != "core":
+                    await invalidate_monitor_baseline(conn, normalized)
                 return True
             if existing is None or existing["tier"] != "core":
                 return False
@@ -343,6 +348,7 @@ class WalletRegistry:
                         .where(hl_wallets.c.address == normalized)
                         .values(tier=None, excluded=True)
                     )
+                await invalidate_monitor_baseline(conn, normalized)
                 return True
             if row is None or not row["excluded"]:
                 return False
@@ -351,6 +357,7 @@ class WalletRegistry:
                 .where(hl_wallets.c.address == normalized)
                 .values(tier="candidate", excluded=False)
             )
+            await invalidate_monitor_baseline(conn, normalized)
             return True
 
     async def set_label(self, address: str, note: str | None) -> bool:
@@ -437,6 +444,8 @@ class WalletRegistry:
                         .where(hl_wallets.c.address == address)
                         .values(tier="core", profile=profile)
                     )
+                    if existing["tier"] != "core":
+                        await invalidate_monitor_baseline(conn, address)
 
     async def list_wallets(
         self,
@@ -511,6 +520,7 @@ class WalletRegistry:
         await conn.execute(
             update(hl_wallets).where(hl_wallets.c.address == victim).values(tier="candidate")
         )
+        await invalidate_monitor_baseline(conn, victim)
 
     @staticmethod
     async def _lock_registry(conn: AsyncConnection) -> None:

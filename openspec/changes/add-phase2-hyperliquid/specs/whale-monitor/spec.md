@@ -55,6 +55,32 @@
 - **WHEN** 仓位快照发生变化但 `userFillsByTime` 没有返回对应成交
 - **THEN** 系统查询 `userTwapSliceFills` 并用其补充事件与成交记录
 
+### Requirement: 钱包监控基线
+系统 SHALL 在 `hl_state` 为每个重点或核心钱包持久化独立监控基线。首次 REST 对账或首次核心状态消息 MUST 只保存当前仓位、初始化强平滞回状态和成交补查游标，不得生成开仓、加仓、减仓、平仓、反手或接近强平事件。钱包从候选或排除状态进入重点/核心层时 MUST 使旧监控基线失效。分层重算写入的 `hl_positions` 快照 MUST NOT 自动视为监控基线。
+
+#### Scenario: 首次观察已有大量仓位
+- **WHEN** 钱包尚无监控基线且首次状态包含多个已有仓位
+- **THEN** 系统保存快照并建立基线，但不生成任何仓位或接近强平事件
+
+#### Scenario: 基线后发生开仓
+- **WHEN** 钱包已建立监控基线且后续仓位从 0 变为达到门槛的非 0 值
+- **THEN** 系统按正常差分生成一条 `hl_open` 事件
+
+#### Scenario: 晋升后重新建立基线
+- **WHEN** 钱包从候选或排除状态恢复并进入重点或核心层
+- **THEN** 系统使旧基线与旧补查游标失效，下一次观察只建立新基线
+
+### Requirement: 补抓事件时效
+系统 SHALL 以监控基线时刻初始化无游标钱包的 `userFillsByTime.startTime`，并忽略早于基线的普通与 TWAP 成交。被清算事件 MUST 只来自基线之后的成交。已有基线钱包的上一快照早于当前时间减 `max_push_age` 时，若没有成交证据提供确切时间，快照差分事件的 `occurred_at` MUST 取上一快照时间，且 `raw.backfill` MUST 为 `true`，使事件只入库不推送；有成交证据时 MUST 使用成交时间。
+
+#### Scenario: 无游标时不回扫基线前历史
+- **WHEN** 钱包已有监控基线但成交补查游标缺失
+- **THEN** 首次 `userFillsByTime` 从基线时刻开始，本次普通与 TWAP 补查返回的基线前成交不写入 `hl_fills` 且不生成历史清算事件
+
+#### Scenario: 停机后无成交证据的变化
+- **WHEN** 上一快照距当前 30 分钟且对账发现仓位变化，但补查没有找到对应成交
+- **THEN** 事件以旧快照时间作为 `occurred_at`、标记 `raw.backfill=true`，并且不产生 `push_log`
+
 ### Requirement: 仓位开平与反手检测
 系统 SHALL 比较相邻仓位快照：`szi` 从 0 到非 0 且新仓名义达到币种门槛时生成 `hl_open`；同号仓位绝对值变化不少于 20% 且变化名义达到币种门槛一半时生成 `hl_increase` 或 `hl_decrease`；非 0 到 0 生成 `hl_close`；符号改变 MUST 拆为一条按原仓位名义计算的 `hl_close` 与一条按新仓位名义计算的 `hl_open`。币种门槛 MUST 为 BTC/ETH 1,000,000 美元、配置的头部山寨 500,000 美元、其他币与 HIP-3 250,000 美元。
 
@@ -125,3 +151,14 @@
 #### Scenario: 空核心名单不超时
 - **WHEN** 核心名单为空且应用持续运行超过核心 WS 的正常 `stale_after`
 - **THEN** `hl_core_ws` 以空闲/降级说明保持非异常，不发送错误健康告警
+
+#### Scenario: 事件写入不登记内部来源
+- **WHEN** Hyperliquid 监控事件通过一期 `EventSink` 入库
+- **THEN** 系统不创建名为 `hl_monitor` 的 `collector_state` 行，状态页只展示已登记的健康子源
+
+### Requirement: 监控运行时快速停止
+系统 SHALL 在停止 Hyperliquid 运行时时立即取消受管后台任务及其在途 REST 请求，再关闭 WS 与 HTTP 资源，不得等待上游请求超时后才退出。
+
+#### Scenario: 停止时存在未完成 REST 请求
+- **WHEN** 运行时收到停止信号且一个 REST 请求仍未完成
+- **THEN** 系统取消该请求并在 0.5 秒内完成运行时停止

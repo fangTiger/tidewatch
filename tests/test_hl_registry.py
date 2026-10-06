@@ -10,7 +10,7 @@ from sqlalchemy import insert, select
 from fakes import async_timeout
 from tidewatch.hyperliquid.leaderboard import LeaderboardEntry
 from tidewatch.hyperliquid.registry import WalletRegistry, normalize_address
-from tidewatch.store.tables import hl_positions, hl_wallets
+from tidewatch.store.tables import hl_positions, hl_state, hl_wallets
 
 
 def _address(number: int) -> str:
@@ -22,6 +22,53 @@ def test_normalize_address_lowercases_and_rejects_invalid_values():
     for value in ("", "0X" + "ab" * 20, "0x1234", "0x" + "gg" * 20):
         with pytest.raises(ValueError, match="0x 开头的 40 位十六进制"):
             normalize_address(value)
+
+
+@async_timeout()
+async def test_monitor_baseline_is_invalidated_when_wallet_reenters_monitored_tier(
+    engine, clock
+):
+    address = _address(99)
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(
+                address=address,
+                tier="candidate",
+                source="leaderboard",
+            )
+        )
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"monitor_baseline:{address}",
+                cursor={"established_at": (clock.now - timedelta(days=1)).isoformat()},
+                updated_at=clock.now - timedelta(days=1),
+            )
+        )
+
+    registry = WalletRegistry(engine, clock=clock)
+    assert await registry.add(address)
+
+    async with engine.connect() as conn:
+        baseline = await conn.scalar(
+            select(hl_state.c.cursor).where(hl_state.c.name == f"monitor_baseline:{address}")
+        )
+    assert baseline is None
+
+    assert await registry.set_excluded(address, True)
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"monitor_baseline:{address}",
+                cursor={"established_at": (clock.now - timedelta(days=1)).isoformat()},
+                updated_at=clock.now - timedelta(days=1),
+            )
+        )
+    assert await registry.set_excluded(address, False)
+    async with engine.connect() as conn:
+        restored_baseline = await conn.scalar(
+            select(hl_state.c.cursor).where(hl_state.c.name == f"monitor_baseline:{address}")
+        )
+    assert restored_baseline is None
 
 
 @async_timeout()

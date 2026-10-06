@@ -14,7 +14,7 @@ from fakes import async_timeout
 from tidewatch.hyperliquid.monitor import ReconcilePriority
 from tidewatch.hyperliquid.runtime import HyperliquidRuntime
 from tidewatch.pipeline.sink import create_event_sink
-from tidewatch.store.tables import events, hl_positions, hl_wallets, push_log
+from tidewatch.store.tables import events, hl_positions, hl_state, hl_wallets, push_log
 
 
 ADDRESS = "0x1234567890abcdef1234567890abcdef12345678"
@@ -75,6 +75,51 @@ async def _wait_for_push(engine, timeout: float = 5) -> None:
     await asyncio.wait_for(poll(), timeout=timeout)
 
 
+@async_timeout()
+async def test_stop_cancels_inflight_rest_work_without_waiting_for_request_timeout(
+    engine, settings, clock
+):
+    async with engine.begin() as conn:
+        await conn.execute(insert(hl_wallets).values(address=ADDRESS, tier="focus", source="manual"))
+    runtime = HyperliquidRuntime(
+        settings.hyperliquid,
+        Health(),
+        engine=engine,
+        sink=None,
+        clock=clock,
+    )
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def inflight_rest(request_type: str, **params):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    runtime.rest.try_info = inflight_rest
+    task = asyncio.create_task(runtime.run_rest())
+    runtime._tasks = [task]
+    await asyncio.wait_for(started.wait(), timeout=1)
+    try:
+        before = time.monotonic()
+        await asyncio.wait_for(runtime.stop(), timeout=0.5)
+        elapsed = time.monotonic() - before
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if not runtime._resources_closed:
+            await runtime.close_resources()
+
+    assert elapsed < 0.5
+    assert task.cancelled() and cancelled.is_set()
+    assert runtime.ws._closed.is_set()
+    assert runtime.rest._client.is_closed and runtime.http.is_closed
+
+
 @async_timeout(10)
 async def test_core_ws_position_change_reaches_push_log_under_ten_seconds(
     engine, settings, clock
@@ -93,6 +138,14 @@ async def test_core_ws_position_change_reaches_push_log_under_ten_seconds(
                 {
                     "channel": "userFills",
                     "data": {"user": ADDRESS, "isSnapshot": True, "fills": []},
+                }
+            )
+        )
+        await websocket.send(
+            json.dumps(
+                {
+                    "channel": "allDexsClearinghouseState",
+                    "data": {"user": ADDRESS, "clearinghouseStates": [_state("0", "0")]},
                 }
             )
         )
@@ -248,6 +301,21 @@ async def test_reconnect_hook_reconciles_hot_wallet_final_state_through_rest(
                 unrealized_pnl=Decimal("0"),
                 updated_at=clock.now,
             )
+        )
+        await conn.execute(
+            insert(hl_state),
+            [
+                {
+                    "name": f"monitor_baseline:{OTHER}",
+                    "cursor": {"established_at": clock.now.isoformat()},
+                    "updated_at": clock.now,
+                },
+                {
+                    "name": f"fills:{OTHER}",
+                    "cursor": {"last_time": int(clock.now.timestamp() * 1000)},
+                    "updated_at": clock.now,
+                },
+            ],
         )
     sink = create_event_sink(engine, settings, clock=clock)
     await sink.start()

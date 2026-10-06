@@ -188,9 +188,20 @@ class EventSink:
 
     # ---------- 对外命令 ----------
 
-    async def ingest(self, result: FetchResult, *, collector: str) -> list[int]:
-        """提交一批采集结果；事务提交后返回新插入的事件 id（重复事件不计入）"""
-        return await self._submit(self._do_ingest, result, collector)
+    async def ingest(
+        self,
+        result: FetchResult,
+        *,
+        collector: str,
+        track_collector_state: bool = True,
+    ) -> list[int]:
+        """提交事件；可关闭轮询采集器游标写入，避免内部事件源产生健康行。"""
+        return await self._submit(
+            self._do_ingest,
+            result,
+            collector,
+            track_collector_state,
+        )
 
     async def push_result(
         self, push_id: int, status: str, *, response: str | None = None, batch_id: str | None = None
@@ -242,7 +253,12 @@ class EventSink:
 
     # ---------- ingest ----------
 
-    async def _do_ingest(self, result: FetchResult, collector: str) -> list[int]:
+    async def _do_ingest(
+        self,
+        result: FetchResult,
+        collector: str,
+        track_collector_state: bool,
+    ) -> list[int]:
         now = self._clock()
         for event in result.events:
             self._prepare(event)
@@ -257,7 +273,7 @@ class EventSink:
                 outcome.cluster_ids.append(event.cluster_id)
                 if plan is not None:
                     outcome.plans.append(plan)
-            if result.cursor is not None or outcome.event_ids:
+            if track_collector_state and (result.cursor is not None or outcome.event_ids):
                 await save_cursor(conn, collector, result.cursor, now, had_events=bool(outcome.event_ids))
         if outcome.event_ids:  # 大多数轮询批次没有新事件，不必通知
             self._emit(self._ingest_listeners, outcome)

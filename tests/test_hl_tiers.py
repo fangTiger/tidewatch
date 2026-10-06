@@ -81,6 +81,13 @@ async def test_recompute_queries_candidates_with_batch_client_and_replaces_lowes
                 updated_at=clock.now,
             )
         )
+        await conn.execute(
+            insert(hl_state).values(
+                name=f"monitor_baseline:{eligible}",
+                cursor={"established_at": (clock.now - timedelta(days=1)).isoformat()},
+                updated_at=clock.now - timedelta(days=1),
+            )
+        )
 
     requested: list[str] = []
 
@@ -112,6 +119,13 @@ async def test_recompute_queries_candidates_with_batch_client_and_replaces_lowes
     assert tiers[eligible] == "focus" and tiers[automatic] == "candidate"
     assert tiers[below] == tiers[maker] == "candidate"
     assert tiers[excluded] is None
+    async with engine.connect() as conn:
+        eligible_baseline = await conn.scalar(
+            select(hl_state.c.cursor).where(
+                hl_state.c.name == f"monitor_baseline:{eligible}"
+            )
+        )
+    assert eligible_baseline is None
 
 
 @async_timeout()
