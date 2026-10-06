@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
@@ -16,6 +17,7 @@ from typing import Any, Awaitable, Callable
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from tidewatch.clock import Clock, utcnow
+from tidewatch.hyperliquid.logging import redact_text, short_address
 from tidewatch.models import Event, FetchResult, level_ge
 from tidewatch.pipeline.cluster import Clusterer
 from tidewatch.pipeline.decision import PushDecider, PushPlan, freshness_from_settings
@@ -299,8 +301,11 @@ class EventSink:
                 await save_grading(conn, event)
                 cluster = await self._clusterer.assign(conn, event, now)
                 return await self._decider.decide(conn, cluster.id, now)
-        except Exception:
-            logger.exception("事件处理失败，已降级为 C 级：%s", event.dedupe_key)
+        except Exception as exc:
+            if event.category == "hyperliquid" or event.dedupe_key.startswith("hl:"):
+                _log_hyperliquid_processing_failure(event, exc)
+            else:
+                logger.exception("事件处理失败，已降级为 C 级：%s", event.dedupe_key)
             event.rule_level = event.final_level = "C"
             event.rule_hits = ["error"]
             event.ai_status = "skipped"
@@ -330,6 +335,30 @@ class EventSink:
                 listener(payload)
             except Exception:
                 logger.exception("监听器处理失败")
+
+
+def _log_hyperliquid_processing_failure(event: Event, exc: BaseException) -> None:
+    """仅用脱敏摘要记录 Hyperliquid 降级，详细调用栈降到 DEBUG。"""
+    raw_address = event.raw.get("address")
+    if not isinstance(raw_address, str) and event.dedupe_key.startswith("hl:"):
+        parts = event.dedupe_key.split(":", 3)
+        raw_address = parts[1] if len(parts) > 1 else "未知"
+    coin = event.raw.get("coin")
+    if not isinstance(coin, str) or not coin:
+        coin = event.assets[0] if event.assets else "未知"
+    reason = redact_text(exc)[:500] or "无异常消息"
+    logger.error(
+        "Hyperliquid 事件处理失败，已降级为 C 级：来源=%s 类型=%s 币种=%s "
+        "钱包=%s 异常=%s 原因=%s",
+        redact_text(event.source),
+        redact_text(event.event_type),
+        redact_text(coin),
+        short_address(raw_address or "未知"),
+        type(exc).__name__,
+        reason,
+    )
+    detail = redact_text("".join(traceback.format_exception(exc)))
+    logger.debug("Hyperliquid 事件处理失败调试详情：\n%s", detail)
 
 
 def create_event_sink(

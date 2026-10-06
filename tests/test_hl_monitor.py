@@ -39,6 +39,28 @@ OTHER = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
 FIXTURES = Path(__file__).parent / "fixtures" / "hyperliquid"
 
 
+class _ObservedLock:
+    """为并发测试暴露第二次取锁尝试，不依赖调度器时间窗口。"""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self.attempts = 0
+        self.second_attempted = asyncio.Event()
+
+    async def __aenter__(self):
+        self.attempts += 1
+        if self.attempts == 2:
+            self.second_attempted.set()
+        await self._lock.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._lock.release()
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+
 def _state(
     *,
     coin: str = "BTC",
@@ -725,6 +747,8 @@ async def test_forget_wallet_clears_all_wallet_scoped_memory(settings, engine, c
     monitor._deferred_fills[ADDRESS] = (clock.now, {"BTC"})
     monitor._pending_reconciles[ADDRESS] = object()
     monitor._liquidation_locks[ADDRESS] = asyncio.Lock()
+    monitor._state_locks[ADDRESS] = asyncio.Lock()
+    monitor._last_observation_at[ADDRESS] = clock.now
     monitor._fill_timeout_warnings[ADDRESS] = clock.now
     monitor._account_lookup_warnings[(ADDRESS, "spot")] = clock.now
 
@@ -734,9 +758,258 @@ async def test_forget_wallet_clears_all_wallet_scoped_memory(settings, engine, c
     assert ADDRESS not in monitor._deferred_fills
     assert ADDRESS not in monitor._pending_reconciles
     assert ADDRESS not in monitor._liquidation_locks
+    assert ADDRESS not in monitor._state_locks
+    assert ADDRESS not in monitor._state_lock_users
+    assert ADDRESS not in monitor._retired_state_locks
+    assert ADDRESS not in monitor._last_observation_at
     assert ADDRESS not in monitor._fill_timeout_warnings
     assert not any(key[0] == ADDRESS for key in monitor._recent_fills)
     assert not any(key[0] == ADDRESS for key in monitor._account_lookup_warnings)
+
+
+@async_timeout()
+async def test_stale_rest_observation_cannot_overwrite_newer_core_ws_state(
+    engine, settings, clock
+):
+    """REST 请求先开始但后返回时，不能覆盖其间已经提交的核心 WS 观察。"""
+    rest_started = asyncio.Event()
+    release_rest = asyncio.Event()
+
+    class Rest:
+        async def try_info(self, request_type: str, **params):
+            if request_type == "clearinghouseState":
+                rest_started.set()
+                await asyncio.wait_for(release_rest.wait(), timeout=2)
+                return True, _state(szi="10", value="1000000")
+            if request_type in {"userFillsByTime", "userTwapSliceFills"}:
+                return True, []
+            raise AssertionError(request_type)
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="core", source="manual")
+        )
+    await _seed_baseline(engine, clock)
+    sink = create_event_sink(engine, settings, clock=clock)
+    await sink.start()
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=Rest(),
+        sink=sink,
+        clock=clock,
+    )
+    reconcile = asyncio.create_task(monitor.reconcile(ADDRESS))
+    try:
+        await asyncio.wait_for(rest_started.wait(), timeout=2)
+        clock.advance(seconds=1)
+        await asyncio.wait_for(
+            monitor.handle_core_message(
+                {
+                    "channel": "allDexsClearinghouseState",
+                    "data": {
+                        "user": ADDRESS,
+                        "clearinghouseStates": {"": _state(szi="600", value="60000000")},
+                    },
+                }
+            ),
+            timeout=2,
+        )
+        release_rest.set()
+        assert await asyncio.wait_for(reconcile, timeout=2)
+    finally:
+        release_rest.set()
+        if not reconcile.done():
+            reconcile.cancel()
+            await asyncio.gather(reconcile, return_exceptions=True)
+        await asyncio.wait_for(sink.stop(), timeout=2)
+
+    async with engine.connect() as conn:
+        position = (await conn.execute(select(hl_positions))).mappings().one()
+        event_rows = (
+            await conn.execute(
+                select(events.c.event_type, events.c.final_level, events.c.dedupe_key)
+            )
+        ).all()
+    assert position.szi == Decimal("600")
+    assert position.notional_usd == Decimal("60000000")
+    assert [(row.event_type, row.final_level) for row in event_rows] == [("hl_open", "S")]
+    assert len({row.dedupe_key for row in event_rows}) == 1
+
+
+@async_timeout()
+async def test_rest_and_core_ws_share_full_wallet_state_critical_section(
+    engine, settings, clock
+):
+    """事件提交故障点交错时，后到的 S 级观察必须等待并使用已提交的新基准。"""
+
+    class BlockingSink:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.first_entered = asyncio.Event()
+            self.second_entered = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.calls = 0
+
+        async def ingest(self, result, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                self.first_entered.set()
+                await asyncio.wait_for(self.release_first.wait(), timeout=2)
+            else:
+                self.second_entered.set()
+            return await self.inner.ingest(result, **kwargs)
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="core", source="manual")
+        )
+    await _seed_baseline(engine, clock)
+    real_sink = create_event_sink(engine, settings, clock=clock)
+    await real_sink.start()
+    blocking_sink = BlockingSink(real_sink)
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=None,
+        sink=blocking_sink,
+        clock=clock,
+    )
+    observed_lock = _ObservedLock()
+    monitor._state_locks[ADDRESS] = observed_lock
+    rest_observed_at = clock.now + timedelta(seconds=1)
+    rest_task = asyncio.create_task(
+        monitor._process_states(
+            ADDRESS,
+            [("", _state(szi="10", value="1000000"))],
+            account_value=Decimal("800000"),
+            allow_fill_lookup=False,
+            observed_at=rest_observed_at,
+        )
+    )
+    ws_task = None
+    try:
+        await asyncio.wait_for(blocking_sink.first_entered.wait(), timeout=2)
+        clock.advance(seconds=2)
+        ws_task = asyncio.create_task(
+            monitor.handle_core_message(
+                {
+                    "channel": "allDexsClearinghouseState",
+                    "data": {
+                        "user": ADDRESS,
+                        "clearinghouseStates": {"": _state(szi="600", value="60000000")},
+                    },
+                }
+            )
+        )
+        await asyncio.wait_for(observed_lock.second_attempted.wait(), timeout=2)
+        assert not blocking_sink.second_entered.is_set()
+        blocking_sink.release_first.set()
+        await asyncio.wait_for(rest_task, timeout=2)
+        await asyncio.wait_for(ws_task, timeout=2)
+    finally:
+        blocking_sink.release_first.set()
+        pending = [task for task in (rest_task, ws_task) if task is not None and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.wait_for(real_sink.stop(), timeout=2)
+
+    async with engine.connect() as conn:
+        position = (await conn.execute(select(hl_positions))).mappings().one()
+        event_rows = (
+            await conn.execute(
+                select(events.c.event_type, events.c.final_level, events.c.dedupe_key)
+                .order_by(events.c.id)
+            )
+        ).all()
+    assert position.szi == Decimal("600")
+    assert [(row.event_type, row.final_level) for row in event_rows] == [
+        ("hl_open", "B"),
+        ("hl_increase", "S"),
+    ]
+    assert len({row.dedupe_key for row in event_rows}) == 2
+
+
+@async_timeout()
+async def test_forget_wallet_defers_state_lock_cleanup_until_all_users_exit(
+    engine, settings, clock
+):
+    """钱包移除与快速重新进入交错时，所有在途处理仍须复用原锁。"""
+
+    class BlockingSink:
+        def __init__(self, inner) -> None:
+            self.inner = inner
+            self.first_entered = asyncio.Event()
+            self.release_first = asyncio.Event()
+            self.calls = 0
+
+        async def ingest(self, result, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                self.first_entered.set()
+                await asyncio.wait_for(self.release_first.wait(), timeout=2)
+            return await self.inner.ingest(result, **kwargs)
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            insert(hl_wallets).values(address=ADDRESS, tier="core", source="manual")
+        )
+    await _seed_baseline(engine, clock)
+    real_sink = create_event_sink(engine, settings, clock=clock)
+    await real_sink.start()
+    blocking_sink = BlockingSink(real_sink)
+    monitor = HyperliquidMonitor(
+        settings.hyperliquid,
+        engine=engine,
+        rest=None,
+        sink=blocking_sink,
+        clock=clock,
+    )
+    observed_lock = _ObservedLock()
+    monitor._state_locks[ADDRESS] = observed_lock
+    first = asyncio.create_task(
+        monitor._process_states(
+            ADDRESS,
+            [("", _state(szi="10", value="1000000"))],
+            account_value=Decimal("800000"),
+            allow_fill_lookup=False,
+            observed_at=clock.now + timedelta(seconds=1),
+        )
+    )
+    second = None
+    try:
+        await asyncio.wait_for(blocking_sink.first_entered.wait(), timeout=2)
+        monitor.forget_wallet(ADDRESS)
+        assert monitor._state_locks.get(ADDRESS) is observed_lock
+        second = asyncio.create_task(
+            monitor._process_states(
+                ADDRESS,
+                [("", _state(szi="600", value="60000000"))],
+                account_value=Decimal("800000"),
+                allow_fill_lookup=False,
+                observed_at=clock.now + timedelta(seconds=2),
+            )
+        )
+        await asyncio.wait_for(observed_lock.second_attempted.wait(), timeout=2)
+        assert blocking_sink.calls == 1
+        blocking_sink.release_first.set()
+        await asyncio.wait_for(first, timeout=2)
+        await asyncio.wait_for(second, timeout=2)
+    finally:
+        blocking_sink.release_first.set()
+        pending = [task for task in (first, second) if task is not None and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.wait_for(real_sink.stop(), timeout=2)
+
+    assert ADDRESS not in monitor._state_locks
+    assert ADDRESS not in monitor._state_lock_users
+    assert ADDRESS not in monitor._retired_state_locks
+    assert ADDRESS not in monitor._last_observation_at
 
 
 async def test_rest_reconcile_persists_snapshot_fill_and_cursor_then_ingests_event(

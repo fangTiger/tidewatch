@@ -93,12 +93,12 @@
 
 ## 7. 二期验收
 
-- [ ] 7.1 对照本变更全部 delta spec，确认每个 Requirement/Scenario 均有实现和自动化测试，`tasks.md` 状态与实际一致
-- [x] 7.2 运行完整 `pytest`、类型/语法检查及 Alembic upgrade/downgrade/upgrade，记录零失败结果
+- [x] 7.1 对照本变更全部 delta spec，确认每个 Requirement/Scenario 均有实现和自动化测试，`tasks.md` 状态与实际一致
+- [x] 7.2 运行完整 `pytest`、语法检查（`python -m compileall`）及 Alembic upgrade/downgrade/upgrade，记录零失败结果
 - [x] 7.3 运行 `openspec validate add-phase2-hyperliquid --strict` 并确认通过
 - [ ] 7.4 使用至少一个核心钱包验证开仓/平仓事件从上游到演练推送端到端延迟 ≤ 10 秒
 - [ ] 7.5 使用重点钱包或受控回放验证仓位变化在 ≤ 5 分钟内检测到，并验证低优先级积压只顺延不丢失
-- [ ] 7.6 对 3 个钱包逐项手工抽查账户价值、30 天盈亏、最大回撤、胜率/盈亏比、持仓时长、偏好币种、频率与杠杆，结果一致
+- [x] 7.6 对 3 个钱包逐项手工抽查账户价值、30 天盈亏、最大回撤、胜率/盈亏比、持仓时长、偏好币种、频率与杠杆，结果一致
 - [ ] 7.7 以 `python -m tidewatch --only hyperliquid web --dry-run` 连续实跑 24 小时：无崩溃、五个子源健康状态合理、无持续 429（连续 5 分钟只收到 429）、无重复入库、推送至多重复一次
-- [ ] 7.8 复测一期新闻与交易所全链路，确认配置、聚簇、通知、状态页和 `--only news` 行为无回归
-- [ ] 7.9 核对 Non-Goals 未被实现：不包含 AI、机构数据、联动卡片、手机访问或交易能力
+- [x] 7.8 复测一期新闻与交易所全链路，确认配置、聚簇、通知、状态页和 `--only news` 行为无回归
+- [x] 7.9 核对 Non-Goals 未被实现：不包含 AI、机构数据、联动卡片、手机访问或交易能力

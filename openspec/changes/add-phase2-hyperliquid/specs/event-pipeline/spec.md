@@ -35,11 +35,15 @@
 - **THEN** 新事件进入新簇
 
 ### Requirement: Hyperliquid 事件事务处理
-系统 SHALL 通过一期 `EventSink.ingest` 在同一事务完成 Hyperliquid 事件插入去重、`hyperliquid` 规则分级、专用聚簇、推送决策、AI 标记与对应子源游标推进。二期 `ai.enabled` 仍为 false，Hyperliquid 事件的 `ai_status` MUST 为 `skipped`。事务提交前 MUST NOT 广播 SSE 或交给 Dispatcher。
+系统 SHALL 通过一期 `EventSink.ingest` 在同一事务完成 Hyperliquid 事件插入去重、`hyperliquid` 规则分级、专用聚簇、推送决策与 AI 标记；事件事务提交后，再提交仓位快照、强平风险状态与对应 Hyperliquid 子源游标。系统 MUST 使用稳定去重键实现跨事务幂等恢复：无成交快照事件使用上一持久化快照时间，成交事件使用 `tid`，清算事件由已持久化成交及其消费游标驱动，保证在事件已提交而后续状态尚未提交时崩溃重启不重复推送、不漏报。二期 `ai.enabled` 仍为 false，Hyperliquid 事件的 `ai_status` MUST 为 `skipped`。事件事务提交前 MUST NOT 广播 SSE 或交给 Dispatcher。
 
-#### Scenario: 事件与游标原子提交
+#### Scenario: 事件事务失败不推进后续状态
 - **WHEN** 一批仓位事件在推送决策阶段发生数据库错误
-- **THEN** 一期保存点/事务语义生效，游标不会越过未提交数据，提交前也没有 SSE 或推送队列通知
+- **THEN** 一期保存点/事务语义生效，快照、风险状态与 Hyperliquid 子源游标不会越过未提交事件，提交前也没有 SSE 或推送队列通知
+
+#### Scenario: 跨事务崩溃后幂等恢复
+- **WHEN** 事件经 `EventSink` 提交后，进程在快照、风险状态或 Hyperliquid 子源游标提交前崩溃并重启
+- **THEN** 快照事件以同一上一持久化快照时间、成交事件以同一 `tid` 生成稳定去重键，清算消费从未推进的成交游标恢复，已提交事件不重复推送且未提交状态不会导致漏报
 
 #### Scenario: 二期不进入 AI 队列
 - **WHEN** 一条 S 级 Hyperliquid 事件在二期入库

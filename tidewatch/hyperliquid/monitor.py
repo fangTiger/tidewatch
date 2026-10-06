@@ -328,6 +328,10 @@ class HyperliquidMonitor:
         self._deferred_fills: dict[str, tuple[datetime, set[str]]] = {}
         self._pending_reconciles: dict[str, _ReconcileProgress] = {}
         self._liquidation_locks: dict[str, asyncio.Lock] = {}
+        self._state_locks: dict[str, asyncio.Lock] = {}
+        self._state_lock_users: dict[str, int] = {}
+        self._retired_state_locks: set[str] = set()
+        self._last_observation_at: dict[str, datetime] = {}
         self._fill_timeout_warnings: dict[str, datetime] = {}
         self._account_lookup_warnings: dict[tuple[str, str], datetime] = {}
 
@@ -364,7 +368,7 @@ class HyperliquidMonitor:
                 else set()
             )
             progress = _ReconcileProgress(
-                observed_at=self.clock(),
+                observed_at=self._begin_state_observation(normalized),
                 dexes=(
                     "",
                     *sorted(position_dexes | remembered_dexes),
@@ -691,12 +695,14 @@ class HyperliquidMonitor:
             states = _all_dex_states(data)
             if not states:
                 return
+            observed_at = self._begin_state_observation(normalized)
             account_value = await self._core_account_value(normalized, states[0][1])
             await self._process_states(
                 normalized,
                 states,
                 account_value=account_value,
                 allow_fill_lookup=False,
+                observed_at=observed_at,
             )
 
     async def update_mids(self, mids: Mapping[str, Any]) -> None:
@@ -852,6 +858,14 @@ class HyperliquidMonitor:
         self._deferred_fills.pop(normalized, None)
         self._pending_reconciles.pop(normalized, None)
         self._liquidation_locks.pop(normalized, None)
+        state_lock = self._state_locks.get(normalized)
+        if state_lock is not None and self._state_lock_users.get(normalized, 0) > 0:
+            self._retired_state_locks.add(normalized)
+        else:
+            self._state_locks.pop(normalized, None)
+            self._state_lock_users.pop(normalized, None)
+            self._retired_state_locks.discard(normalized)
+            self._last_observation_at.pop(normalized, None)
         self._fill_timeout_warnings.pop(normalized, None)
         for mapping in (self._recent_fills, self._account_lookup_warnings):
             for key in [key for key in mapping if key[0] == normalized]:
@@ -864,6 +878,10 @@ class HyperliquidMonitor:
             *self._deferred_fills,
             *self._pending_reconciles,
             *self._liquidation_locks,
+            *self._state_locks,
+            *self._state_lock_users,
+            *self._retired_state_locks,
+            *self._last_observation_at,
             *self._fill_timeout_warnings,
         }
         addresses.update(address for address, _coin in self._recent_fills)
@@ -879,10 +897,52 @@ class HyperliquidMonitor:
         allow_fill_lookup: bool,
         observed_at: datetime | None = None,
     ) -> None:
-        now = observed_at or self.clock()
+        normalized = normalize_address(address)
+        now = observed_at or self._begin_state_observation(normalized)
+        current_observation = self._last_observation_at.get(normalized)
+        if current_observation is None or now > current_observation:
+            self._last_observation_at[normalized] = now
+        lock = self._state_locks.setdefault(normalized, asyncio.Lock())
+        self._state_lock_users[normalized] = self._state_lock_users.get(normalized, 0) + 1
+        try:
+            async with lock:
+                await self._process_states_locked(
+                    normalized,
+                    states,
+                    account_value=account_value,
+                    allow_fill_lookup=allow_fill_lookup,
+                    observed_at=now,
+                )
+        finally:
+            remaining = self._state_lock_users[normalized] - 1
+            if remaining:
+                self._state_lock_users[normalized] = remaining
+            else:
+                self._state_lock_users.pop(normalized, None)
+                if (
+                    normalized in self._retired_state_locks
+                    and self._state_locks.get(normalized) is lock
+                ):
+                    self._state_locks.pop(normalized, None)
+                    self._retired_state_locks.discard(normalized)
+                    self._last_observation_at.pop(normalized, None)
+
+    async def _process_states_locked(
+        self,
+        address: str,
+        states: list[tuple[str, Any]],
+        *,
+        account_value: Decimal | None,
+        allow_fill_lookup: bool,
+        observed_at: datetime,
+    ) -> None:
+        """在钱包状态锁内完成读取、检测、事件与快照/游标提交。"""
+        now = observed_at
         async with self.engine.connect() as conn:
             baseline_at = await load_monitor_baseline(conn, address)
             last_observed_at = await load_last_observed_at(conn, address)
+        if last_observed_at is not None and now < last_observed_at:
+            return
         establishing_baseline = baseline_at is None
         total_notional = sum(
             (sum((snapshot.notional_usd for snapshot in _snapshots(state, address, dex, now)), Decimal(0)) for dex, state in states),
@@ -1047,6 +1107,16 @@ class HyperliquidMonitor:
             self._deferred_fills.pop(address, None)
         for key in used_fill_keys:
             self._recent_fills.pop(key, None)
+
+    def _begin_state_observation(self, address: str) -> datetime:
+        """记录无上游时间戳状态的开始时刻，并在进程内保证单调递增。"""
+        normalized = normalize_address(address)
+        observed_at = self.clock()
+        previous = self._last_observation_at.get(normalized)
+        if previous is not None and observed_at <= previous:
+            observed_at = previous + timedelta(microseconds=1)
+        self._last_observation_at[normalized] = observed_at
+        return observed_at
 
     async def process_liquidation_fills(self, address: str) -> None:
         """消费清算游标之后的已入库成交，事件提交后才推进游标。"""

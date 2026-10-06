@@ -1,10 +1,12 @@
 import asyncio
+import logging
 from datetime import timedelta
 
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 
+from fakes import async_timeout
 from tidewatch.models import Event, FetchResult
 from tidewatch.pipeline.rules.engine import build_rule_engine
 from tidewatch.pipeline.sink import create_event_sink
@@ -92,6 +94,83 @@ async def test_rule_error_degrades_single_event(engine, settings, clock):
     assert rows["bad"].final_level == "C" and rows["bad"].rule_hits == ["error"] and rows["bad"].cluster_id is not None
     assert rows["good"].final_level == "S" and len(pushes) == 1
     assert cursor == {"last_id": "9"}
+
+
+@async_timeout()
+async def test_hyperliquid_rule_error_log_is_redacted_without_error_traceback(
+    engine, settings, clock, caplog
+):
+    address = "0x1234567890abcdef1234567890abcdef12345678"
+    dedupe_key = f"hl:{address}:BTC:hl_open:1"
+
+    class Boom:
+        async def evaluate(self, event, ctx):
+            raise RuntimeError(f"上游失败 {address} [parameters: ({address!r},)]")
+
+    event = Event(
+        source="hl_monitor",
+        category="hyperliquid",
+        event_type="hl_open",
+        occurred_at=clock.now,
+        title="Hyperliquid 巨鲸开仓 BTC",
+        dedupe_key=dedupe_key,
+        assets=["BTC"],
+        raw={"address": address, "coin": "BTC"},
+    )
+    event_sink = create_event_sink(engine, settings, clock=clock, rules=Boom())
+    await event_sink.start()
+    try:
+        with caplog.at_level(logging.DEBUG, logger="tidewatch.pipeline.sink"):
+            await asyncio.wait_for(
+                event_sink.ingest(FetchResult([event], None), collector="hl_monitor"),
+                timeout=2,
+            )
+    finally:
+        await asyncio.wait_for(event_sink.stop(), timeout=2)
+
+    records = [record for record in caplog.records if "事件处理失败" in record.message]
+    error_record = next(record for record in records if record.levelno == logging.ERROR)
+    debug_record = next(record for record in records if record.levelno == logging.DEBUG)
+    combined = "\n".join(record.getMessage() for record in records)
+    assert error_record.exc_info is None
+    assert "来源=hl_monitor" in error_record.getMessage()
+    assert "类型=hl_open" in error_record.getMessage()
+    assert "币种=BTC" in error_record.getMessage()
+    assert "钱包=0x1234…5678" in error_record.getMessage()
+    assert "异常=RuntimeError" in error_record.getMessage()
+    assert "原因=上游失败 0x1234…5678" in error_record.getMessage()
+    assert "Traceback (most recent call last)" in debug_record.getMessage()
+    assert address not in combined
+    assert dedupe_key not in combined
+    assert "parameters:" not in combined
+
+
+@async_timeout()
+async def test_news_rule_error_log_keeps_existing_dedupe_key_and_error_traceback(
+    engine, settings, clock, caplog
+):
+    class Boom:
+        async def evaluate(self, event, ctx):
+            raise RuntimeError("一期规则缺陷")
+
+    event_sink = create_event_sink(engine, settings, clock=clock, rules=Boom())
+    await event_sink.start()
+    try:
+        with caplog.at_level(logging.ERROR, logger="tidewatch.pipeline.sink"):
+            await asyncio.wait_for(
+                event_sink.ingest(
+                    FetchResult([_flash(clock, "jin10:legacy", NFP)], None),
+                    collector="jin10",
+                ),
+                timeout=2,
+            )
+    finally:
+        await asyncio.wait_for(event_sink.stop(), timeout=2)
+
+    record = next(record for record in caplog.records if "事件处理失败" in record.message)
+    assert record.getMessage().endswith("jin10:legacy")
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None
 
 
 async def test_db_error_in_rule_rolls_back_to_savepoint(engine, settings, clock):
