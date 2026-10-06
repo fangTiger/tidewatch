@@ -40,7 +40,7 @@ async def seeded(engine, settings, clock):
 @pytest.fixture
 async def client(seeded, settings, clock):
     app = create_app(seeded, Broadcaster(), settings, clock=clock)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as http:
         yield http
 
 
@@ -110,7 +110,7 @@ async def test_status_marks_abnormal_collector_red(seeded, settings, clock):
             .values(status="abnormal", last_error="接口超时")
         )
     app = create_app(seeded, Broadcaster(), settings, clock=clock)
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as http:
         page = await asyncio.wait_for(http.get("/status"), timeout=3)
 
     assert 'id="s-jin10" class="st-abnormal"' in page.text
@@ -138,12 +138,50 @@ async def test_timeline_escapes_script_in_title(seeded, settings, clock):
         finally:
             await sink.stop()
         app = create_app(seeded, Broadcaster(), settings, clock=clock)
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as http:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as http:
             return await http.get("/")
 
     page = await asyncio.wait_for(scenario(), timeout=5)
     assert "<script>alert(1)</script>" not in page.text
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in page.text
+
+
+async def test_host_allowlist_rejects_forged_get_post_and_sse(seeded, settings, clock):
+    app = create_app(seeded, Broadcaster(), settings, clock=clock)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://evil.example:8000") as evil:
+        forged_get = await asyncio.wait_for(evil.get("/"), timeout=3)
+        assert forged_get.status_code == 400
+        forged_post = await asyncio.wait_for(
+            evil.post(
+                "/whales/actions",
+                data={"action": "invalid", "address": "0x" + "1" * 40},
+                headers={"Origin": "http://evil.example:8000"},
+            ),
+            timeout=3,
+        )
+        assert forged_post.status_code == 400
+        forged_sse = await asyncio.wait_for(evil.get("/stream"), timeout=3)
+        assert forged_sse.status_code == 400
+
+async def test_host_allowlist_accepts_loopback_and_configured_host(seeded, settings, clock):
+    settings.web.host = "dashboard.internal"
+    app = create_app(seeded, Broadcaster(), settings, clock=clock)
+    transport = httpx.ASGITransport(app=app)
+    for host in ("127.0.0.1", "localhost", "[::1]", "dashboard.internal"):
+        async with httpx.AsyncClient(transport=transport, base_url=f"http://{host}:8000") as http:
+            response = await asyncio.wait_for(http.get("/"), timeout=3)
+        assert response.status_code == 200
+
+
+async def test_host_allowlist_does_not_accept_wildcard_configuration(seeded, settings, clock):
+    settings.web.host = "*"
+    app = create_app(seeded, Broadcaster(), settings, clock=clock)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://evil.example:8000"
+    ) as http:
+        response = await asyncio.wait_for(http.get("/"), timeout=3)
+    assert response.status_code == 400
 
 
 @pytest.fixture

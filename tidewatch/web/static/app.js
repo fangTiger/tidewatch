@@ -136,6 +136,94 @@
     return root ? root.querySelector("." + className) : null;
   }
 
+  function decimalInfo(value) {
+    if (value == null || value === "" || typeof value === "boolean") return null;
+    const match = String(value).trim().match(/^([+-])?(\d+)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/);
+    if (!match) return null;
+    const exponent = Number(match[4] || 0);
+    const fractionLength = (match[3] || "").length;
+    const rawDigits = (match[2] + (match[3] || "")).replace(/^0+/, "") || "0";
+    if (!Number.isSafeInteger(exponent) || Math.abs(exponent) > 1000 || rawDigits.length > 1000) return null;
+    const scale = fractionLength - exponent;
+    return {
+      coefficient: BigInt(rawDigits),
+      scale,
+      adjusted: rawDigits === "0" ? 0 : rawDigits.length - scale - 1,
+      negative: match[1] === "-" && rawDigits !== "0",
+    };
+  }
+
+  function powerOfTen(exponent) {
+    return 10n ** BigInt(exponent);
+  }
+
+  function compareAbsWithInteger(info, integer) {
+    if (info.scale >= 0) {
+      const target = BigInt(integer) * powerOfTen(info.scale);
+      return info.coefficient < target ? -1 : info.coefficient > target ? 1 : 0;
+    }
+    const value = info.coefficient * powerOfTen(-info.scale);
+    const target = BigInt(integer);
+    return value < target ? -1 : value > target ? 1 : 0;
+  }
+
+  function fixedNumber(value, places, trim, multiplier, divisor) {
+    const info = decimalInfo(value);
+    if (!info) return "—";
+    const factor = multiplier == null ? 1n : multiplier;
+    let numerator = info.coefficient * factor * powerOfTen(places);
+    let denominator = divisor == null ? 1n : divisor;
+    if (info.scale >= 0) denominator *= powerOfTen(info.scale);
+    else numerator *= powerOfTen(-info.scale);
+    let rounded = numerator / denominator;
+    if ((numerator % denominator) * 2n >= denominator) rounded += 1n;
+    let digits = rounded.toString().padStart(places + 1, "0");
+    let integer = places ? digits.slice(0, -places) : digits;
+    let fraction = places ? digits.slice(-places) : "";
+    integer = integer.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    if (trim && fraction) fraction = fraction.replace(/0+$/, "");
+    const sign = info.negative ? "-" : "";
+    return sign + integer + (fraction ? "." + fraction : "");
+  }
+
+  function formatMoney(value) {
+    const formatted = fixedNumber(value, 2, false);
+    if (formatted === "—") return formatted;
+    return formatted.startsWith("-") ? "-$" + formatted.slice(1) : "$" + formatted;
+  }
+
+  function formatPercent(value) {
+    const formatted = fixedNumber(value, 2, false, 100n);
+    return formatted === "—" ? formatted : formatted + "%";
+  }
+
+  function formatDuration(value) {
+    const info = decimalInfo(value);
+    if (!info) return "—";
+    return compareAbsWithInteger(info, 86400) < 0
+      ? fixedNumber(value, 2, false, 1n, 3600n) + " 小时"
+      : fixedNumber(value, 2, false, 1n, 86400n) + " 天";
+  }
+
+  function formatNumber(value, places, fixed) {
+    return fixedNumber(value, places == null ? 6 : places, !fixed);
+  }
+
+  function formatPrice(value) {
+    const info = decimalInfo(value);
+    if (!info) return "—";
+    if (compareAbsWithInteger(info, 1000) >= 0) return fixedNumber(value, 2, false);
+    if (compareAbsWithInteger(info, 1) >= 0) return fixedNumber(value, 4, false);
+    if (info.coefficient === 0n) return "0";
+    const places = Math.max(4, Math.min(12, 5 - info.adjusted));
+    return fixedNumber(value, places, true);
+  }
+
+  function formatLeverage(value) {
+    const formatted = fixedNumber(value, 2, false);
+    return formatted === "—" ? formatted : formatted + "×";
+  }
+
   function updateMarket(data) {
     if (!marketStrip || !data || !Array.isArray(data.tickers)) return;
     data.tickers.forEach((ticker) => {
@@ -146,7 +234,7 @@
       target.dataset.status = ticker.status;
       const price = childWithClass(target, "ticker-price");
       const status = childWithClass(target, "ticker-status");
-      if (price) price.textContent = ticker.price || "—";
+      if (price) price.textContent = formatPrice(ticker.price);
       if (status) status.textContent = ticker.status;
     });
   }
@@ -171,13 +259,13 @@
       article.dataset.coin = item.coin;
       const headline = document.createElement("div");
       appendText(headline, "b", item.coin);
-      appendText(headline, "span", item.net_usd, "net-value " + item.direction);
+      appendText(headline, "span", formatMoney(item.net_usd), "net-value " + item.direction);
       article.appendChild(headline);
       const detail = document.createElement("dl");
       appendText(detail, "dt", "多");
-      appendText(detail, "dd", item.long_usd);
+      appendText(detail, "dd", formatMoney(item.long_usd));
       appendText(detail, "dt", "空");
-      appendText(detail, "dd", item.short_usd);
+      appendText(detail, "dd", formatMoney(item.short_usd));
       article.appendChild(detail);
       netPositions.appendChild(article);
     });
@@ -222,14 +310,17 @@
       row.dataset.dex = item.dex;
       appendText(row, "td", item.coin + " · " + item.dex);
       appendText(row, "td", item.direction === "long" ? "多" : "空", item.direction);
-      [item.quantity, item.notional_usd, item.entry_px, item.liquidation_px].forEach((value) => appendText(row, "td", value));
-      const risk = appendText(row, "td", item.liquidation_distance);
+      appendText(row, "td", formatNumber(item.quantity));
+      appendText(row, "td", formatMoney(item.notional_usd));
+      appendText(row, "td", formatPrice(item.entry_px));
+      appendText(row, "td", formatPrice(item.liquidation_px));
+      const risk = appendText(row, "td", formatPercent(item.liquidation_distance));
       const progress = document.createElement("progress");
       progress.max = 100;
       progress.value = item.liquidation_progress || 0;
       risk.appendChild(progress);
-      appendText(row, "td", item.leverage);
-      appendText(row, "td", item.unrealized_pnl);
+      appendText(row, "td", formatLeverage(item.leverage));
+      appendText(row, "td", formatMoney(item.unrealized_pnl));
       body.appendChild(row);
     });
   }

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from urllib.parse import unquote
 
 import httpx
+import pytest
 from sqlalchemy import insert, select
 
 from fakes import wait_until
@@ -28,9 +29,19 @@ async def _seed(engine, clock) -> None:
         await conn.execute(insert(hl_wallets), [
             {"address": A, "note": "<script>alert(1)</script>", "tier": "focus", "source": "manual",
              "excluded": False, "style": "directional",
-             "profile": {"account_value": "2000000", "pnl_30d": "120000", "win_rate": 0.6,
+             "profile": {"account_value": "23576096.8364340588", "total_pnl": "120000.5",
+                         "pnl_30d": "120000", "volume_total": "34567890.125",
+                         "volume_30d": "7654321.5", "max_drawdown": "23456.7",
+                         "max_drawdown_ratio": "1.617094152903319467691422616",
+                         "win_rate": "0.6086915267103141", "profit_loss_ratio": "1.23456",
+                         "holding_duration_avg_s": "1583.844", "holding_duration_median_s": "90000",
+                         "open_rounds": 3, "daily_fill_count": "12.34567",
+                         "passive_fill_ratio": "0.81234", "actual_leverage": "6.59",
+                         "configured_leverage": {"BTC": "6.59"},
                          "tags": ["<img src=x onerror=alert(2)>", "大户"],
-                         "pnl_history": [[1, "0"], [2, "120000"]], "coverage": {}},
+                         "pnl_history": [[1, "0"], [2, "120000"]],
+                         "coverage": {"max_drawdown": {"sufficient": False, "complete": False,
+                                                        "reason": "历史不完整"}}},
              "profile_updated_at": clock.now},
             {"address": B, "note": "第二只", "tier": "candidate", "source": "leaderboard",
              "excluded": False, "style": "swing",
@@ -38,13 +49,14 @@ async def _seed(engine, clock) -> None:
              "profile_updated_at": clock.now},
         ])
         await conn.execute(insert(hl_positions).values(
-            address=A, dex="", coin="BTC", szi=2, entry_px=90000, liquidation_px=70000,
-            leverage=3, notional_usd=200000, unrealized_pnl=20000, updated_at=clock.now,
+            address=A, dex="", coin="BTC", szi=2, entry_px=Decimal("84931.3"),
+            liquidation_px=Decimal("68604.6106151719"), leverage=Decimal("6.59"),
+            notional_usd=Decimal("171681"), unrealized_pnl=Decimal("20000.125"), updated_at=clock.now,
         ))
 
 
 def _runtime() -> SimpleNamespace:
-    return SimpleNamespace(monitor=SimpleNamespace(mids={"BTC": Decimal("100000"), "ETH": Decimal("4000")}))
+    return SimpleNamespace(monitor=SimpleNamespace(mids={"BTC": Decimal("85840.5"), "ETH": Decimal("4000")}))
 
 
 async def _client(engine, settings, clock, *, enabled: bool = True, broadcaster: Broadcaster | None = None):
@@ -55,7 +67,7 @@ async def _client(engine, settings, clock, *, enabled: bool = True, broadcaster:
         clock=clock,
         hyperliquid=_runtime() if enabled else None,
     )
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1")
 
 
 async def test_whales_list_filters_sorts_caps_and_escapes_external_text(engine, settings, clock):
@@ -71,6 +83,10 @@ async def test_whales_list_filters_sorts_caps_and_escapes_external_text(engine, 
     assert "&lt;img src=x onerror=alert(2)&gt;" in page.text
     assert data.status_code == 200 and [row["address"] for row in data.json()] == [A]
     assert 'href="/whales/' + A + '"' in page.text
+    assert "$23,576,096.84" in page.text
+    assert "$120,000.00" in page.text
+    assert "60.87%" in page.text
+    assert "$171,681.00" in page.text
 
 
 async def test_whale_detail_and_unknown_404(engine, settings, clock):
@@ -85,6 +101,17 @@ async def test_whale_detail_and_unknown_404(engine, settings, clock):
     ):
         assert marker in page.text
     assert "<svg" in page.text and 'id="positions"' in page.text
+    assert "历史不完整" in page.text
+    for formatted in (
+        "$23,576,096.84", "161.71%", "60.87%", "0.44 小时", "1.04 天",
+        "84,931.30", "68,604.61", "20.08%", "6.59×", "$171,681.00",
+    ):
+        assert formatted in page.text
+    for raw in (
+        "23576096.8364340588", "1.617094152903319467691422616",
+        "0.6086915267103141", "1583.844", "68604.6106151719",
+    ):
+        assert raw not in page.text
     assert missing.status_code == 404
 
 
@@ -102,7 +129,7 @@ async def test_whale_actions_require_same_origin_and_broadcast_after_commit(engi
         pending = asyncio.create_task(asyncio.wait_for(agen.__anext__(), timeout=3))
         await wait_until(lambda: broadcaster.subscriber_count == 1, timeout=2)
         accepted = await asyncio.wait_for(
-            http.post("/whales/actions", data={"action": "add", "address": A}, headers={"Origin": "http://test"}),
+            http.post("/whales/actions", data={"action": "add", "address": A}, headers={"Origin": "http://127.0.0.1"}),
             timeout=3,
         )
         message = await pending
@@ -113,6 +140,27 @@ async def test_whale_actions_require_same_origin_and_broadcast_after_commit(engi
     async with engine.connect() as conn:
         row = (await conn.execute(select(hl_wallets).where(hl_wallets.c.address == A))).mappings().one()
     assert row["tier"] == "focus" and row["profile"]["manual_focus"] is True
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://127.0.0.1",
+        "http://127.0.0.1:9999",
+        "http://localhost",
+    ],
+)
+async def test_whale_actions_reject_nonidentical_allowlisted_origin(engine, settings, clock, origin):
+    async with await _client(engine, settings, clock) as http:
+        response = await asyncio.wait_for(
+            http.post(
+                "/whales/actions",
+                data={"action": "invalid", "address": A},
+                headers={"Origin": origin},
+            ),
+            timeout=3,
+        )
+    assert response.status_code == 403
 
 
 async def test_whale_actions_share_registry_limits_conflicts_and_note_validation(engine, settings, clock):
@@ -128,15 +176,15 @@ async def test_whale_actions_share_registry_limits_conflicts_and_note_validation
     async with await _client(engine, settings, clock) as http:
         limited = await asyncio.wait_for(
             http.post("/whales/actions", data={"action": "core", "address": A},
-                      headers={"Referer": "http://test/whales"}, follow_redirects=True), timeout=3
+                      headers={"Referer": "http://127.0.0.1/whales"}, follow_redirects=True), timeout=3
         )
         conflict = await asyncio.wait_for(
             http.post("/whales/actions", data={"action": "exclude", "address": "0x0000000000000000000000000000000000000001"},
-                      headers={"Origin": "http://test"}, follow_redirects=True), timeout=3
+                      headers={"Origin": "http://127.0.0.1"}, follow_redirects=True), timeout=3
         )
         invalid = await asyncio.wait_for(
             http.post("/whales/actions", data={"action": "note", "address": "bad", "note": "备注"},
-                      headers={"Origin": "http://test"}, follow_redirects=True), timeout=3
+                      headers={"Origin": "http://127.0.0.1"}, follow_redirects=True), timeout=3
         )
     assert "核心钱包最多 10 个" in limited.text
     assert "核心钱包不能直接排除" in conflict.text
@@ -148,7 +196,7 @@ async def test_whale_actions_toggle_core_exclusion_and_note(engine, settings, cl
         await conn.execute(insert(hl_wallets).values(
             address=A, tier="focus", source="manual", excluded=False, profile={"manual_focus": True}
         ))
-    headers = {"Origin": "http://test"}
+    headers = {"Origin": "http://127.0.0.1"}
     async with await _client(engine, settings, clock) as http:
         for action, extra in (
             ("note", {"note": "我的 <script>备注</script>"}),
@@ -174,8 +222,8 @@ async def test_home_market_and_net_sidebar_have_enabled_and_disabled_states(engi
         page = await asyncio.wait_for(http.get("/"), timeout=3)
         summary = await asyncio.wait_for(http.get("/api/hyperliquid"), timeout=3)
     assert page.status_code == 200
-    assert 'id="market-strip"' in page.text and "BTC" in page.text and "100000" in page.text
-    assert 'id="net-positions"' in page.text and "200000" in page.text
+    assert 'id="market-strip"' in page.text and "BTC" in page.text and "85,840.50" in page.text
+    assert 'id="net-positions"' in page.text and "$171,681.00" in page.text
     assert summary.json()["enabled"] is True
 
     async with engine.begin() as conn:

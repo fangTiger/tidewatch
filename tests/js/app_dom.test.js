@@ -338,7 +338,7 @@ async function testHyperliquidUpdates() {
     enabled: true,
     tickers: [{symbol: "BTC", price: "101234.5", status: "实时"}],
   });
-  assert.equal(btcPrice.textContent, "101234.5");
+  assert.equal(btcPrice.textContent, "101,234.50");
   assert.equal(btcStatus.textContent, "实时");
 
   await EventSourceStub.instance.emit("whales.net_position.updated", {
@@ -347,16 +347,46 @@ async function testHyperliquidUpdates() {
   });
   assert.equal(netPositions.children.length, 1);
   assert.equal(netPositions.children[0].dataset.coin, "BTC");
-  assert.equal(netPositions.children[0].querySelector(".net-value").textContent, "18000000");
+  assert.equal(netPositions.children[0].querySelector(".net-value").textContent, "$18,000,000.00");
+  assert.equal(netPositions.children[0].children[1].children[1].textContent, "$30,000,000.00");
+  assert.equal(netPositions.children[0].children[1].children[3].textContent, "$12,000,000.00");
   assert.equal(netUpdated.textContent, "2026-10-06T04:00:00Z");
 
   await EventSourceStub.instance.emit("position.updated", {
     address: positions.dataset.address,
-    positions: [{coin: "BTC", dex: "主 dex", direction: "long", quantity: "2", notional_usd: "200000", entry_px: "90000", liquidation_px: "70000", liquidation_distance: "0.3", liquidation_progress: 70, leverage: "3", unrealized_pnl: "20000"}],
+    positions: [{coin: "BTC", dex: "主 dex", direction: "long", quantity: "12345.6789012", notional_usd: "200000", entry_px: "84931.3", liquidation_px: "68604.6106151719", liquidation_distance: "0.2007897133034884465957211340", liquidation_progress: 79.92102866965115, leverage: "6.59", unrealized_pnl: "20000.125"}],
   });
   assert.equal(positionsBody.rows.length, 1);
   assert.equal(positionsBody.rows[0].dataset.coin, "BTC");
   assert.equal(positionsBody.rows[0].children[1].textContent, "多");
+  assert.equal(positionsBody.rows[0].children[2].textContent, "12,345.678901");
+  assert.equal(positionsBody.rows[0].children[3].textContent, "$200,000.00");
+  assert.equal(positionsBody.rows[0].children[4].textContent, "84,931.30");
+  assert.equal(positionsBody.rows[0].children[5].textContent, "68,604.61");
+  assert.equal(positionsBody.rows[0].children[6].textContent, "20.08%");
+  assert.equal(positionsBody.rows[0].children[7].textContent, "6.59×");
+  assert.equal(positionsBody.rows[0].children[8].textContent, "$20,000.13");
+
+  await EventSourceStub.instance.emit("position.updated", {
+    address: positions.dataset.address,
+    positions: [{coin: "ETH", dex: "主 dex", direction: "short", quantity: "0", notional_usd: "9007199254740992.01", entry_px: "0.00001234567", liquidation_px: null, liquidation_distance: "0", liquidation_progress: 0, leverage: "0", unrealized_pnl: "1.005"}],
+  });
+  assert.equal(positionsBody.rows[0].children[2].textContent, "0");
+  assert.equal(positionsBody.rows[0].children[3].textContent, "$9,007,199,254,740,992.01");
+  assert.equal(positionsBody.rows[0].children[4].textContent, "0.0000123457");
+  assert.equal(positionsBody.rows[0].children[5].textContent, "—");
+  assert.equal(positionsBody.rows[0].children[6].textContent, "0.00%");
+  assert.equal(positionsBody.rows[0].children[7].textContent, "0.00×");
+  assert.equal(positionsBody.rows[0].children[8].textContent, "$1.01");
+
+  await EventSourceStub.instance.emit("position.updated", {
+    address: positions.dataset.address,
+    positions: [{coin: "SOL", dex: "主 dex", direction: "long", quantity: "-0.0000001", notional_usd: "-0.001", entry_px: "0", liquidation_px: "0", liquidation_distance: "-0.000001", liquidation_progress: 0, leverage: "0", unrealized_pnl: "-0.001"}],
+  });
+  assert.equal(positionsBody.rows[0].children[2].textContent, "-0");
+  assert.equal(positionsBody.rows[0].children[3].textContent, "-$0.00");
+  assert.equal(positionsBody.rows[0].children[6].textContent, "-0.00%");
+  assert.equal(positionsBody.rows[0].children[8].textContent, "-$0.00");
 }
 
 (async () => {

@@ -39,9 +39,9 @@
         {% if wallet.labels or wallet.tags %}<span class="labels">{{ (wallet.labels + wallet.tags) | join(' · ') }}</span>{% endif %}</td>
       <td><span class="tier tier-{{ wallet.tier or 'excluded' }}">{{ {'core':'核心','focus':'重点','candidate':'候选'}.get(wallet.tier, '已排除') }}</span><small>{{ wallet.source }}</small></td>
       <td>{{ {'directional':'方向型','swing':'波段','market_maker':'做市','high_frequency':'高频','unknown':'未知'}.get(wallet.style, wallet.style or '—') }}</td>
-      <td class="number">{{ wallet.account_value or '—' }}</td><td class="number">{{ wallet.pnl_30d or '—' }}</td>
-      <td class="number">{% if wallet.win_rate %}{{ wallet.win_rate }}{% else %}—{% endif %}</td>
-      <td class="number">{{ wallet.total_notional }}</td><td>{{ wallet.profile_updated }}</td>
+      <td class="number">{{ wallet.account_value | money }}</td><td class="number">{{ wallet.pnl_30d | money }}</td>
+      <td class="number">{{ wallet.win_rate | percent }}</td>
+      <td class="number">{{ wallet.total_notional | money }}</td><td>{{ wallet.profile_updated }}</td>
       <td class="actions">
         <form method="post" action="/whales/actions"><input type="hidden" name="address" value="{{ wallet.address }}">
           {% if wallet.excluded %}<button name="action" value="un_exclude">取消排除</button>

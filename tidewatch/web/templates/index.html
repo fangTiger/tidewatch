@@ -5,7 +5,7 @@
   {% for ticker in hyperliquid.tickers %}
   <span class="ticker" data-symbol="{{ ticker.symbol }}" data-status="{{ ticker.status }}">
     <b>{{ ticker.symbol }}</b>
-    <span class="ticker-price">{{ ticker.price or '—' }}</span>
+    <span class="ticker-price">{{ ticker.price | price }}</span>
     <small class="ticker-status">{{ ticker.status }}</small>
   </span>
   {% endfor %}
@@ -52,8 +52,8 @@
   <div id="net-positions">
     {% for row in hyperliquid.net_positions %}
     <article class="net-row" data-coin="{{ row.coin }}">
-      <div><b>{{ row.coin }}</b><span class="net-value {{ row.direction }}">{{ row.net_usd }}</span></div>
-      <dl><dt>多</dt><dd>{{ row.long_usd }}</dd><dt>空</dt><dd>{{ row.short_usd }}</dd></dl>
+      <div><b>{{ row.coin }}</b><span class="net-value {{ row.direction }}">{{ row.net_usd | money }}</span></div>
+      <dl><dt>多</dt><dd>{{ row.long_usd | money }}</dd><dt>空</dt><dd>{{ row.short_usd | money }}</dd></dl>
     </article>
     {% else %}
     <p class="empty-state">{{ '未启用' if not hyperliquid.enabled else '暂无有效仓位' }}</p>

@@ -13,11 +13,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncEngine
 from sse_starlette.sse import EventSourceResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from tidewatch.clock import Clock, utcnow
 from tidewatch.hyperliquid.registry import WalletRegistry
 from tidewatch.pipeline.decision import freshness_from_settings
 from tidewatch.web.broadcaster import Broadcaster
+from tidewatch.web.formatting import FILTERS
 from tidewatch.web.queries import (
     LEVELS,
     cluster_rows,
@@ -33,6 +35,39 @@ from tidewatch.web.queries import (
 WEB_DIR = Path(__file__).resolve().parent
 
 
+def _normalized_host(value: str) -> str:
+    """把配置中的主机名、带端口主机或 IPv6 字面量规范为无括号主机名。"""
+    text = value.strip()
+    if not text or "*" in text:
+        return ""
+    if "://" not in text and text.count(":") > 1 and not text.startswith("["):
+        return text.lower().rstrip(".")
+    parsed = urlsplit(text if "://" in text else f"//{text}")
+    return (parsed.hostname or "").lower().rstrip(".")
+
+
+def _trusted_host_pattern(host: str) -> str:
+    """Starlette 的 Host 解析器为 IPv6 保留方括号。"""
+    return f"[{host}]" if ":" in host else host
+
+
+def _url_origin(value: str) -> tuple[str, str, int] | None:
+    """提取同源比较三元组，并补齐 HTTP(S) 默认端口。"""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if scheme not in {"http", "https"} or not host or parsed.username is not None or parsed.password is not None:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    return scheme, host, port or (443 if scheme == "https" else 80)
+
+
 def create_app(
     engine: AsyncEngine,
     broadcaster: Broadcaster,
@@ -42,7 +77,17 @@ def create_app(
     hyperliquid: Any | None = None,
 ) -> FastAPI:
     app = FastAPI(title="观潮", docs_url=None, redoc_url=None, openapi_url=None)
+    allowed_origin_hosts = {"127.0.0.1", "localhost", "::1"}
+    configured_host = _normalized_host(settings.web.host)
+    if configured_host:
+        allowed_origin_hosts.add(configured_host)
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=sorted(_trusted_host_pattern(host) for host in allowed_origin_hosts),
+        www_redirect=False,
+    )
     templates = Jinja2Templates(directory=str(WEB_DIR / "templates"))
+    templates.env.filters.update(FILTERS)
     app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
     freshness = freshness_from_settings(settings)
     assets = [asset.symbol for asset in settings.watchlist.assets]
@@ -209,9 +254,12 @@ def create_app(
         supplied = request.headers.get("origin") or request.headers.get("referer")
         if not supplied:
             return False
-        candidate = urlsplit(supplied)
-        expected = request.url
-        return candidate.scheme == expected.scheme and candidate.netloc == expected.netloc
+        candidate_origin = _url_origin(supplied)
+        return (
+            candidate_origin is not None
+            and candidate_origin[1] in allowed_origin_hosts
+            and candidate_origin == _url_origin(str(request.url))
+        )
 
     @app.post("/whales/actions")
     async def whale_action(request: Request):
